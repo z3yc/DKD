@@ -16,6 +16,31 @@ uv run ruff check .    # lint
 uv run ruff format --check .
 ```
 
+### ⚠️ 本机环境三个坑（已实测，换机器请先看这段）
+
+**1. venv 里没有 `pip`** —— uv 创建的 venv 默认不装 pip。装包必须用 uv：
+
+```bash
+uv pip install <包>     # 装到当前 venv（不写 pyproject）
+uv add <包>             # 需要写入 pyproject 时用这个（会更新 uv.lock）
+```
+
+直接敲 `pip` 会命中别处的旧 Python（见下条），报 `No module named 'pip'`。
+
+**2. 本机 PATH 里有 4 个 Python**（`D:\python3.8`、用户目录 3.10、uv 托管 3.11、WindowsApps 占位），
+裸用 `python` / `pip` 极易误中 3.8。请一律用 `uv run ...` 或 `.venv\Scripts\python.exe` 绝对路径。
+
+**3. 激活虚拟环境**（可选；`uv run` 会自动使用它）：
+
+| Shell | 命令 |
+| --- | --- |
+| PowerShell | `.\.venv\Scripts\Activate.ps1`（本机 CurrentUser 策略为 RemoteSigned，无需改策略） |
+| cmd | `.venv\Scripts\activate.bat` |
+| Git Bash | `source .venv/Scripts/activate` |
+
+> 注意：`.env` 里的变量必须注入到进程环境才生效（Spring Boot / Python 都不会自动读 `.env`）。
+> Git Bash 临时注入：`set -a; source ../.env; set +a`；永久（Windows）：`setx DKD_DEEPSEEK_API_KEY "..."`（需重开终端）。
+
 版本锁定：`uv.lock` 固定 langgraph / langgraph-checkpoint / saver 等全部传递依赖的**精确版本**，
 升级须走「兼容性评审 + 存量会话处理方案」（方案 V1.1 §5.2）。
 
@@ -45,6 +70,22 @@ curl -N -H "X-Agent-User: 1" -H "Content-Type: application/json" \
 对外**只监听内网/回环**，前端一律经 Java 网关（`/agent/**`）访问；Python 不解析 JWT，
 只信任网关注入的 `X-Agent-User / X-Agent-Roles / X-Agent-Region` 头。
 
+## LLM 连通性验证（任务 0-3）
+
+`app/llm.py` 用 `langchain-openai` 以 OpenAI 兼容模式指向 DeepSeek。
+**单元测试全部打桩**（AGENTS §8：测试不得真实调用外部 API）；真实调用需人工显式触发：
+
+```bash
+set -a; source ../.env; set +a          # 注入 DKD_DEEPSEEK_API_KEY
+DKD_AGENT_LIVE_LLM=1 uv run pytest -m live -v
+```
+
+首次实测结论（2026-09-21）：HTTP 200、内容返回正常、耗时 5.4s、token 9/1。
+
+> ⚠️ **注意服务端模型名可能与配置不一致**：配置 `deepseek-chat` 时服务端返回的 `model` 为
+> `deepseek-flash`。`ping_llm()` 会记录**实际返回的模型名**并在不一致时打 WARN——
+> 成本计量与效果归因必须按实际模型，不能按配置假设。
+
 ## 环境变量
 
 除复用 Java 侧的 `DKD_DEEPSEEK_API_KEY` 外，其余为服务自身变量：
@@ -61,8 +102,9 @@ curl -N -H "X-Agent-User: 1" -H "Content-Type: application/json" \
 
 | 任务 | 状态 |
 | --- | --- |
-| 0-2 环境与依赖锁定 | ✅ |
-| 0-3 LLM 连通 | ⛔ 阻塞：旧 DeepSeek Key 已失效（HTTP 401），需新 Key |
+| 0-2 环境与依赖锁定 | ✅ `uv.lock` 已锁定（langgraph 1.2.11 / checkpoint 4.2.0 / sqlite 3.1.1） |
+| 0-3 LLM 连通 | ✅ 代码 + 打桩单测 + 可选 live 冒烟；实测 HTTP 200（5.4s） |
 | 0-5 `agent_*` 四表 DDL | ✅ 已在本地 dkd 库执行通过（幂等重跑 + 唯一键拒绝路径已验证） |
-| 0-9 服务骨架（/health + SSE echo + 鉴权 + request_id） | ✅ |
+| 0-9 服务骨架（/health + SSE echo + 鉴权 + request_id） | ✅ 真实进程冒烟通过 |
 | 0-10 SQLite checkpointer 接入 | 待办 |
+| 0-12 request_id 贯穿 + 决策留痕 + 成本计量 | 部分完成（request_id 已贯穿；留痕表已建，写入未接） |

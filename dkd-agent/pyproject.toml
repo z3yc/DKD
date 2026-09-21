@@ -44,12 +44,19 @@ ignore = ["ANN101", "ANN102", "ANN401"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ANN201", "ANN001"]
+# 例外理由：live 冒烟测试由人工显式触发（-m live），需把实测 model/耗时/token 打到控制台
+# 便于当场核对（AGENTS §2.3 禁 print 的例外，理由在此备案）
+"tests/test_llm_live.py" = ["T201"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
-addopts = "-q --strict-markers"
+# 默认排除 live（真实外部 API 调用）；显式 `-m live` 才执行
+addopts = "-q --strict-markers -m 'not live'"
+markers = [
+    "live: 真实调用外部 LLM API（需 DKD_AGENT_LIVE_LLM=1；AGENTS §8 要求默认打桩）",
+]
 # 严格模式：本项目自身的 DeprecationWarning 视为失败；第三方（anyio/starlette）的已知弃用项豁免
 filterwarnings = [
     "error::DeprecationWarning",

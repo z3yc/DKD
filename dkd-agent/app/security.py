@@ -88,6 +88,4 @@ def verify_service_secret(
             detail="服务间密钥未配置（DKD_AGENT_SERVICE_SECRET），拒绝服务",
         )
     if not x_agent_secret or not hmac.compare_digest(x_agent_secret, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="服务间密钥校验失败"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="服务间密钥校验失败")
