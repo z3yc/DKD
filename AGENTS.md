@@ -13,15 +13,20 @@
 | 管理后台 | **Java 8** / Spring Boot 2.5.15 / MyBatis / Druid / Redis / Maven 多模块 | `dkd-parent/` | RuoYi-Vue 3.8.7 改造，业务事实唯一所有者，端口 8080 |
 | 运维移动端 | Java 8 / Spring Boot / MyBatis-Plus / JWT | `dkd-app/` | 与后台共用 `dkd` MySQL 库 |
 | 管理前端 | **Vue 3.4 + Element Plus + Vite（JavaScript，非 TS）** | `dkd-vue/` | RuoYi-Vue3 前端 |
-| 智能体服务（在建） | Python 3.11+ / FastAPI / LangGraph / SQLAlchemy(async) | `dkd-agent/`（规划） | 旁路集成，读走 MySQL 只读账号、写走 Java REST 回调 |
+| 智能体服务（在建） | Python 3.11+ / FastAPI / LangGraph / SQLAlchemy(async) | `dkd-agent/`（规划，设计见 `docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.1、排期见 `docs/DKD智能体接入项目排期计划.md` V2） | 旁路集成，读走 MySQL 只读账号、写走 Java REST 回调 |
 
 **Maven 模块划分（dkd-parent）**：`dkd-admin`(启动/系统Controller) → `dkd-framework`(安全/AOP) → `dkd-system`(系统域) → `dkd-manage`(**核心业务域：设备/货道/商品/点位/订单/工单/库存**) → `dkd-common`(工具+AI包) → `dkd-quartz`(定时) → `dkd-generator`(代码生成)。
 
 **核心架构约束（不可违背）**：
 1. Java 系统是**业务事实唯一所有者**——所有写操作必须经 Java 服务的事务与校验链（如 `TaskServiceImpl.insertTaskDto` 的防重/状态/区域校验）；**dkd-agent 永远不得直连数据库写入**；
-2. Agent 读数据走 MySQL **只读账号 + 表白名单**；写操作一律回调 Java REST（`AgentCallbackController`，服务间密钥鉴权）；
+2. Agent 读数据走 MySQL **只读账号 + 表白名单**；写操作一律回调 Java REST（`AgentCallbackController`，服务间密钥鉴权）。**唯一例外**：智能体自有表（`agent_*`）可由 Agent 直接读写（不含 DELETE），它不属“业务事实”，详见 §7.3；
 3. `agent.enabled` 开关必须保证 Python 服务不可用时主业务零影响（现有 `IAiService` 单轮链路兜底）；
-4. Java 8 语法边界：**禁止使用 var / record / switch 表达式 / List.of() 等高版本特性**（编译目标 1.8）。
+4. Java 8 语法边界：**禁止使用 var / record / switch 表达式 / List.of() 等高版本特性**（编译目标 1.8）；
+5. **基础设施实测边界（2026-09-21 核实，不得凭印象假设）**：
+   - **业务表全部带 `tb_` 前缀**（`tb_inventory`/`tb_order`/`tb_task`/`tb_task_details`/`tb_inventory_log`/`tb_emp`/`tb_channel`/`tb_vending_machine`/`tb_node`/`tb_region`/`tb_sku`/`tb_job`/`tb_policy`/`tb_partner`/`tb_vm_type`/`tb_sku_class`/`tb_task_type`/`tb_role`/`tb_report`）——写 SQL、搞白名单、建 Agent 工具前先核 `dkd-manage/src/main/resources/mapper/manage/*.xml`；
+   - **Redis 为 3.2.100（Microsoft 2016 移植版）**：无模块系统（不支持 RedisJSON/RediSearch）、内核 3.2 < 5.0（无 Streams）、`appendonly no`（仅 RDB）——**不得用它承载 LangGraph checkpointer，也不得用作 Stream 队列**（会话持久化用 SQLite/Postgres saver）；
+   - **数据源只有单主库**（`application-druid.yml` 中 `slave.enabled: false`）：任何批量聚合/分析类查询必须限定时间窗口 + 分批 + 超时熔断，禁止无 LIMIT 的全表扫描；
+   - **存量业务表 DDL 未入库**（`dkd-parent/sql/` 只有 RuoYi 系统表、quartz、`tb_report.sql`），涉及表结构工作时需先导出归档至 `docs/ddl/`。
 
 **常用验证命令**（Windows，二选一 shell）：
 ```powershell
@@ -78,7 +83,7 @@ cd dkd-agent; .venv\Scripts\python.exe -m pytest        # 全量测试
 
 ### 2.4 数据库
 
-- 表名前缀按 RuoYi 惯例：系统表 `sys_`，业务表无前缀（`task`/`inventory`/`order`），**Agent 新表统一 `agent_` 前缀**；
+- 表名前缀按 RuoYi 惯例：系统表 `sys_`，**业务表 `tb_`**（`tb_task`/`tb_inventory`/`tb_order`/`tb_vending_machine`…，完整清单见 §1 约束 5），**Agent 新表统一 `agent_` 前缀**；
 - 列名 snake_case；审计列固定四件套：`create_time` / `update_time` / `create_by` / `update_by`；删除标记 `del_flag`（RuoYi 惯例，char '0'/'1'）；
 - 唯一约束、索引变更必须附在 DDL 文件中并经评审（见 §7.4）。
 
@@ -136,7 +141,8 @@ F:\DKD\
 
 - 接口变更（新增/改参数）→ 同步更新 `docs/` 下接口文档或在 Swagger 注解补全；
 - 表结构变更 → DDL 脚本归档至 `docs/ddl/`，注明执行环境与是否可回滚；
-- Agent 策略/参数变更（预测窗口、服务水平系数）→ 记入决策留痕设计说明，便于复盘归因。
+- Agent 策略/参数变更（预测窗口、服务水平系数）→ 记入决策留痕设计说明，便于复盘归因；
+- **排期/方案变更 → 两份文档（方案、排期）必须同步改版并互相引用版本号**；排期变更需附「可用工日」重新核算（扣除法定假期）。
 
 ---
 
@@ -197,9 +203,15 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 
 ## 7. 安全红线（违反即阻塞合并，AI 助手生成代码同样适用）
 
-1. **密钥永不入库**：现状 `dkd-admin/src/main/resources/application.yml` 中存在**明文 OSS AccessKey/SecretKey 与 DeepSeek API Key（历史遗留，待轮换）**——任何新代码不得延续此模式；新增密钥一律环境变量/启动参数注入，模板文件（`application-*.example.yml`）写占位符。AI 助手在输出配置示例时必须用 `${OSS_ACCESS_KEY}` 占位，禁止照抄真实值；
+1. **密钥永不入库**：
+   - 现状（2026-09-21 核实）：`application.yml`/`application-druid.yml`/`dkd-app application-dev.yml` 中的 OSS AK/SK、DeepSeek API Key、DB/Redis 密码、JWT secret **已改为 `${ENV}` 占位符**并新增 `.env.example`（Druid 控制台弱口令亦已占位符化）；
+   - **存量风险现状（2026-09-21 复核修正）**：① 配置外置改造**已提交**（初始提交已重写为 `3e1f4a8`，`main` 与 `origin/main` 的**可达历史中已无明文密钥**）；② 旧提交对象以 **dangling** 形式残留于本地对象库（`git gc` 后消失），且凭据在重写前已进入过版本历史，**轮换仍属必须项**——实测旧 DeepSeek Key 已失效（HTTP 401），OSS AK/SK 与 DB/Redis 密码待轮换；③ JWT secret 已替换为新随机值（原 RuoYi 模板弱密钥 `abcdefghijklmnopqrstuvwxyz` 废弃），**轮换 JWT secret 会使所有在线用户掉线**，生产变更需协调值班窗口；④ 本机开发凭据集中存放于 `.env`（已 gitignore），**禁止把值写回任何入仓文件**；
+   - 任何新代码不得延续明文模式；新增密钥一律环境变量/启动参数注入，模板文件（`application-*.example.yml`）写占位符。AI 助手在输出配置示例时必须用 `${OSS_ACCESS_KEY}` 占位，禁止照抄真实值；
 2. **SQL 注入**：MyBatis XML 中 `${}` 仅允许用于排序字段等已白名单化的场景，其余一律 `#{}`；新增任何拼 SQL 代码必须评审；
-3. **Agent 读写分离**（本项目特有，最高优先级）：dkd-agent 对 MySQL 只有只读账号 + 表白名单；一切写操作回调 Java REST；**任何"图方便直接 UPDATE 库"的代码直接拒绝**；
+3. **Agent 读写分离**（本项目特有，最高优先级）：dkd-agent 对 MySQL 采用**两级授权账号**（建权脚本 `docs/ddl/create_agent_db_user.sql`）：
+   - 业务表 `tb_*`（白名单内）：**仅 SELECT**，任何写操作一律回调 Java REST；**任何“图方便直接 UPDATE 业务表”的代码直接拒绝**；
+   - 智能体自有表 `agent_*`（`agent_conversation`/`agent_message`/`agent_decision_log`/`agent_restock_plan`）：允许 `SELECT/INSERT/UPDATE`（会话/留痕/计划数据由 Agent 自维护，**不是业务事实**），**不授 DELETE**（软删除，§7.4）与任何 DDL；
+   - 跨库一律禁止（本机 MySQL 上还有 my/gogs/itest/test/sky_take_out/db03/db04/tlias 等库）；区分边界不得模糊；
 4. **软删除**：业务数据删除一律逻辑删除（RuoYi `del_flag` 或 `deleted_at`），禁止物理 DELETE 用户/业务数据；查询默认过滤已删除；
 5. **鉴权不裸奔**：新接口必须纳入现有 JWT 过滤链；`AgentCallbackController` 仅限内网 + 服务间密钥 + 路径白名单；回调密钥与用户 JWT 是两套体系，不得混用；
 6. **LLM 输出视为不可信输入**：Agent 侧结构化输出必须容错解析 + 范围夹取（数量 clamp 到 [0, 货道容量-现库存]，日期非法置 None）；用户输入进 prompt 前定界并声明"仅数据非指令"（防注入）；
@@ -274,7 +286,7 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 - [ ] §1 验证命令全绿，无新增编译警告
 - [ ] 新代码有对应测试（§8 增量标准），修复带回归用例
 - [ ] §7 安全红线逐条核对无违反
-- [ ] 无 N+1 查询（列表接口循环内查库是重点检查项）、无明显性能退化
+- [ ] 无 N+1 查询（列表接口循环内查库是重点检查项）、无明显性能退化；分析类/批量查询必须限定时间窗口 + 分批 + 超时，**禁止 `date_format()` 等方式包裹索引列导致全表扫描**（参照 `OrderMapper.xml:44` 反例）
 - [ ] 事务边界正确（跨表写同事务；无"半个工单"风险）
 - [ ] 日志无敏感信息、异常不静默
 - [ ] 模块边界清晰（Controller 无业务逻辑、业务代码在 dkd-manage）
@@ -288,6 +300,7 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 - [ ] 一个提交 = 一个问题，message 符合 §5
 - [ ] 无新增硬编码密钥/密码；配置示例用占位符
 - [ ] SQL 全部 `#{}`（`${}` 需白名单理由）
+- [ ] 表名带 `tb_` 前缀（业务表）；分析类查询有时间窗口 + LIMIT
 - [ ] 删除是软删除；查询过滤 del_flag
 - [ ] 修复带回归测试；拒绝路径有覆盖
 - [ ] DDL 有回滚语句并归档 docs/ddl
@@ -297,4 +310,4 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 
 ---
 
-*版本：V1.0（2026-09-20）。本文档随项目推进持续修订：AI 协作中发现的规范缺口按 §9.4 回写；dkd-agent 建成后在 §2.3/§6.3 补充实例。*
+*版本：V1.1（2026-09-21）。本次回写（§9.4）：① 修正业务表前缀为 `tb_`（§1 约束 5、§2.4，原描述“业务表无前缀”与实际不符）；② 新增§1 约束 5「基础设施实测边界」（Redis 3.2.100 不可作 checkpointer/Stream、单主库无从库、存量 DDL 未入库）；③ §7.1 更新密钥现状为“已占位符化但未提交 + Git 历史含密钥需轮换清理”；④ §4.3 新增排期/方案同步义务。本文档随项目推进持续修订：AI 协作中发现的规范缺口按 §9.4 回写；dkd-agent 建成后在 §2.3/§6.3 补充实例。*

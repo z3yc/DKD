@@ -1,9 +1,17 @@
 # 帝可得（DKD）智能售货机平台 LangChain/LangGraph 智能体接入方案
 
-> 版本：V1.0（供评审）
-> 日期：2026-09-20
+> 版本：V1.1（评审修订）
+> 日期：2026-09-21
 > 范围：现有架构分析 → 智能体场景规划 → 集成方式 → 数据链路 → 技术实现路径 → 分阶段实施计划
-> 说明：原型图与接入效果展示待本方案确认后另行输出。
+> 说明：原型见 `docs/prototypes/dkd-agent-prototype.html`（V2）；排期见《DKD智能体接入项目排期计划.md》**V2**。
+>
+> **V1.1 修订摘要（均基于源码与现场实测，证据见 §十）**：
+> ① **表白名单修正**——实际业务表**全部带 `tb_` 前缀**，V1 的 `inventory/order/task/...` 写法会直接失败，且漏掉诊断/建单必需的 `tb_inventory_log`/`tb_task_details`/`tb_emp`/`tb_channel`；
+> ② **会话持久化换型**——实测本机 Redis 为 3.2.100（无模块系统，不支持 RedisJSON/RediSearch；内核 < 5.0 无 Streams），`langgraph-checkpoint-redis` **不可用**，改为本地 **SQLite saver**；
+> ③ **密钥整改现状修正**——源码**已**占位符化（但工作区未提交），而 **Git 初始提交中含真实密钥**，整改动作应为「提交 + 轮换 + 历史清理」，工时由 1d 修正为 1.75d；
+> ④ **新增 §5.5 补货工单接单人分配与幂等设计**——`insertTaskDto` 的「同设备+同类型进行中工单防重」与「员工区域必须等于设备区域」两条校验是 M2 验收的隐性拦路虎，V1 未覆盖；
+> ⑤ **新增技术约束**：LangGraph 版本精确锁定与补货 state schema 冻结评审、SQL 聚合禁用 `date_format()` 包裹列、SSE 在前端需绕开 axios 自行实现、只读账号需覆盖"读非白名单表被拒"、评测集建设、LLM 成本计量前移至 Phase 0；
+> ⑥ **周期修正**——原"10~12 周"不成立（Phase 0 的 Java 侧 7 人日 vs 7 个可用工日 × 30% 投入，超载约 3.3 倍），修正为 **14 周**，详见排期计划 V2 §六。
 
 ---
 
@@ -70,7 +78,7 @@
 
 1. **Java 8 + Spring Boot 2.5.15**：无法升级到 Java 17，**排除 Spring AI / LangChain4j 新版本等 JVM 内智能体框架** → 必须采用 Python 独立进程旁路集成；
 2. **单体架构、共库**：dkd-parent 与 dkd-app 共用 `dkd` MySQL 库，无消息中间件（MQ）→ 数据触发机制需在"定时轮询 / API 回调 / Binlog CDC"中选择低成本方案；
-3. **已有 Redis**：可复用作会话状态、任务队列（List/Stream）；
+3. **已有 Redis（现场实测 v3.2.100）**：本机实例为 `E:\Redis-x64-3.2.100`（Microsoft 2016-07 移植版）——**无模块系统**（不支持 RedisJSON/RediSearch，因此 `langgraph-checkpoint-redis` 不可用）、内核 3.2 < 5.0（**无 Streams**）、`appendonly no`（仅 RDB，崩溃最多丢 15 分钟数据）、`maxmemory` 未设置且与 Java 侧共用 `db 0`。**结论：Redis 仅保留给现有 Java 会话/序列使用，不承载智能体会话状态，也不作为队列**（V1 原计划作废）；
 4. **已有 LLM 供应商**：DeepSeek（OpenAI 兼容），Python 侧可无缝复用同一账号，并支持切换通义千问等兼容端点；
 5. **前端统一 JWT 鉴权**（token header: Authorization，30 分钟有效）→ 智能体服务必须纳入同一鉴权体系，不能裸奔。
 
@@ -107,7 +115,8 @@
 → 需求测算: 移动平均/分位数打底, LLM 结合点位画像校准（节假日前/天气/异常波动）
 → 约束校验: 货道容量(maxCapacity)/最小预警值/设备未完成工单检查（复用 TaskServiceImpl 校验规则）
 → 结构化输出: 补货清单 JSON（每货道: 现库存/建议量/预计撑到日期/优先级/理由）
-→ 人工确认: 前端"补货工作台"一键确认 → Agent 调 POST /manage/task (insertTaskDto 通道) 批量创建补货工单
+→ 人工确认: 前端「补货工作台」一键确认 → Agent 调 POST /manage/task (insertTaskDto 通道) 批量创建补货工单
+   （**粒度约束**：`insertTaskDto` 的防重校验为「同设备 + 同工单类型 + 进行中」，因此只能**按设备整单创建、明细含多货道**，无法按货道拆分多张单；且必须按设备 `region_id` 匹配接单人，详见 §5.5）
 → 闭环复盘: 工单完成 7 日后自动对比"建议量 vs 实际消耗量"，回写评估表，迭代预测参数
 ```
 
@@ -165,7 +174,7 @@
 │   ├─ API 层: /chat(SSE流式) /agents/restock/** /agents/diagnose/**    │
 │   ├─ LangGraph 编排: Supervisor + 补货/诊断/分析 子 Agent             │
 │   ├─ 工具层: Java REST 封装(MySQL 读工具 + 工单写工具)                 │
-│   ├─ 记忆: Redis checkpointer(会话) / 决策留痕表(审计)                 │
+│   ├─ 记忆: SQLite saver(会话) / 决策留痕表(审计)                    │
 │   └─ LLM: DeepSeek(OpenAI兼容), 可切换通义千问等                       │
 └─────────────────────────────────────────────────────────────────────┘
            ▲ 定时触发
@@ -181,7 +190,7 @@
 | A. JVM 内嵌（LangChain4j 等） | Java 进程内跑智能体 | **否决**：本项目 Java 8，主流智能体框架要求 Java 17+ |
 | B. Python 直连数据库（全直连） | Python 同时读写 dkd 库 | **否决写路径**：绕过 Java 的事务、校验（如工单防重）、权限、操作日志，产生数据一致性风险 |
 | C. **API 网关旁路（推荐）** | Python 独立服务；**读走 MySQL 只读账号，写走 Java REST 回调**；前端经 Java 网关统一转发 | **采纳**：Java 保持事实所有者，Python 侧无侵入，前端不改鉴权体系 |
-| D. 消息队列解耦 | MQ 驱动事件 | 暂缓：当前无 MQ 基础设施，规模不需要；预留升级路径（后续可加 RabbitMQ/Redis Stream） |
+| D. 消息队列解耦 | MQ 驱动事件 | 暂缓：当前无 MQ 基础设施，且**本机 Redis 3.2.100 不支持 Streams**，当前规模不需要；预留升级路径（后续可加 RabbitMQ，或升级 Redis 版本后启用 Stream） |
 
 ### 3.3 Java 侧改造点（刻意保持最小侵入）
 
@@ -191,6 +200,9 @@
 2. `AgentCallbackController`：供 Python 服务间回调（创建工单、查询业务数据兜底），使用独立的**服务间密钥**鉴权（配置项，非用户 JWT）；
 3. `AgentProperties`：`agent.enabled / agent.baseUrl / agent.secret` 配置；
 4. 网关超时与降级：对话类请求透传 SSE 流；Python 服务不可用时返回友好降级提示，**不影响主业务任何功能**（开关可一键下线智能体）。
+   - **流式实现约束**：项目为 Spring MVC + Tomcat，`/agent/**` 的 SSE 转发必须用 `StreamingResponseBody`（或 `ResponseBodyEmitter`）逐块写出，**禁止先把响应体读完再返回**，否则流式体验失效；
+   - **前端约束（V1 遗漏）**：现有 `dkd-vue/src/utils/request.js` 的 axios 实例 `timeout: 10000` 且响应拦截器按 `res.data.code` 解析 JSON，**无法用于 SSE**；前端需新增独立 SSE 客户端（`fetch` + `ReadableStream`，因为 `EventSource` 不能携带 `Authorization` 头），并实现 `AbortController` 取消与心跳（AGENTS §2.2 要求长请求可取消）；
+   - **降级范围界定**：`IAiService` 只能兜底**单轮文本**场景（原 `/manage/ai/diagnose`），侧边栏多轮对话**没有等价兜底**，降级时前端应隐藏/禁用对话入口并给出提示，而非伪造会话能力。
 
 现有 `IAiService`/`AiOperationController` 保留为**降级兜底**：`agent.enabled=false` 或 Python 服务故障时，`/manage/ai/diagnose` 继续走原单轮逻辑，保证功能不断档。
 
@@ -200,10 +212,13 @@
 | --- | --- | --- |
 | 前端 → Java 网关 → Python | 复用现有 JWT（`token.header: Authorization`） | 网关解析后转发，Python 不解析 JWT，只信任网关注入的用户头 |
 | Python → Java 回调（写操作） | 服务间密钥（HMAC 签名或固定 Secret Header） | 回调接口在白名单路径内，仅限内网 |
-| Python → MySQL | 独立只读账号（仅 SELECT 权限，仅授权业务表） | 物理隔离写风险；NL2SQL 场景再叠加表白名单+SQL 校验 |
+| Python → MySQL | **两级授权账号** `dkd_agent`（建权脚本 `docs/ddl/create_agent_db_user.sql`）：业务表 `tb_*` 仅白名单内 SELECT；自有表 `agent_*` 可 SELECT/INSERT/UPDATE，**无 DELETE（软删除）/DDL**；禁用跨库（本机另有 8 个其他项目库） | 物理隔离写风险；验收须同时覆盖「**读非白名单表被拒**」「**写业务表被拒**」「**DELETE 被拒**」——只验「写被拒」不够（MySQL 只读账号默认仍可读全库表结构与其他库）；NL2SQL 场景再叠加表白名单 + SQL 校验 |
 | 写操作二次确认 | 前端确认卡片（工单创建前展示完整参数预览） | 首期所有写操作必须人工点击确认 |
 
-> 附带安全建议（与本方案并行推进）：`application.yml` 中目前存在明文的 OSS AccessKey/SecretKey 与 DeepSeek API Key，建议尽快轮换密钥并外置到环境变量/配置中心，避免随代码库泄露扩大影响面。
+> **安全整改现状（2026-09-21 实测核对，V1 描述已过时）：**
+> - **源码已改造完成**：`dkd-parent/dkd-admin/src/main/resources/application.yml`、`application-druid.yml` 与 `dkd-app/src/main/resources/application-dev.yml` 中的 OSS AccessKey/SecretKey、DeepSeek API Key、DB 密码、Redis 密码、JWT secret **均已改为 `${ENV}` 占位符**，并新增了 `.env.example`；
+> - **整改进展（2026-09-21 复核修正）**：① 配置外置改造**已提交**（初始提交重写为 `3e1f4a8`，`main`/`origin/main` 可达历史已无明文）；② 旧提交对象以 dangling 形式残留本地对象库（`git gc` 后消失），且凭据在重写前已进入过历史；③ 本机开发凭据已集中写入 `.env`（已 gitignore，含新生成的 JWT secret 与 Druid 控制台口令）；
+> - **仍待完成**：**凭据轮换**。实测旧 DeepSeek Key **已失效（HTTP 401）**，OSS AK/SK、MySQL/Redis 密码（当前均为纯数字弱口令）待轮换；JWT secret 轮换会使在线用户全部掉线，需协调值班窗口。
 
 ---
 
@@ -216,36 +231,45 @@
 | **读（分析、批量聚合）** | Python 直连 MySQL 只读账号 | 补货分析需聚合近 30 天 Order × Inventory × Task，走 REST 会导致 N 次调用与 Java 侧接口膨胀；只读账号 + 白名单保证安全 |
 | **读（单实体、实时详情）** | 调 Java REST（如 `/manage/vm/{innerCode}`） | 复用现有接口与权限语义，工具层天然与页面数据一致 |
 | **写（创建工单、回写结果）** | 只走 Java REST（`POST /manage/task` 等） | 复用 `TaskServiceImpl` 的业务校验（设备状态/防重/区域匹配）与操作日志 |
-| **触发（定时任务）** | dkd-quartz 定时 Job → HTTP 调 Python webhook | 复用现有调度体系，无需引入新中间件 |
-| **流式（对话）** | 前端 → Java 网关 → Python SSE 透传 | 逐 token 输出，体验关键 |
+| **触发（定时任务）** | dkd-quartz 定时 Job → HTTP 调 Python webhook | 复用现有调度体系，无需引入新中间件；**Job 必须带失败重试与告警**（AGENTS §6.4：不允许半夜静默失败），并保证重入安全 |
+| **流式（对话）** | 前端 → Java 网关 → Python SSE 透传 | 逐 token 输出，体验关键；前端需自建 SSE 客户端（不用 axios，见 §3.3） |
+
+> **共库风险提示（V1 未评估）**：`application-druid.yml` 中 slave 数据源 `enabled: false`，当前只有**单主库**，Agent 的分析类查询会与业务查询争抢同一 MySQL 实例；且仓库 `sql/` 下**没有业务表 DDL**（仅有 RuoYi 系统表、quartz、`tb_report.sql`），数据量与索引状况未经评估。因此：Phase 0 必须先做数据量与索引勘查并归档 `docs/ddl/`；Phase 1 的分析查询限定凌晨窗口 + 按 vm 分批 + 结果缓存；Phase 3 前把「只读实例/从库」列入决策。
+>
+> **聚合 SQL 写法约束**：`OrderMapper.xml:44` 现有写法 `date_format(create_time,'%y%m%d') >= date_format(?, '%y%m%d')` 会让 `create_time` 索引失效；Agent 侧工具**必须**改用范围比较 `create_time >= ? AND create_time < ?`，并把 `EXPLAIN` 结果留档。
 
 ### 4.2 智能体侧新增数据表（挂在 dkd 库，由 Java/DBA 建表）
 
 | 表 | 用途 | 关键字段 |
 | --- | --- | --- |
 | `agent_conversation` | 会话元数据 | id、user_id、scene、created_at |
-| `agent_message` | 消息明细（LangGraph checkpointer 的业务投影） | conversation_id、role、content、tool_calls(JSON)、created_at |
+| `agent_message` | 消息明细（LangGraph checkpointer 的业务投影 + **成本计量数据源**） | conversation_id、**user_id**、seq、role、content、tool_calls(JSON)、model、**tokens_in/tokens_out**、latency_ms、create_time |
 | `agent_decision_log` | **决策留痕（审计核心表）** | id、scene、input_context(JSON)、llm_output(JSON)、action、target_id、result、confidence、created_at |
 | `agent_restock_plan` | 补货计划（建议→确认→执行全生命周期） | id、vm_id、inner_code、items(JSON)、status(建议/已确认/已建单/已复盘)、task_id、review_metrics(JSON) |
 
-> 建表 DDL 与存量 RuoYi 表风格保持一致（create_time/update_time/by 等审计列），DDL 脚本在 Phase 0 交付。
+> 建表 DDL 与存量 RuoYi 表风格保持一致（create_time/update_time/by 等审计列），DDL 脚本在 Phase 0 交付并归档至 `docs/ddl/`（附回滚语句）。
+> 存量业务表（`tb_*`）DDL 目前**不在仓库中**，需从生产/测试库导出后归档，否则智能体侧开发者无法本地建库、无法评审索引与容量。
 
 ### 4.3 典型时序（补货场景全链路）
 
 ```
-06:00 dkd-quartz Job
+06:00 dkd-quartz Job（失败重试 + 告警）
   → POST http://python:8090/agents/restock/analyze  (服务间密钥)
-     → [读] MySQL: 全量运营中设备的 Inventory + 近30天 Order 聚合 + 未完成补货工单
+     → [读] MySQL 只读账号: 运营中设备的 tb_inventory + 近30天 tb_order 聚合
+          （范围比较 create_time >= ? AND < ?，按 vm 分批，查询超时熔断）
+        + 在途补货工单 tb_task / tb_task_details
      → [算] 基线需求(统计) + LLM 校准(点位/节假日/异常)
-     → [校] 货道容量/MOQ等价约束/未完成工单去重
+     → [校] 货道容量(tb_inventory.max_stock)/最小预警值/未完成工单去重
+     → [选] 按设备 region_id 匹配 tb_emp 选定接单人（区域不符则标记为“待指派”，不得建单）
      → [写] agent_restock_plan(status=建议) + agent_decision_log
-  → 前端"补货工作台"展示待确认清单（含每条建议的依据）
-运营人员 点击"确认建单"
+  → 前端「补货工作台」展示待确认清单（含每条建议的依据）
+运营人员 点击「确认建单」
   → POST /agent/restock/{planId}/confirm (用户JWT)
-     → Java 网关转发 → Python 校验计划归属
+     → Java 网关转发 → Python 校验计划归属 + 幂等预检(plan.status 必须=建议/已调整)
      → Python 回调 Java: POST /manage/task (AgentCallback, 服务间密钥)
-        → TaskServiceImpl.insertTaskDto: 设备状态/防重/区域校验 → 创建工单+明细
-     → [写] agent_restock_plan(status=已建单, task_id) + 留痕
+        → TaskServiceImpl.insertTaskDto: 设备状态/防重/区域校验 → 创建工单(tb_task)+明细(tb_task_details)
+        （失败原因原样返回前端：设备有未完成工单 / 员工区域不一致 / 售货机不存在）
+     → [写] agent_restock_plan(status=已建单, task_id) + 留痕（幂等：重复确认直接返回已建单）
 运维人员(dkd-app) 接单 → 补货完成 → 库存回写
 7日后 Python 复盘 Job → 对比建议量 vs 实际消耗 → review_metrics → 迭代参数
 ```
@@ -259,9 +283,9 @@
 | 组件 | 选型 | 版本基线 | 理由 |
 | --- | --- | --- | --- |
 | 服务框架 | FastAPI + Uvicorn | ≥0.110 | 原生 async、SSE、Pydantic 结构化输出 |
-| 编排框架 | **LangGraph**（+ LangChain 核心包） | langgraph ≥0.2 | 有状态多 Agent 编排、checkpointer、human-in-the-loop 中断恢复 |
+| 编排框架 | **LangGraph**（+ LangChain 核心包） | **锁定精确版本三元组**（langgraph / langgraph-checkpoint / 下游 saver），禁止用 `≥x.y` 开放区间 | 有状态多 Agent 编排、checkpointer、human-in-the-loop 中断恢复。注意：`interrupt` 字段在 0.6 已被移除、1.0 又有变更，且 checkpointer 模块会绑定 langgraph 主版本——开放区间会导致 1-6 `interrupt` 节点返工 |
 | LLM 接入 | `langchain-openai`（OpenAI 兼容模式指向 DeepSeek） | — | 与现有 `ai.api-url` 同一供应商账号，零迁移成本；可切通义千问 |
-| 会话持久化 | `langgraph-checkpoint-redis` | — | 复用现有 Redis；多实例水平扩展友好 |
+| 会话持久化 | **`langgraph-checkpoint-sqlite`（AsyncSqliteSaver）**；备选 fallback：Postgres saver（需多实例时） | 锁定版本 | ① 本机 Redis 3.2.100 不支持 RedisJSON/RediSearch → `langgraph-checkpoint-redis` **不可用**；② 当前为单机部署，SQLite 零新增基础设施；③ 需同步备份 `*.db` 文件（写入 runbook）。**迁移触发条件：出现多实例部署或需跨机共享会话** |
 | 观测 | LangSmith（可选）+ 结构化日志 + `agent_decision_log` | — | 全链路 trace，Prompt/工具调用可回放审计 |
 | 数据访问 | SQLAlchemy 2.x（async, aiomysql）+ 只读账号 | — | 分析类查询 ORM/原生 SQL 双模式 |
 | 部署 | 独立 venv/conda，systemd 或 Windows 服务；与 dkd-parent 同机或同内网 | — | 与现有运维形态一致，Phase 0 不引入容器化复杂度 |
@@ -287,14 +311,15 @@
 ```
 
 - **Human-in-the-loop**：LangGraph `interrupt()` 原生支持——补货 Agent 生成计划后中断，等待前端确认事件恢复执行建单节点，天然的"建议→确认→执行"实现；
-- **结构化输出**：补货清单用 Pydantic 模型约束（字段对齐现有 `RestockSuggestionDto`：vmId/skuId/channelId/currentQuantity/suggestedQuantity/priority/reason），前端可直接复用现有补货建议弹窗的渲染逻辑。
+- **结构化输出**：补货清单用 Pydantic 模型约束（字段对齐现有 `RestockSuggestionDto`：vmId/skuId/channelId/currentQuantity/suggestedQuantity/priority/reason），前端可直接复用现有补货建议弹窗的渲染逻辑；
+- **state schema 冻结（V1 遗漏）**：LangGraph 会把**最新图代码立即应用于所有历史 checkpoint**，即每次发版本质上都是相对已有会话状态的兼容性变更。因此 `restock_graph` 的 state 字段必须在 Phase 0 评审冻结（0-13），后续变更须走「兼容性评审 + 存量会话处理方案」（新增字段给默认值、禁止删改已持久化字段）。
 
 ### 5.3 Python 工程结构（Phase 0 交付骨架）
 
 ```
 dkd-agent/
 ├─ app/main.py                 # FastAPI 入口
-├─ app/config.py               # env: LLM/API/DB/Redis/Agent密钥
+├─ app/config.py               # env: LLM/API/DB/Agent密钥(+ saver路径)
 ├─ app/api/                    # /chat(SSE) /agents/restock/** /agents/diagnose/**
 ├─ app/graphs/
 │   ├─ supervisor.py           # 总路由图
@@ -302,7 +327,8 @@ dkd-agent/
 │   └─ diagnose_graph.py       # 诊断子图(问诊→工具循环→结论→工单卡片)
 ├─ app/tools/                  # Java REST/MySQL 只读 工具封装(带鉴权/超时/重试)
 ├─ app/models/                 # Pydantic: 补货计划/诊断报告/对话消息
-├─ app/db/                     # SQLAlchemy 只读引擎 + SQL 白名单校验器
+├─ app/db/                     # SQLAlchemy 只读引擎 + SQL 白名单校验器 + 聚合工具(范围比较/分批)
+├─ app/checkpoint.py           # AsyncSqliteSaver 初始化与生命周期管理
 ├─ app/security.py             # 服务间密钥校验(回调) + 用户头解析(网关透传)
 └─ tests/                      # 单测 + 工具层集成测试(打桩Java接口)
 ```
@@ -310,54 +336,99 @@ dkd-agent/
 ### 5.4 前端改造点（dkd-vue，Phase 1）
 
 1. 全局 **AI 助手侧边栏**（右侧抽屉，SSE 流式渲染，支持 Markdown + 操作卡片）；
-2. `inventory/index.vue` 现有"补货建议"按钮升级 → 跳转**补货工作台**（确认式建单）；
+2. `inventory/index.vue` 现有「补货建议」按钮升级 → 跳转**补货工作台**（确认式建单）；
 3. `vm/index.vue` 的 AI 诊断弹窗升级为多轮对话框（入口 URL 不变，内部改调 `/agent/**`）；
-4. axios 层新增 `/agent` 前缀路由（无需改动拦截器，JWT 自动携带）。
+4. **新增独立 SSE 客户端（不能复用 axios）**：`src/utils/sse.js` 封装 `fetch` + `ReadableStream`，手动携带 `Authorization` 头（`EventSource` 不支持自定义头）、支持 `AbortController` 取消、解析 SSE 帧、含心跳超时；普通 `/agent/**` REST 调用仍走 axios。
+
+### 5.5 补货工单的接单人分配与幂等设计（V1 遗漏，M2 验收前置）
+
+**问题来源**：`TaskServiceImpl.insertTaskDto` 的校验链决定了两件事——
+
+```java
+// dkd-parent/dkd-manage/.../TaskServiceImpl.java:147-158
+// 查询同设备 + 同工单类型 + 进行中的工单，存在则拒绝
+taskParam.setInnerCode(taskDto.getInnerCode());
+taskParam.setProductTypeId(taskDto.getProductTypeId());
+taskParam.setTaskStatus(DkdContants.TASK_STATUS_PROGRESS);
+if (taskList != null && taskList.size() > 0) {
+    throw new ServiceException("设备有未完成工单，请勿重复创建工单");
+}
+// :160-167  接单人必须存在，且区域必须与设备区域一致
+if (!emp.getRegionId().equals(vm.getRegionId())) {
+    throw new ServiceException("员工区域与设备区域不一致，请勿创建工单");
+}
+```
+
+**设计要点**：
+
+| 项 | 设计 | 理由 |
+| --- | --- | --- |
+| 建单粒度 | **按设备整单**，`details[]` 携带多货道明细 | 防重校验是设备级，按货道拆单必然撞"设备有未完成工单" |
+| 接单人选择 | Agent 侧按设备 `region_id` 查询可用运维员工，优先「同区域 + 在岗」；按区域分组批量建单 | 避免"员工区域与设备区域不一致"失败；不同区域设备不能共用同一接单人 |
+| 无可用接单人 | 计划标记为「待指派」并进入人工处理队列，**不调建单接口** | 宁可让人来拍，也不要抛异常给运营 |
+| 幂等保护 | ① `agent_restock_plan.status` 状态机卡口（仅「建议/已调整」可确认）；② 建单前先行校验同设备是否已有进行中 补货工单；③ 乐观锁/版本号防并发双击 | 阻止重复点击、定时任务重跑、多人并发确认三种场景下的重复建单 |
+| 失败反馈 | 把 `ServiceException` 的 message 原样透传到前端（按设备聚合展示） | 让运营看到"哪台设备为什么没建成"，而不是失败弹窗一律吞掉 |
+| 留痕 | 每次建单尝试（含失败）写入 `agent_decision_log` | AGENTS §6.3：写操作决策必留痕 |
+
+> 对排期的影响：新增任务 1-8（区域分配 + 幂等，工作量 1.5 人日），并作为 M2 验收的前置——用 10 台**跨区域**设备预演，而非同区域设备。
 
 ---
 
 ## 六、分阶段实施计划
 
-> 原则：每阶段都有可独立演示的闭环交付物；总周期约 10~12 周（2~3 人投入：1 Python + 1 Java + 前端兼职）。
+> 原则：每阶段都有可独立演示的闭环交付物；**总周期 14 周（2026-09-21 ~ 2026-12-25）**。
+> 人力前提：1 Python（全职）+ 1 Java（**W1~W3 需 ≥80%**，之后 30%）+ 前端（W1~W7 需 ≥50%，之后 30%）。
+> **排期依据**：2026 年法定假期（中秋 09-25~27、国庆 10-01~07）扣减后，09-21~12-25 内的实际可用工日为 **64 天**（非 70 天）；V1 的「10~12 周」在 Phase 0 即出现 Java 侧约 **3.3 倍**负载超载（7 人日 vs 7 个可用工日 × 30%），不可执行。明细见排期计划 V2 §二/§六。
 
-### Phase 0：基础设施与集成底座（第 1~2 周）
+### Phase 0：基础设施与集成底座（W1~W3，09-21 ~ 10-09，9 个可用工日）
 
-- Python 工程骨架 + FastAPI 服务 + 健康检查；DeepSeek 连通（复用现有账号）；
-- Java 侧 `AgentGatewayController/AgentCallbackController/AgentProperties` + 单测；SSE 透传验证；
-- MySQL 只读账号、表白名单；Redis checkpointer 初始化；
-- 建表 DDL（agent_conversation/message/decision_log/restock_plan）；
-- 前端 AI 助手侧边栏壳（纯流式 echo 验证全链路）；
-- **验收标准**：前端侧边栏发起对话，经 Java 网关到 Python，LLM 流式返回；`agent.enabled=false` 一键降级回原 `/manage/ai` 逻辑。
+- Python 工程骨架 + FastAPI 服务 + 健康检查；DeepSeek 连通（复用现有账号）；依赖锁定（**精确版本三元组**）；
+- Java 侧 `AgentGatewayController/AgentCallbackController/AgentProperties` + 单测；SSE 逐块透传验证（`StreamingResponseBody`）；
+- MySQL 只读账号 + **`tb_` 真实表白名单** + 数据量与索引勘查；建表 DDL（agent_conversation/message/decision_log/restock_plan）；
+- **checkpointer：SQLite `AsyncSqliteSaver`**（Redis 3.2.100 不可用的实测依据见 §5.1）；
+- 前端 SSE 客户端（绕开 axios）+ AI 助手侧边栏壳（纯流式 echo 验证全链路）；
+- `request_id` 贯穿 + 决策留痕 + **LLM 成本计量与限额**；LangGraph 版本锁定与 state schema 评审；
+- 安全整改四项（提交 / 轮换 / Git 历史清理 / 生产注入校验）；
+- **中间门 G1（09-30）**：前端→网关→Python echo 流式打通；
+- **验收标准（10-09）**：前端侧边栏发起对话，经 Java 网关到 Python，LLM 流式返回；`agent.enabled=false` 一键降级回原 `/manage/ai` 逻辑（侧边栏入口隐藏，不伪造会话能力）；回调无密钥/伪造密钥均 401；代码库与 Git 历史无明文密钥。
 
-### Phase 1：智能补货 Agent MVP（第 3~5 周）
+### Phase 1：智能补货 Agent MVP（W4~W7，10-12 ~ 11-06，20 个可用工日）
 
-- 工具层：库存/订单聚合/在途工单查询（MySQL 只读）+ 工单创建（Java 回调）；
+- 工具层：库存/订单聚合/在途工单查询（MySQL 只读，**范围比较 + 分批 + 超时熔断**）+ 工单创建（Java 回调）；
 - 补货子图：统计基线（7/14/30 天分位销量 + 货道容量约束）→ LLM 校准与理由生成 → `interrupt` 人工确认 → 建单 → 留痕；
-- dkd-quartz 每日 06:00 触发任务；
-- 前端补货工作台（清单渲染 + 确认建单 + 失败原因展示）；
-- **验收标准**：对 ≥10 台真实设备跑通"夜间分析 → 早晨确认 → 批量建单 → 工单正常流转"；与规则版 `generateRestockSuggestions` 并行对比 2 周，输出效果对比报告。
+- **接单人分配与幂等保护（§5.5，V1 遗漏）**；
+- dkd-quartz 每日 06:00 触发任务（失败重试 + 告警）；
+- 前端补货工作台（清单渲染 + 确认建单 + 失败原因按设备展示）；
+- **验收标准**：对 ≥10 台 **跨区域**真实设备跑通「夜间分析 → 早晨确认 → 批量建单 → 工单正常流转」；与规则版 `generateRestockSuggestions` 并行对比 **3 周**，输出效果对比报告。
 
-### Phase 2：设备故障诊断 Agent（第 6~7 周）
+### Phase 2：设备故障诊断 Agent（W8~W10，11-09 ~ 11-27，15 个可用工日）
 
-- 诊断子图 + 设备/库存/工单历史工具；多轮问诊；
+- 诊断子图 + 设备/库存/工单历史工具；多轮问诊；设备实体消歧（`tb_vending_machine.addr` 模糊匹配）；
 - 诊断结论结构化（原因排序/处置建议/置信度）→ 维修工单创建卡片（结论写入工单备注）；
 - `vm/index.vue`、`node/index.vue` 入口切换至 `/agent/**`；
-- 故障案例库冷启动（历史维修工单清洗入库，RAG 可选，先规则检索）；
+- 故障案例库冷启动（**先做 0.5d 数据质量抽样**，不达标则降级为规则库；RAG 可选）；
+- 兜底与降级：Agent 不可用时回落 `/manage/ai/diagnose` 单轮逻辑；
 - **验收标准**：运营人员在无培训情况下完成 5 个真实故障的诊断→建单闭环；诊断信息量显著优于现有 100 字单轮建议。
 
-### Phase 3：运营分析 Copilot + 体系化收尾（第 8~10 周）
+### Phase 3：运营分析 Copilot + 体系化收尾（W11~W13，11-30 ~ 12-18，15 个可用工日）
 
-- 预置分析模板（点位排行/SKU 动销/区域对比/合作商分润）+ 参数抽取；受控 NL2SQL（只读+白名单+校验器）；
+- 预置分析模板（点位排行/SKU 动销/区域对比/合作商分润）+ **评测集构建（50~100 条，作为 3-3/3-4 的前置）** + 参数抽取；受控 NL2SQL（只读 + 白名单 + 静态校验器）；
 - 补货复盘自动化（7 日回看指标迭代）；
-- 可观测看板：`agent_decision_log` → 决策审计页面（RuoYi 标准列表页）；
-- 安全收尾：密钥外置、回调白名单、压测与故障演练；
-- **验收标准**：运营高频取数问题 80% 由 Copilot 直接回答；全部写操作可审计追溯。
+- 可观测看板：`agent_decision_log` → 决策审计页面（RuoYi 标准列表页，含 JSON 详情与回放）；
+- 压测与故障演练（含 **SQLite 文件损坏恢复**、MySQL 慢查询、定时任务重入）；
+- **验收标准**：运营高频取数问题 80% 由 Copilot 直接回答（按评测集抽样验证，而非主观断言）；全部写操作可审计追溯。
 
-### Phase 4（后续规划，暂不承诺）
+### Phase 4：上线收尾（W14，12-21 ~ 12-25，5 个可用工日）
+
+- 文档收尾（接口文档 / 部署 runbook / 运维手册 / 用户操作指引 / SQLite 备份恢复手册）；
+- 上线评审与灰度（`agent.enabled` 按环境/角色开关）+ 回滚预案演练；
+- 上线值守与首日观测（trace/错误率/token 消耗/留痕完整性）；1 天延期缓冲。
+
+### Phase 5（后续规划，暂不承诺）
 
 - 按置信度分级自动建单（放量前需 Phase 3 复盘数据支撑）；
 - 点位选址 Agent、货道配置优化；
-- MQ 事件化改造、多实例部署、模型灰度切换。
+- MQ 事件化改造、多实例部署（**伴随 checkpointer 迁移**）、Redis 版本升级、模型灰度切换。
 
 ---
 
@@ -365,12 +436,16 @@ dkd-agent/
 
 | 风险 | 等级 | 对策 |
 | --- | --- | --- |
-| LLM 建议错误导致错补/漏补 | 高 | 首期全部人工确认；复盘指标闭环；对比期与规则版并行跑 |
-| NL2SQL 越权/慢查询拖垮库 | 高 | 只读账号 + 白名单 + SQL 静态校验 + 查询超时熔断；分析走独立只读实例（可后续加从库） |
-| Python 服务故障影响主业务 | 中 | 旁路架构 + `agent.enabled` 开关 + 现有 IAiService 兜底，主业务零依赖 |
+| LLM 建议错误导致错补/漏补 | 高 | 首期全部人工确认；复盘指标闭环；与规则版并行 3 周对比 |
+| NL2SQL 越权/慢查询拖垮库 | 高 | 只读账号仅授权白名单表 + SQL 静态校验 + 超时熔断；**当前无从库（`slave.enabled=false`）**，分析限于凌晨窗口 + 分批 + 缓存；Phase 3 前决策只读实例/从库 |
+| **补货建单反复失败（区域不匹配 / 重复建单）** | 高 | §5.5 接单人分配 + 「待指派」队列 + 幂等保护；M2 验收改用**跨区域**设备预演 |
+| **checkpointer 向后兼容（state schema 变更）** | 中 | Phase 0 冻结 schema；变更走兼容性评审 + 存量会话处理方案；SQLite 文件纳入定期备份与恢复演练 |
+| **业务表 DDL/数据量未知（仓库无 DDL）** | 中 | Phase 0 数据量与索引勘查，导出归档 `docs/ddl/`；聚合限制分批 + 超时 + EXPLAIN 留档 |
+| Python 服务故障影响主业务 | 中 | 旁路架构 + `agent.enabled` 开关 + 现有 IAiService 兜底，主业务零依赖；降级时隐藏对话入口 |
 | 服务间回调被滥用 | 中 | 内网限定 + 密钥鉴权 + 路径白名单 + 速率限制 |
 | Prompt 注入（用户输入操纵工具调用） | 中 | 系统提示隔离、工具入参白名单化、写操作二次确认不受对话影响 |
-| 成本失控（LLM token 消耗） | 低 | 会话长度上限、缓存取数结果、按用户/场景限额与计量报表 |
+| 成本失控（LLM token 消耗） | 低 | 会话长度上限、缓存取数结果、按用户/场景限额与计量报表；**计量与限额在 Phase 0 就绪**（V1 排在 W10，太晚） |
+| **技术债：本机 Redis 3.2.100**（无模块/无 Streams/`appendonly no`/与 Java 共用 db0） | 低 | 本期不依赖 Redis；登记技术债，触发条件：多实例部署或需跨机共享会话 |
 | 团队 Python 运维经验不足 | 低 | 单服务极简部署（无容器依赖）、LangSmith/日志双观测、完整 runbook |
 
 ---
@@ -385,17 +460,47 @@ dkd-agent/
 | 运营取数需求交付周期 | 现状依赖开发导数 | 从小时级降到分钟级（Copilot 自助） |
 | 决策可审计率 | 0（现状无留痕） | 写操作 100% 留痕可回溯 |
 
+> **基线采集要求（V1 遗漏）**：上述 5 项指标必须在 Phase 0~1 期间**先把基线值落库固定**（缺货率可从 `tb_inventory` 预警数据回溯计算，排单耗时需人工计时抽样 2 周，故障响应时长为 `tb_task` 创建间隔统计），否则 3 个月后无法得出可信结论；Phase 1 的规则版双跑（1-14）同时承担基线采集职责。
+> Copilot 的 80% 自助回答口径需按 3-2 的评测集抽样验证，不接受主观统计。
+
 ---
 
 ## 九、待评审决策点（请重点确认）
 
-1. **写操作边界**：首期"全部人工确认"是否符合预期？还是允许低风险场景（如库存盘点修正）直接执行？
-2. **补货建单粒度**：按"设备"整单创建（现状 insertTaskDto 即设备级）还是支持按货道拆分？
-3. **LLM 供应商**：继续 DeepSeek，还是评估通义千问（两者均为 OpenAI 兼容，切换成本≈0，仅改配置）？
-4. **部署位置**：dkd-agent 与 dkd-parent 同机部署（当前单机形态）还是独立服务器？
-5. **Phase 1 对比期**：与规则版补货建议并行跑 2 周是否可接受（涉及双入口并存的 UI 处理）？
-6. **安全整改**：application.yml 明文密钥轮换与外置是否随 Phase 0 一并执行？
+1. **写操作边界**：首期「全部人工确认」是否符合预期？还是允许低风险场景（如库存盘点修正）直接执行？
+2. ~~补货建单粒度~~ → **已收敛为陈述句（仅需确认）**：`insertTaskDto` 的防重校验是「同设备+同工单类型+进行中」，因此只能是**按设备整单创建 + 明细多货道**，无法按货道拆分。请确认该约束符合业务预期（若必须按货道拆分，则需改造 Java 侧防重逻辑，属另一项需求）。
+3. **LLM 供应商**：继续 DeepSeek，还是评估通义千问（均为 OpenAI 兼容，切换成本≈0）？**补充**：DeepSeek 能满足 function calling，但结构化输出（补货校准、参数抽取、NL2SQL）精度需用评测集（3-2）实测后再定，建议先建评测集、再定模型。
+4. **部署位置**：dkd-agent 与 dkd-parent 同机部署（当前单机形态）还是独立服务器？（**同时决定** SQLite checkpointer 是否够用，见下条）
+5. **Phase 1 对比期**：与规则版补货建议并行跑 **3 周**（V1 为 2 周，因 Phase 1 后移而顺延）是否可接受（涉及双入口并存的 UI 处理）？
+6. **安全整改（描述已按实际进展修正）**：配置外置**已提交**、`main`/`origin` 可达历史已无明文（初始提交已重写为 `3e1f4a8`），本地 `.env` 已就绪 → 剩余动作是**凭据轮换 + 确认生产环境已注入环境变量**（旧 DeepSeek Key 实测 401 已失效，OSS AK/SK 与 DB/Redis 弱口令待轮换）。注：JWT secret 轮换会使在线用户全部掉线，需运营确认窗口。
+7. **checkpointer 选型（新增）**：本机 Redis 3.2.100 不支持 RedisJSON/RediSearch → 已默认选用 **SQLite `AsyncSqliteSaver`**（单机部署）。请确认：是否接受单机会话存储？（若计划年内多实例部署，建议直接上 Postgres saver，避免二次迁移）
+8. **接单人分配策略（新增）**：机器人自动按「设备区域 + 在岗」选运维员工（不足则进「待指派」队列），还是由产品指定固定接单人？
+9. **分析读路径（新增）**：何时上只读实例/从库？当前单主库 + 无从库，Phase 3 的 NL2SQL 上线前需给出结论。
+10. **评测集与准确率目标（新增）**：是否接受「先建 50~100 条评测集，再定准确率目标」的路径（V1 直接写死 ≥90%，无前置评测任务）？
 
 ---
 
-*本方案基于对 dkd-parent/dkd-app/dkd-vue 源码的实际分析编写（关键依据：`com.dkd.common.ai` 包、`TaskServiceImpl.insertTaskDto` 校验链、`IInventoryService` 预警/补货建议接口、`application.yml` 配置）。评审通过后输出：① 原型图（AI 助手侧边栏/补货工作台/诊断对话）；② Phase 0 详细技术设计与 DDL。*
+*本方案基于对 dkd-parent/dkd-app/dkd-vue 源码与现场环境的实际核对编写（证据索引见下）；评审通过后输出：① Phase 0 详细技术设计（含 DDL）；② 只读账号授权 SQL 与表白名单。原型见 `docs/prototypes/dkd-agent-prototype.html`（V2）。*
+
+---
+
+## 十、证据索引（V1.1 修订依据，均为一手核对）
+
+| 结论 | 证据位置 |
+| --- | --- |
+| 业务表均为 `tb_` 前缀 | `dkd-parent/dkd-manage/src/main/resources/mapper/manage/*.xml`（如 `InventoryMapper.xml:25-30`、`OrderMapper.xml:36`） |
+| 工单防重（同设备+同类型+进行中） | `TaskServiceImpl.java:147-158` |
+| 接单人必须存在且区域=设备区域 | `TaskServiceImpl.java:159-167` |
+| 补货工单明细写入 | `TaskServiceImpl.java:177-191` |
+| 规则版补货建议现状（作为对比基线） | `InventoryServiceImpl.java:414-535` |
+| 订单聚合时间字段与索引失效写法 | `OrderMapper.xml:31-32,44-47` |
+| 库存字段实际列名（current_stock/min_stock/max_stock） | `InventoryMapper.xml:12-13,25` |
+| 现有 AI 链路（Hutool 直连 DeepSeek） | `dkd-common/.../ai/service/impl/AiServiceImpl.java:344`、`AiController`、`manage/controller/AiOperationController.java` |
+| 前端 axios 无法承载 SSE | `dkd-vue/src/utils/request.js:18,20,75-84` |
+| 单主库、无从库 | `dkd-parent/dkd-admin/src/main/resources/application-druid.yml`（`slave.enabled: false`） |
+| Redis 配置（db 0、共用） | `application.yml:66-90` |
+| 本机 Redis 3.2.100 能力边界 | `E:\Redis-x64-3.2.100`：`redis-server --version` = 3.2.100；`redis.windows.conf:194-196,582`（`appendonly no`）；无 `maxmemory` 配置项 |
+| 配置外置已完成但未提交 | `git status`（`application.yml`/`application-druid.yml`/`dkd-app application-dev.yml` 为 M，`.env.example` 为 ??） |
+| Git 历史与密钥现状（2026-09-21 复核） | `git log --all -p -- dkd-parent/dkd-admin/src/main/resources/application.yml` 已无明文；`git fsck` 可见 dangling `5d56572`（旧提交，含明文）；旧 DeepSeek Key 探测返回 HTTP 401 |
+| 业务表 DDL 未入库 | `dkd-parent/sql/` 下仅有 RuoYi 系统表、`quartz.sql`、`tb_report.sql` |
+| 2026 年假期 | 国务院办公厅关于 2026 年部分节假日安排的通知（中秋 09-25~27、国庆 10-01~07，09-20/10-10 上班） |
