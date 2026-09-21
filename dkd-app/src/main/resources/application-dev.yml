@@ -1,0 +1,19 @@
+dkd:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    host: localhost
+    port: 3306
+    database: dkd
+    username: root
+    # 为什么用占位符：AGENTS.md §7.1 安全红线——DB 密码禁止明文入库，由环境变量注入
+    password: ${DKD_DB_PASSWORD}
+  redis:
+    host: localhost
+    port: 6379
+    # 为什么用占位符：同上，Redis 密码由环境变量注入
+    password: ${DKD_REDIS_PASSWORD}
+  sms:
+    key:
+    secret:
+    sign-name: 阿里云短信测试
+    template-code: SMS_154950909

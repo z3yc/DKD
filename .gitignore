@@ -1,0 +1,50 @@
+######################################################################
+# DKD 单体仓库 · 根级忽略规则
+# 说明：各子目录（dkd-parent / dkd-vue）保留自有 .gitignore，两层叠加生效
+######################################################################
+
+# ---- 构建产物 ----
+# 注意：不带前导斜杠的目录 pattern 会匹配任意层级，故仅对根目录下的 build/ 生效，
+# 避免误伤 dkd-vue/src/views/tool/build/（表单构建器源码）
+target/
+/build/
+dist/
+*.class
+*.jar
+*.war
+
+# ---- 依赖目录 ----
+node_modules/
+
+# ---- 凭据文件（真值只存本机/部署环境，不入仓）----
+# 模板 .env.example 需入仓，故显式取反
+.env
+!.env.example
+
+# ---- 日志与临时文件 ----
+*.log
+logs/
+*.tmp
+*.swp
+*.versionsBackup
+
+# ---- IDE / 编辑器 ----
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.classpath
+.project
+
+# ---- AI 工具本地配置（含本机路径/本地权限，不入仓）----
+# 注意：带斜杠的 pattern 锚定在 .gitignore 所在目录，故子目录需用 **/ 前缀
+**/.claude/settings.local.json
+.gstack/
+**/.gstack/
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini

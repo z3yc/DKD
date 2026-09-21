@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DKD 智能体原型 V2 · 补货工作台 / 设备诊断 / 运营分析</title>
+<style>
+  :root{
+    --primary:#409EFF; --primary-light:#ecf5ff; --primary-dark:#337ecc;
+    --success:#67C23A; --success-light:#f0f9eb;
+    --warning:#E6A23C; --warning-light:#fdf6ec;
+    --danger:#F56C6C;  --danger-light:#fef0f0;
+    --info:#909399;
+    --text:#303133; --text-2:#606266; --text-3:#909399;
+    --border:#DCDFE6; --border-l:#E4E7ED;
+    --bg:#f0f2f5; --card:#fff; --sidebar:#001529;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;font-family:"Helvetica Neue",Helvetica,"PingFang SC","Microsoft YaHei",Arial,sans-serif}
+  body{background:var(--bg);color:var(--text);font-size:14px;overflow:hidden}
+  button{cursor:pointer;border:none;border-radius:4px;font-size:13px;transition:all .2s}
+  .layout{display:flex;height:100vh;flex-direction:column}
+  /* ===== 顶栏 ===== */
+  .topbar{height:50px;background:#fff;border-bottom:1px solid var(--border-l);display:flex;align-items:center;padding:0 16px;gap:12px;z-index:10}
+  .topbar .logo{font-weight:700;font-size:16px;color:var(--primary);margin-right:16px}
+  .breadcrumb{color:var(--text-3);font-size:13px;flex:1}
+  .breadcrumb b{color:var(--text);font-weight:500}
+  .ai-btn{background:linear-gradient(135deg,#409EFF,#7b5cff);color:#fff;padding:8px 16px;border-radius:20px;display:flex;align-items:center;gap:6px;font-weight:500}
+  .ai-btn:hover{filter:brightness(1.08)}
+  .ai-btn .dot{width:8px;height:8px;border-radius:50%;background:#fff;animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .avatar{width:34px;height:34px;border-radius:50%;background:var(--primary-light);color:var(--primary);display:flex;align-items:center;justify-content:center;font-weight:600}
+  .env-tag{font-size:11px;background:var(--success-light);color:var(--success);padding:2px 8px;border-radius:3px}
+  /* ===== 主体 ===== */
+  .main{display:flex;flex:1;overflow:hidden}
+  .menu{width:200px;background:var(--sidebar);color:rgba(255,255,255,.65);padding-top:8px;flex-shrink:0}
+  .menu .item{padding:12px 20px;cursor:pointer;border-left:3px solid transparent;font-size:14px}
+  .menu .item:hover{color:#fff}
+  .menu .item.active{color:#fff;background:rgba(64,158,255,.15);border-left-color:var(--primary)}
+  .menu .group{padding:8px 20px;font-size:11px;color:rgba(255,255,255,.35);letter-spacing:1px}
+  .menu .item.ai-item{color:#7babff}
+  .menu .item.ai-item.active{color:#fff;border-left-color:#7b5cff}
+  .content{flex:1;overflow-y:auto;padding:16px}
+  .page{display:none;animation:fadein .3s}
+  .page.active{display:block}
+  @keyframes fadein{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .page-title{font-size:18px;font-weight:600;margin-bottom:4px}
+  .page-sub{color:var(--text-3);font-size:12px;margin-bottom:14px}
+  .steps{display:inline-flex;gap:0;margin-bottom:14px;background:#fff;border:1px solid var(--border-l);border-radius:6px;overflow:hidden;font-size:12px}
+  .steps span{padding:7px 14px;color:var(--text-3);display:flex;align-items:center;gap:6px}
+  .steps span b{width:16px;height:16px;border-radius:50%;background:#e4e7ed;color:#909399;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:600}
+  .steps span.on{background:var(--primary-light);color:var(--primary);font-weight:600}
+  .steps span.on b{background:var(--primary);color:#fff}
+  /* ===== 卡片 ===== */
+  .card{background:var(--card);border-radius:6px;border:1px solid var(--border-l);padding:16px;margin-bottom:14px}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px}
+  .stat{background:var(--card);border:1px solid var(--border-l);border-radius:6px;padding:14px 16px}
+  .stat .label{color:var(--text-3);font-size:12px}
+  .stat .value{font-size:22px;font-weight:700;margin:4px 0 2px}
+  .stat .delta{font-size:12px}
+  .up{color:var(--danger)} .down{color:var(--success)}
+  /* ===== 表格 ===== */
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{background:#f8f9fb;color:var(--text-2);font-weight:600;text-align:left;padding:9px 12px;border-bottom:1px solid var(--border-l)}
+  td{padding:9px 12px;border-bottom:1px solid #f2f3f5;vertical-align:middle}
+  tr:hover td{background:#f8fbff}
+  tr.detail-row:hover td{background:#fafcff}
+  tr.detail-row td{background:#fafbfc;color:var(--text-2);font-size:12px;line-height:1.8;border-bottom:1px solid var(--border-l)}
+  .tag{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;line-height:1.6}
+  .tag.p-urgent{background:var(--danger-light);color:var(--danger)}
+  .tag.p-high{background:var(--warning-light);color:var(--warning)}
+  .tag.p-mid{background:var(--primary-light);color:var(--primary)}
+  .tag.p-low{background:#f4f4f5;color:var(--info)}
+  .tag.s-pending{background:var(--primary-light);color:var(--primary)}
+  .tag.s-adjusted{background:var(--warning-light);color:var(--warning)}
+  .tag.s-skipped{background:#f4f4f5;color:var(--info)}
+  .tag.s-done{background:var(--success-light);color:var(--success)}
+  .btn-p{background:var(--primary);color:#fff;padding:7px 14px}
+  .btn-p:hover{background:var(--primary-dark)}
+  .btn-p:disabled{background:#a0cfff;cursor:not-allowed}
+  .btn-s{background:#fff;border:1px solid var(--border);color:var(--text-2);padding:6px 13px}
+  .btn-s:hover{color:var(--primary);border-color:var(--primary)}
+  .btn-xs{padding:3px 9px;font-size:12px}
+  .btn-warn{background:#fff;border:1px solid #f3d19e;color:var(--warning);padding:6px 13px}
+  .btn-warn:hover{background:var(--warning-light)}
+  .progress{height:8px;background:#f0f2f5;border-radius:4px;overflow:hidden;min-width:80px;display:inline-block;vertical-align:middle}
+  .progress i{display:block;height:100%;border-radius:4px;background:var(--danger)}
+  .progress i.mid{background:var(--warning)} .progress i.ok{background:var(--success)}
+  /* 筛选 chips */
+  .fchips{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap;align-items:center}
+  .fchip{padding:4px 12px;border-radius:14px;background:#f4f4f5;color:var(--text-3);cursor:pointer;font-size:12px;border:none}
+  .fchip.on{background:var(--primary-light);color:var(--primary);font-weight:600}
+  .fchip .cnt{font-size:11px;opacity:.75;margin-left:2px}
+  .plan-meta{display:flex;gap:16px;font-size:12px;color:var(--text-3);align-items:center;flex-wrap:wrap}
+  .plan-meta b{color:var(--text)}
+  .plan-actions{margin-left:auto;display:flex;gap:8px}
+  .banner{background:var(--warning-light);border:1px solid #f3d19e;color:#a0741a;border-radius:4px;padding:8px 12px;font-size:12px;margin-bottom:10px;display:flex;align-items:center;gap:10px}
+  .chev{color:var(--primary);font-size:12px;cursor:pointer;user-select:none;white-space:nowrap}
+  /* ===== 对话区（诊断页） ===== */
+  .chat-wrap{display:flex;gap:14px;height:calc(100vh - 170px)}
+  .chat{flex:1.6;display:flex;flex-direction:column;background:#fff;border:1px solid var(--border-l);border-radius:6px;overflow:hidden}
+  .chat-head{padding:12px 16px;border-bottom:1px solid var(--border-l);display:flex;align-items:center;gap:10px}
+  .chat-head .robot{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#409EFF,#7b5cff);color:#fff;display:flex;align-items:center;justify-content:center;font-size:15px}
+  .chat-body{flex:1;overflow-y:auto;padding:18px;background:#f7f9fc}
+  .msg{display:flex;gap:10px;margin-bottom:16px}
+  .msg .ava{width:30px;height:30px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:13px}
+  .msg.user .ava{background:var(--primary-light);color:var(--primary)}
+  .msg.ai .ava{background:linear-gradient(135deg,#409EFF,#7b5cff);color:#fff}
+  .bubble{max-width:78%;border-radius:8px;padding:10px 14px;line-height:1.8;font-size:13.5px;background:#fff;border:1px solid var(--border-l);box-shadow:0 1px 2px rgba(0,0,0,.03)}
+  .msg.user .bubble{background:var(--primary);color:#fff;border:none}
+  .typing-cursor::after{content:"▌";color:var(--primary);animation:pulse .8s infinite}
+  .tool-chip{display:inline-flex;align-items:center;gap:6px;background:#f0f5ff;border:1px dashed #a3c5fd;color:#337ecc;border-radius:4px;padding:4px 10px;font-size:12px;margin:3px 4px 3px 0}
+  .tool-chip .spin{display:inline-block;width:11px;height:11px;border:2px solid #a3c5fd;border-top-color:transparent;border-radius:50%;animation:rot .8s linear infinite}
+  @keyframes rot{to{transform:rotate(360deg)}}
+  .chat-input{border-top:1px solid var(--border-l);padding:12px;display:flex;gap:10px;background:#fff}
+  .chat-input input{flex:1;border:1px solid var(--border);border-radius:4px;padding:9px 12px;font-size:13px;outline:none}
+  .chat-input input:focus{border-color:var(--primary)}
+  .action-card{margin-top:10px;border:1px solid #b3d8ff;background:#f0f7ff;border-radius:6px;overflow:hidden}
+  .action-card .ac-head{background:#d9ecff;color:#1d6fb8;padding:7px 12px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px}
+  .action-card .ac-body{padding:10px 12px;font-size:12.5px;color:var(--text-2);line-height:1.8}
+  .action-card .ac-foot{padding:8px 12px;text-align:right;background:#f7fbff}
+  .rank{list-style:none}
+  .rank li{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12.5px}
+  .rank .r-bar{flex:1;height:6px;background:#eee;border-radius:3px;overflow:hidden}
+  .rank .r-bar i{display:block;height:100%;background:linear-gradient(90deg,#409EFF,#7b5cff)}
+  /* ===== 右侧档案面板 ===== */
+  .profile{flex:1;background:#fff;border:1px solid var(--border-l);border-radius:6px;overflow-y:auto}
+  .profile h4{padding:12px 16px;border-bottom:1px solid var(--border-l);font-size:13px;color:var(--text-2)}
+  .kv{display:flex;padding:8px 16px;font-size:12.5px}
+  .kv .k{width:96px;color:var(--text-3);flex-shrink:0}
+  .kv .v{color:var(--text)}
+  .mini-chart{padding:10px 16px}
+  .bars{display:flex;align-items:flex-end;gap:5px;height:90px}
+  .bars i{flex:1;background:linear-gradient(180deg,#79bbff,#409EFF);border-radius:3px 3px 0 0;position:relative}
+  .bars i em{position:absolute;top:-16px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--text-3);font-style:normal;white-space:nowrap}
+  .bars i u{position:absolute;bottom:-18px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--text-3);text-decoration:none;white-space:nowrap}
+  /* ===== Copilot ===== */
+  .nl-row{display:flex;gap:10px;margin-bottom:10px}
+  .nl-row input{flex:1;border:1px solid var(--border);border-radius:4px;padding:10px 14px;font-size:13px;outline:none}
+  .nl-row input:focus{border-color:var(--primary)}
+  .quick{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+  .quick .q{font-size:12px;background:#f4f6f9;border:1px solid var(--border-l);border-radius:14px;padding:5px 12px;color:var(--text-2);cursor:pointer}
+  .quick .q:hover{color:var(--primary);border-color:var(--primary)}
+  .ctrl-bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;border-bottom:1px solid var(--border-l);padding-bottom:12px;margin-bottom:14px}
+  .ctrl-group{display:flex;align-items:center;gap:6px}
+  .ctrl-group .gl{font-size:12px;color:var(--text-3)}
+  .ctabs{display:flex;gap:0;margin-left:auto;border:1px solid var(--border);border-radius:4px;overflow:hidden}
+  .ctab{padding:6px 14px;background:#fff;color:var(--text-2);font-size:12px;border-radius:0}
+  .ctab.on{background:var(--primary);color:#fff}
+  .ctab:hover:not(.on){color:var(--primary)}
+  .chart-title{font-size:14px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .insight{background:var(--primary-light);border-left:3px solid var(--primary);border-radius:4px;padding:10px 14px;font-size:12.5px;color:var(--text-2);line-height:1.8;margin-top:14px}
+  .insight b{color:var(--primary-dark)}
+  .lg-row{display:flex;align-items:center;gap:10px;padding:7px 0;font-size:12.5px;border-bottom:1px dashed #f0f0f0}
+  .lg-dot{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+  .lg-name{width:110px;color:var(--text-2)}
+  .lg-val{color:var(--text);font-weight:600;margin-left:auto}
+  .lg-pct{width:52px;text-align:right;color:var(--text-3)}
+  .rk-row{display:flex;align-items:center;gap:10px;padding:8px 0;font-size:12.5px}
+  .rk-name{width:130px;color:var(--text-2);flex-shrink:0}
+  .rk-bar{flex:1;height:14px;background:#f0f2f5;border-radius:7px;overflow:hidden}
+  .rk-bar i{display:block;height:100%;border-radius:7px;background:linear-gradient(90deg,#79bbff,#409EFF)}
+  .rk-val{width:84px;text-align:right;font-weight:600}
+  .rk-wow{width:70px;text-align:right;font-size:12px}
+  details.sqlbox{margin-top:14px;border-top:1px dashed var(--border-l);padding-top:10px}
+  details.sqlbox summary{cursor:pointer;color:var(--text-3);font-size:12px;user-select:none}
+  details.sqlbox summary:hover{color:var(--primary)}
+  .sqlcode{background:#282c34;color:#abb2bf;border-radius:6px;padding:14px;font-family:Consolas,monospace;font-size:12px;line-height:1.8;overflow-x:auto;margin-top:10px}
+  .checks{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  /* ===== 步进器 / 参数 ===== */
+  .stepper{display:flex;align-items:center;gap:0;border:1px solid var(--border);border-radius:4px;width:fit-content}
+  .stepper button{width:34px;height:34px;font-size:16px;background:#f4f4f5;color:var(--text-2);border-radius:0}
+  .stepper button:hover{background:var(--primary-light);color:var(--primary)}
+  .stepper .val{width:64px;text-align:center;font-size:16px;font-weight:700;color:var(--primary)}
+  .quick-set{display:flex;gap:8px;margin-top:8px}
+  .quick-set button{font-size:12px;color:var(--text-3);background:#f4f4f5;padding:4px 10px;border-radius:12px}
+  .quick-set button:hover{color:var(--primary)}
+  .adj-reasons{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+  .adj-reasons .r{padding:5px 12px;border-radius:14px;border:1px solid var(--border);background:#fff;color:var(--text-2);font-size:12px}
+  .adj-reasons .r.on{background:var(--primary-light);border-color:var(--primary);color:var(--primary);font-weight:600}
+  .param-row{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--text-2);padding:6px 0}
+  .param-row input[type=range]{width:160px;accent-color:var(--primary)}
+  .dlg-sec{margin-top:14px}
+  .dlg-sec .t{font-size:12px;color:var(--text-3);margin-bottom:6px}
+  .dlg-sec .t b{color:var(--danger);font-weight:400}/* 必填星 */
+  /* ===== AI 抽屉 ===== */
+  .drawer-mask{position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:99;display:none}
+  .drawer-mask.show{display:block}
+  .drawer{position:fixed;top:0;right:-420px;width:400px;height:100vh;background:#fff;z-index:100;box-shadow:-6px 0 20px rgba(0,0,0,.1);display:flex;flex-direction:column;transition:right .25s}
+  .drawer.show{right:0}
+  .drawer-head{padding:14px 16px;border-bottom:1px solid var(--border-l);display:flex;align-items:center;gap:10px}
+  .drawer-head .close{margin-left:auto;color:var(--text-3);font-size:18px;background:none}
+  .scene-tabs{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--border-l)}
+  .scene-tabs .s{padding:4px 10px;border-radius:14px;font-size:12px;background:#f4f4f5;color:var(--text-3);cursor:pointer}
+  .scene-tabs .s.on{background:var(--primary-light);color:var(--primary);font-weight:600}
+  .drawer .chat-body{background:#fafbfc}
+  .drawer .bubble{max-width:88%}
+  /* toast & dialog */
+  .toast{position:fixed;top:70px;left:50%;transform:translateX(-50%);background:#f0f9eb;border:1px solid #c2e7b0;color:var(--success);padding:10px 20px;border-radius:4px;z-index:200;display:none;font-size:13px;max-width:70vw}
+  .dialog-mask{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:150;display:none;align-items:center;justify-content:center}
+  .dialog-mask.show{display:flex}
+  .dialog{width:500px;background:#fff;border-radius:8px;overflow:hidden;animation:fadein .2s}
+  .dialog .d-head{padding:14px 20px;font-weight:600;border-bottom:1px solid var(--border-l)}
+  .dialog .d-body{padding:16px 20px;font-size:13px;line-height:1.9;color:var(--text-2);max-height:64vh;overflow-y:auto}
+  .dialog .d-foot{padding:12px 20px;text-align:right;border-top:1px solid var(--border-l)}
+  .proto-note{position:fixed;bottom:12px;right:12px;background:rgba(0,0,0,.55);color:#fff;font-size:11px;padding:6px 12px;border-radius:20px;z-index:50}
+  .fade-row{opacity:.55}
+</style>
+</head>
+<body>
+<div class="layout">
+  <!-- 顶栏 -->
+  <div class="topbar">
+    <span class="logo">帝可得 · 运营平台</span>
+    <span class="env-tag">智能体原型 V2</span>
+    <span class="breadcrumb">AI 智能体 / <b id="crumb">智能补货工作台</b></span>
+    <button class="ai-btn" onclick="openDrawer()"><span class="dot"></span> AI 助手</button>
+    <div class="avatar">运</div>
+  </div>
+  <div class="main">
+    <!-- 菜单 -->
+    <div class="menu">
+      <div class="group">智能体</div>
+      <div class="item ai-item active" data-page="restock" onclick="switchPage(this)">智能补货工作台 <span style="font-size:10px;opacity:.7">P0</span></div>
+      <div class="item ai-item" data-page="diagnose" onclick="switchPage(this)">设备故障诊断 <span style="font-size:10px;opacity:.7">P0</span></div>
+      <div class="item ai-item" data-page="copilot" onclick="switchPage(this)">运营分析 Copilot <span style="font-size:10px;opacity:.7">P1</span></div>
+      <div class="group">业务管理</div>
+      <div class="item">设备管理</div>
+      <div class="item">库存管理</div>
+      <div class="item">工单管理</div>
+      <div class="group">系统</div>
+      <div class="item">决策审计日志</div>
+    </div>
+    <!-- 内容 -->
+    <div class="content">
+
+      <!-- 页面1：补货工作台 -->
+      <div class="page active" id="page-restock">
+        <div class="page-title">智能补货工作台</div>
+        <div class="page-sub">Agent 每日 06:00 自动分析生成建议清单 —— 你只需处理异常、确认建单</div>
+        <div class="steps">
+          <span class="on"><b>1</b>查看建议清单</span><span><b>2</b>调整或跳过异常项</span><span><b>3</b>确认创建工单</span>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="label">待处理建议</div><div class="value" id="st-pending">6</div><div class="delta down" id="st-urgent">其中紧急 2 条</div></div>
+          <div class="stat"><div class="label">预测 7 日缺货率</div><div class="value">8.2%</div><div class="delta down">规则版基线 12.6%</div></div>
+          <div class="stat"><div class="label">上期建议准确率</div><div class="value">91%</div><div class="delta down">人工调整后偏差 ≤±15%</div></div>
+        </div>
+        <div class="card">
+          <div class="plan-meta">
+            <span>计划 <b>RP-20260920-001</b></span><span>生成于今日 06:00</span>
+            <div class="plan-actions">
+              <button class="btn-warn" id="btn-pause" onclick="pausePlan()">⏸ 暂停自动分析</button>
+              <button class="btn-p" id="btn-all" onclick="confirmAll()">全部确认建单（6）</button>
+            </div>
+          </div>
+          <div class="banner" id="pause-banner" style="display:none">
+            ⏸ 已暂停自动补货分析：明日 06:00 不再生成新建议，当前清单仍可继续处理。
+            <button class="btn-s btn-xs" style="margin-left:auto" onclick="resumePlan()">恢复自动分析</button>
+          </div>
+          <div class="fchips" id="fchips"></div>
+          <table>
+            <thead><tr><th>设备 / 点位</th><th>商品 · 货道</th><th>库存水位</th><th>建议补货</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+            <tbody id="restock-tbody"></tbody>
+          </table>
+        </div>
+        <div style="color:var(--text-3);font-size:12px;line-height:1.8">
+          💡 点击行内「依据」可展开 Agent 的建议理由与参数；所有人工调整、跳过操作均会反馈给复盘模型用于迭代预测。
+        </div>
+      </div>
+
+      <!-- 页面2：设备诊断 -->
+      <div class="page" id="page-diagnose">
+        <div class="page-title">设备故障诊断 Agent</div>
+        <div class="page-sub">多轮问诊 + 多工具自主取数 → 结构化诊断结论 → 一键创建维修工单</div>
+        <div class="chat-wrap">
+          <div class="chat">
+            <div class="chat-head"><div class="robot">🤖</div><div><b>设备诊断 Agent</b><div style="font-size:11px;color:var(--text-3)">设备 01000043 · 朝阳区·望京SOHO T3 · 咖啡机</div></div></div>
+            <div class="chat-body" id="diag-chat"></div>
+            <div class="chat-input">
+              <input id="diag-input" placeholder="描述故障现象，例如：出货口卡货，用户投诉了两次…" onkeydown="if(event.key==='Enter')diagSend()">
+              <button class="btn-p" onclick="diagSend()">发送</button>
+            </div>
+          </div>
+          <div class="profile">
+            <h4>🧾 Agent 自动调取的设备档案</h4>
+            <div class="kv"><span class="k">设备编号</span><span class="v">01000043（运营中）</span></div>
+            <div class="kv"><span class="k">点位</span><span class="v">望京SOHO T3 · 商务商圈</span></div>
+            <div class="kv"><span class="k">近7日订单</span><span class="v">218 单 / 6 单异常（支付成功未出货）</span></div>
+            <div class="kv"><span class="k">近30日维修</span><span class="v">2 次（同为出货机构故障）</span></div>
+            <div class="kv"><span class="k">库存异常</span><span class="v">今日 14:02 B3 货道库存骤减 2（未对应订单）</span></div>
+            <h4 style="margin-top:8px">📉 近 7 日出货异常趋势（工具返回）</h4>
+            <div class="mini-chart"><div class="bars">
+              <i style="height:12%"><em>0</em><u>周一</u></i><i style="height:10%"><em>0</em><u>周二</u></i>
+              <i style="height:30%"><em>1</em><u>周三</u></i><i style="height:20%"><em>1</em><u>周四</u></i>
+              <i style="height:55%"><em>2</em><u>周五</u></i><i style="height:85%"><em>3</em><u>周六</u></i><i style="height:60%"><em>2</em><u>今日</u></i>
+            </div></div>
+            <h4 style="margin-top:8px">📚 相似案例检索（历史工单）</h4>
+            <div class="kv"><span class="k">案例 #78</span><span class="v">01000012 · 出货电机老化 → 更换出货机构</span></div>
+            <div class="kv"><span class="k">案例 #102</span><span class="v">01000043 · 货道弹簧变形 → 校正+润滑</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 页面3：运营分析 Copilot -->
+      <div class="page" id="page-copilot">
+        <div class="page-title">运营分析 Copilot</div>
+        <div class="page-sub">用一句话提问 —— 自动生成 SQL（只读校验）并渲染图表，支持时间与维度切换</div>
+        <div class="card">
+          <div class="nl-row">
+            <input id="nl-input" value="近7天各区域销售额表现如何？" onkeydown="if(event.key==='Enter')runNL()">
+            <button class="btn-p" onclick="runNL()">分析</button>
+          </div>
+          <div class="quick">
+            <span class="q" onclick="askQuick('近30天销售趋势和上期对比怎么样？',{time:'30d',chart:'trend'})">近30天销售趋势对比</span>
+            <span class="q" onclick="askQuick('各区域销售额占比分布？',{dim:'region',chart:'share'})">区域销售占比</span>
+            <span class="q" onclick="askQuick('分析用户从扫码到支付的转化漏斗',{chart:'funnel'})">扫码支付转化漏斗</span>
+            <span class="q" onclick="askQuick('哪些商品品类卖得最好？环比如何？',{dim:'sku',chart:'rank'})">品类销量排行</span>
+          </div>
+          <div class="ctrl-bar">
+            <div class="ctrl-group"><span class="gl">时间</span>
+              <button class="fchip" data-t="today" onclick="setTime('today')">今日</button>
+              <button class="fchip on" data-t="7d" onclick="setTime('7d')">近7天</button>
+              <button class="fchip" data-t="30d" onclick="setTime('30d')">近30天</button>
+            </div>
+            <div class="ctrl-group"><span class="gl">维度</span>
+              <button class="fchip on" data-d="region" onclick="setDim('region')">区域</button>
+              <button class="fchip" data-d="node" onclick="setDim('node')">点位</button>
+              <button class="fchip" data-d="sku" onclick="setDim('sku')">品类</button>
+            </div>
+            <div class="ctabs">
+              <button class="ctab on" data-c="trend" onclick="setChart('trend')">趋势对比</button>
+              <button class="ctab" data-c="share" onclick="setChart('share')">占比分布</button>
+              <button class="ctab" data-c="funnel" onclick="setChart('funnel')">转化漏斗</button>
+              <button class="ctab" data-c="rank" onclick="setChart('rank')">排行榜</button>
+            </div>
+          </div>
+          <div class="chart-title" id="cp-title"></div>
+          <div id="cp-chart"></div>
+          <div class="insight" id="cp-insight"></div>
+          <details class="sqlbox">
+            <summary>▸ 查看生成的 SQL 与安全校验（默认收起）</summary>
+            <div class="sqlcode" id="cp-sql"></div>
+            <div class="checks">
+              <span class="tag ok">✓ 只读账号校验通过</span><span class="tag ok">✓ 表白名单命中</span>
+              <span class="tag ok">✓ LIMIT 兜底注入</span><span class="tag p-mid">执行 320ms</span>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- AI 助手抽屉 -->
+<div class="drawer-mask" id="drawer-mask" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-head"><div style="width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#409EFF,#7b5cff);color:#fff;display:flex;align-items:center;justify-content:center">🤖</div>
+    <div><b>DKD AI 助手</b><div style="font-size:11px;color:var(--text-3)">Supervisor 路由 · 全局可用</div></div>
+    <button class="close" onclick="closeDrawer()">✕</button></div>
+  <div class="scene-tabs">
+    <div class="s on">补货 Agent</div><div class="s" onclick="toast('诊断场景请进入「设备故障诊断」页（演示）')">诊断 Agent</div><div class="s" onclick="toast('分析场景请进入「运营分析 Copilot」页（演示）')">分析 Copilot</div>
+  </div>
+  <div class="chat-body" id="drawer-chat">
+    <div class="msg ai"><div class="ava">🤖</div><div class="bubble">你好，我是补货 Agent。今日 06:00 已完成分析，<b>6 条建议</b>待你处理（其中 2 条紧急）。<br>可以直接说："先看紧急的" / "帮我调整可乐的数量" / "暂停明天的自动分析"。</div></div>
+  </div>
+  <div class="quick">
+    <span class="q" onclick="drawerAsk('先看紧急的')">先看紧急的</span>
+    <span class="q" onclick="drawerAsk('为什么补这么多可乐？')">为什么补这么多可乐？</span>
+    <span class="q" onclick="drawerAsk('暂停明天的自动分析')">暂停自动分析</span>
+    <span class="q" onclick="drawerAsk('上周补货准确率怎么样？')">上期复盘如何？</span>
+  </div>
+  <div class="chat-input"><input id="drawer-input" placeholder="输入问题…" onkeydown="if(event.key==='Enter')drawerSend()"><button class="btn-p" onclick="drawerSend()">发送</button></div>
+</div>
+
+<!-- 通用确认弹窗 -->
+<div class="dialog-mask" id="dlg-mask">
+  <div class="dialog">
+    <div class="d-head" id="dlg-title"></div>
+    <div class="d-body" id="dlg-body"></div>
+    <div class="d-foot"><button class="btn-s" onclick="closeDlg()">取消</button> <button class="btn-p" id="dlg-ok">确认</button></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<div class="proto-note">原型演示 V2 · 数据为模拟 · 降认知负担版</div>
+
+<script>
+/* ==================== 补货工作台 ==================== */
+const plans=[
+ {vm:'01000043',node:'望京SOHO T3',sku:'可口可乐 330ml',ch:'B3',cur:2,max:15,sug0:13,sug:13,until:'09-21',p:'urgent',
+  reason:'连续5天日均销4.2瓶（点位周末效应 + 今明两日展会），现库存仅撑0.5天；货道容量15，无在途工单。',
+  params:'预测窗口 7 天 · 服务水平 0.95 · 同商圈同品类均值 +38%'},
+ {vm:'01000043',node:'望京SOHO T3',sku:'农夫山泉 550ml',ch:'B4',cur:6,max:15,sug0:9,sug:9,until:'09-23',p:'high',
+  reason:'日均销2.8瓶平稳，按7天预测缺口9瓶；建议一次补足减少二次派单。',
+  params:'预测窗口 7 天 · 服务水平 0.95'},
+ {vm:'01000012',node:'海淀中关村创业大厦',sku:'瑞幸即饮咖啡',ch:'C1',cur:1,max:10,sug0:9,sug:9,until:'09-21',p:'urgent',
+  reason:'商务商圈早高峰销量陡增，今日10点已售4罐；昨日刚完成补货工单，本轮为追加紧急单。',
+  params:'预测窗口 7 天 · 服务水平 0.98（紧急级）'},
+ {vm:'01000027',node:'西城金融街购物中心',sku:'乐事薯片(原味)',ch:'A2',cur:4,max:12,sug0:6,sug:6,until:'09-26',p:'mid',
+  reason:'日均销1.1袋，慢动销品按14天周期补货即可，避免过量占道。',
+  params:'预测窗口 14 天 · 服务水平 0.90（慢动销）'},
+ {vm:'01000058',node:'朝阳合生汇B1',sku:'元气森林气泡水',ch:'B1',cur:9,max:15,sug0:6,sug:6,until:'09-29',p:'low',
+  reason:'新品上架观察期，销量爬坡中(0.9瓶/天)，先补6瓶试探，7日后复盘决定是否上调。',
+  params:'预测窗口 14 天 · 新品冷启动策略'},
+ {vm:'01000066',node:'丰台万达广场',sku:'康师傅冰红茶',ch:'B2',cur:3,max:12,sug0:9,sug:9,until:'09-22',p:'high',
+  reason:'周五-周日销量为平日2.3倍（商场客流），现库存撑不过周末峰段。',
+  params:'预测窗口 7 天 · 周末因子 ×2.3'}
+];
+plans.forEach(p=>{p.status='pending'});
+let curFilter='all', planPaused=false;
+const expanded=new Set();
+const pName={urgent:'紧急',high:'高',mid:'中',low:'低'};
+const sName={pending:'待确认',adjusted:'已调整',skipped:'已跳过',done:'已建单'};
+
+function activeList(){return plans.filter(p=>p.status==='pending'||p.status==='adjusted')}
+function renderChips(){
+  const cnt={all:plans.length};
+  plans.forEach(p=>cnt[p.p]=(cnt[p.p]||0)+1);
+  document.getElementById('fchips').innerHTML=
+    [['all','全部'],['urgent','紧急'],['high','高'],['mid','中'],['low','低']]
+    .map(([k,n])=>`<button class="fchip ${curFilter===k?'on':''}" onclick="setFilter('${k}')">${n}<span class="cnt">${cnt[k]||0}</span></button>`).join('');
+}
+function setFilter(k){curFilter=k;renderRestock()}
+function renderRestock(){
+  renderChips();
+  const tb=document.getElementById('restock-tbody');
+  const rows=plans.map((p,i)=>({p,i})).filter(({p})=>curFilter==='all'||p.p===curFilter);
+  tb.innerHTML=rows.map(({p,i})=>{
+    const ops=p.status==='done'?'<span style="color:var(--text-3);font-size:12px">工单已创建</span>'
+      :p.status==='skipped'?`<button class="btn-s btn-xs" onclick="resumeRow(${i})">恢复建议</button>`
+      :`<button class="btn-s btn-xs" onclick="openEdit(${i})">调整</button>
+        <button class="btn-s btn-xs" style="color:var(--danger);border-color:#fab6b6" onclick="openSkip(${i})">跳过</button>
+        <button class="btn-p btn-xs" onclick="confirmOne(${i})">确认</button>`;
+    const qty=p.status==='skipped'?'—'
+      :`<b style="color:var(--primary);font-size:15px">+${p.sug}</b>${p.status==='adjusted'?`<br><s style="font-size:11px;color:var(--text-3)">原 +${p.sug0}</s>`:''}`;
+    const detail=expanded.has(i)?`
+      <tr class="detail-row"><td colspan="6">
+        <b>Agent 依据：</b>${p.reason}<br>
+        <b>预测参数：</b>${p.params}${p.status==='adjusted'?`<br><b>人工调整记录：</b>原建议 +${p.sug0} → +${p.sug}（原因：${p.adjReason}）`:''}
+        ${p.status==='skipped'?`<br><b>跳过原因：</b>${p.skipReason}`:''}
+      </td></tr>`:'';
+    return `
+    <tr class="${p.status==='done'||p.status==='skipped'?'fade-row':''}">
+      <td><b>${p.vm}</b><br><span style="font-size:11px;color:var(--text-3)">${p.node}</span></td>
+      <td>${p.sku}<br><span style="font-size:11px;color:var(--text-3)">货道 ${p.ch}</span></td>
+      <td><div style="display:flex;align-items:center;gap:6px"><span class="progress"><i class="${p.cur/p.max>.4?'ok':(p.cur/p.max>.15?'mid':'')}" style="width:${p.cur/p.max*100}%"></i></span><span style="font-size:12px">${p.cur}/${p.max}</span></div></td>
+      <td>${qty}</td>
+      <td><span class="tag p-${p.p}">${pName[p.p]}</span> <span class="tag s-${p.status}">${sName[p.status]}</span><br><span class="chev" onclick="toggleDetail(${i})">${expanded.has(i)?'▾':'▸'} 依据</span></td>
+      <td style="text-align:right;white-space:nowrap">${ops}</td>
+    </tr>${detail}`;
+  }).join('')||'<tr><td colspan="6" style="text-align:center;color:var(--text-3);padding:24px">该级别暂无建议</td></tr>';
+  // 顶部统计与批量按钮联动
+  const act=activeList();
+  document.getElementById('st-pending').textContent=act.length;
+  const ug=act.filter(p=>p.p==='urgent').length;
+  document.getElementById('st-urgent').textContent=ug>0?`其中紧急 ${ug} 条`:'无紧急项，可放心批量确认';
+  const btn=document.getElementById('btn-all');
+  btn.textContent=`全部确认建单（${act.length}）`;btn.disabled=act.length===0;
+}
+function toggleDetail(i){expanded.has(i)?expanded.delete(i):expanded.add(i);renderRestock()}
+
+/* ---- 调整建议 ---- */
+let editIdx=-1,editQty=0,editWin=7,editSl=0.95,adjReason='';
+function openEdit(i){
+  const p=plans[i];editIdx=i;editQty=p.sug;editWin=7;editSl=0.95;adjReason='';
+  document.getElementById('dlg-title').textContent='调整补货建议';
+  document.getElementById('dlg-body').innerHTML=`
+    <div>${p.vm} · ${p.node} —— <b>${p.sku}</b>（货道 ${p.ch}）</div>
+    <div style="color:var(--text-3);font-size:12px;margin-top:2px">当前库存 ${p.cur}/${p.max} · Agent 原建议 +${p.sug0} · 预计撑至 ${p.until}</div>
+    <div class="dlg-sec"><div class="t">补货数量（上限 ${p.max-p.cur}）</div>
+      <div class="stepper"><button onclick="stepQty(-1)">−</button><span class="val" id="qty-val">${p.sug}</span><button onclick="stepQty(1)">＋</button></div>
+      <div class="quick-set"><button onclick="setQty(${p.max-p.cur})">补满货道</button><button onclick="setQty(${Math.max(1,Math.ceil(p.sug0/2))})">减半</button><button onclick="setQty(${p.sug0})">恢复建议值</button></div>
+    </div>
+    <div class="dlg-sec"><div class="t">调整原因<b>*</b>（必选，将反馈给复盘模型）</div>
+      <div class="adj-reasons" id="adj-reasons">
+        ${['销量预估偏高','现场陈列空间受限','促销计划已调整','设备即将撤机','其他'].map(r=>`<button class="r" onclick="pickReason('${r}',this)">${r}</button>`).join('')}
+      </div>
+    </div>
+    <div class="dlg-sec"><details><summary style="cursor:pointer;color:var(--text-3);font-size:12px">▸ 高级：修正预测参数（可选）</summary>
+      <div class="param-row"><span style="width:76px">预测窗口</span>
+        ${[7,14,30].map(d=>`<button class="fchip ${d===7?'on':''}" id="win-${d}" onclick="setWin(${d})">${d}天</button>`).join('')}
+      </div>
+      <div class="param-row"><span style="width:76px">服务水平</span>
+        <input type="range" min="0.90" max="0.99" step="0.01" value="0.95" oninput="setSl(this.value)">
+        <span id="sl-val" style="width:150px;color:var(--primary);font-weight:600">0.95 → 预计缺货率 5%</span>
+      </div>
+    </details></div>`;
+  const ok=document.getElementById('dlg-ok');
+  ok.textContent='保存调整';
+  ok.onclick=()=>{
+    if(!adjReason){toast('⚠ 请先选择调整原因');return}
+    const p=plans[editIdx];const old=p.sug;
+    p.sug=editQty;p.status=(editQty===p.sug0)?'pending':'adjusted';
+    p.adjReason=adjReason;p.win=editWin;p.sl=editSl;
+    closeDlg();renderRestock();
+    toast(`✓ 已调整：${p.sku} 建议量 ${old}→${editQty}（原因：${adjReason}），已记录留痕`);
+  };
+  document.getElementById('dlg-mask').classList.add('show');
+}
+function stepQty(d){const p=plans[editIdx];editQty=Math.min(Math.max(editQty+d,0),p.max-p.cur);document.getElementById('qty-val').textContent=editQty}
+function setQty(v){const p=plans[editIdx];editQty=Math.min(v,p.max-p.cur);document.getElementById('qty-val').textContent=editQty}
+function pickReason(r,el){adjReason=r;document.querySelectorAll('#adj-reasons .r').forEach(x=>x.classList.remove('on'));el.classList.add('on')}
+function setWin(d){editWin=d;[7,14,30].forEach(x=>document.getElementById('win-'+x).classList.toggle('on',x===d))}
+function setSl(v){editSl=+v;const risk=Math.round((1-v)*100);document.getElementById('sl-val').textContent=`${v} → 预计缺货率 ${risk}%`}
+
+/* ---- 跳过 / 恢复 ---- */
+function openSkip(i){
+  const p=plans[i];let skipReason='';
+  document.getElementById('dlg-title').textContent='跳过该条补货建议';
+  document.getElementById('dlg-body').innerHTML=`
+    确定跳过：<b>${p.vm} · ${p.sku}（货道 ${p.ch}）</b> 的补货建议（原建议 +${p.sug}）？
+    <div class="dlg-sec"><div class="t">跳过原因<b>*</b>（帮助模型学习）</div>
+      <div class="adj-reasons" id="skip-reasons">
+        ${['现场库存实际充足','销量预估偏高','设备即将撤机','促销计划取消','其他'].map(r=>`<button class="r" onclick="this.parentNode.querySelectorAll('.r').forEach(x=>x.classList.remove('on'));this.classList.add('on');window._sr='${r}'">${r}</button>`).join('')}
+      </div></div>`;
+  const ok=document.getElementById('dlg-ok');ok.textContent='确认跳过';
+  ok.onclick=()=>{
+    if(!window._sr){toast('⚠ 请先选择跳过原因');return}
+    p.status='skipped';p.skipReason=window._sr;window._sr='';
+    closeDlg();renderRestock();
+    toast(`✓ 已跳过：${p.sku}（原因：${p.skipReason}），该条不纳入本期建单，将反馈复盘模型`);
+  };
+  window._sr='';document.getElementById('dlg-mask').classList.add('show');
+}
+function resumeRow(i){
+  const p=plans[i];p.status=p.sug===p.sug0?'pending':'adjusted';
+  renderRestock();toast(`✓ 已恢复建议：${p.sku}（+${p.sug}）重新进入待确认清单`);
+}
+
+/* ---- 暂停 / 恢复计划 ---- */
+function pausePlan(){
+  showDlg('暂停自动补货分析',
+   `暂停后：<br>· 明日 06:00 将<b>不再自动生成</b>新补货建议<br>· 当前清单仍可正常调整、确认建单<br>· 复盘与策略迭代同步暂停<br><br>适合场景：盘点期、大促前人工统一排单、数据异常排查。`,
+   ()=>{planPaused=true;
+     document.getElementById('pause-banner').style.display='flex';
+     document.getElementById('btn-pause').style.display='none';
+     toast('⏸ 已暂停自动分析，可随时点击恢复');});
+}
+function resumePlan(){
+  planPaused=false;
+  document.getElementById('pause-banner').style.display='none';
+  document.getElementById('btn-pause').style.display='';
+  toast('▶ 已恢复自动分析，明日 06:00 将正常生成建议');
+}
+
+/* ---- 确认建单 ---- */
+function confirmOne(i){
+  const p=plans[i];
+  showDlg('确认创建补货工单',
+   `设备：<b>${p.vm}</b>（${p.node}）<br>商品：${p.sku} · 货道 ${p.ch}<br>补货数量：<b style="color:var(--primary)">${p.sug}</b>（补后 ${p.cur+p.sug}/${p.max}）${p.status==='adjusted'?`<br><span style="color:var(--warning);font-size:12px">⚠ 该条经人工调整（原建议 +${p.sug0}，原因：${p.adjReason}）</span>`:''}<br><br>
+    <span style="color:var(--text-3);font-size:12px">经服务间密钥回调 Java <code>POST /manage/task</code>，由 TaskServiceImpl 校验设备状态 / 防重 / 区域匹配后创建，并写入决策审计日志。</span>`,
+   ()=>{p.status='done';renderRestock();toast(`✓ 补货工单已创建（${p.vm} ${p.sku} ×${p.sug}），7日后自动复盘`)});
+}
+function confirmAll(){
+  const act=activeList();
+  if(!act.length)return;
+  showDlg('批量创建补货工单',
+   `将创建 <b style="color:var(--danger)">${act.length}</b> 条补货建议对应的工单，覆盖 ${new Set(act.map(p=>p.vm)).size} 台设备。<br>
+    ${plans.some(p=>p.status==='skipped')?`已跳过 ${plans.filter(p=>p.status==='skipped').length} 条，<b>不会</b>建单。<br>`:''}
+    <span style="color:var(--text-3);font-size:12px">逐条回调 Java 建单接口，单条失败不影响其余，失败项回列待确认。</span>`,
+   ()=>{act.forEach(p=>p.status='done');renderRestock();
+     toast(`✓ 已批量创建 ${act.length} 条工单（跳过项未建单），7日后自动复盘`)});
+}
+
+/* ==================== 弹窗 / Toast ==================== */
+function showDlg(t,b,ok){
+  document.getElementById('dlg-title').textContent=t;
+  document.getElementById('dlg-body').innerHTML=b;
+  const k=document.getElementById('dlg-ok');k.textContent='确认';k.onclick=()=>{closeDlg();ok&&ok()};
+  document.getElementById('dlg-mask').classList.add('show');
+}
+function closeDlg(){document.getElementById('dlg-mask').classList.remove('show')}
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',3000)}
+
+/* ==================== 页面切换 ==================== */
+function switchPage(el){
+  document.querySelectorAll('.menu .item').forEach(x=>x.classList.remove('active'));
+  el.classList.add('active');
+  const pg=el.dataset.page;
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
+  document.getElementById('page-'+pg).classList.add('active');
+  document.getElementById('crumb').textContent={'restock':'智能补货工作台','diagnose':'设备故障诊断','copilot':'运营分析 Copilot'}[pg];
+  if(pg==='diagnose'&&!diagStarted)startDiag();
+  if(pg==='copilot')renderCopilot();
+}
+
+/* ==================== 设备诊断（同 V1） ==================== */
+let diagStarted=false;
+const diagChat=document.getElementById('diag-chat');
+function addUserMsg(text){const d=document.createElement('div');d.className='msg user';d.innerHTML=`<div class="ava">👤</div><div class="bubble">${text}</div>`;diagChat.appendChild(d);diagChat.scrollTop=diagChat.scrollHeight}
+function addAIBubble(){const d=document.createElement('div');d.className='msg ai';d.innerHTML='<div class="ava">🤖</div><div class="bubble typing-cursor"></div>';diagChat.appendChild(d);diagChat.scrollTop=diagChat.scrollHeight;return d.querySelector('.bubble')}
+function addChips(tools,done){
+  const d=document.createElement('div');d.className='msg ai';
+  d.innerHTML=`<div class="ava">🤖</div><div class="bubble" style="background:none;border:none;box-shadow:none;padding:0">${tools.map(t=>`<span class="tool-chip"><span class="spin"></span>${t}</span>`).join('')}</div>`;
+  diagChat.appendChild(d);diagChat.scrollTop=diagChat.scrollHeight;
+  setTimeout(()=>{d.querySelectorAll('.tool-chip').forEach(c=>{c.innerHTML='✓ '+c.textContent.replace(/✓ /,'');c.style.borderColor='#b3e19d';c.style.color='#529b2e';c.style.background='#f0f9eb'});done&&done()},1300);
+}
+function streamText(el,text,done){
+  let i=0;const t=setInterval(()=>{el.innerHTML=text.slice(0,++i)+(i<text.length?'<span style="color:#409EFF">▌</span>':'');diagChat.scrollTop=diagChat.scrollHeight;
+    if(i>=text.length){clearInterval(t);el.classList.remove('typing-cursor');done&&done()}},14);
+}
+function startDiag(){
+  diagStarted=true;
+  addChips(['查询设备详情(01000043)','查询近7天订单异常','查询库存变动日志','检索历史维修工单'],()=>{
+    const b=addAIBubble();
+    streamText(b,'已完成多源数据核查。检测到 <b>6 笔"支付成功但未出货"异常订单</b>，且今日 14:02 B3 货道出现无订单库存扣减，结合近 30 日 2 次同部位维修记录，初步判断为<b>出货机构故障</b>。',()=>{
+      const b2=addAIBubble();
+      b2.innerHTML=`综合诊断结论（置信度排序）：<ul class="rank">
+        <li><b>① 出货电机老化/卡滞</b><span class="r-bar"><i style="width:72%"></i></span>72%</li>
+        <li><b>② 货道弹簧变形</b><span class="r-bar"><i style="width:19%"></i></span>19%</li>
+        <li><b>③ 主控板出货信号异常</b><span class="r-bar"><i style="width:9%"></i></span>9%</li></ul>
+        <div class="action-card"><div class="ac-head">⚡ 建议操作：创建维修工单</div>
+        <div class="ac-body">工单类型：维修 · 设备 01000043 · 点位 望京SOHO T3<br>指派：朝阳区维修组（区域匹配 ✓）<br>诊断结论将自动写入工单备注，附异常订单清单供维修人员预判。</div>
+        <div class="ac-foot"><button class="btn-p btn-xs" onclick="toast('✓ 维修工单 WX-20260920-087 已创建，已同步 dkd-app 待接单')">创建维修工单</button></div></div>`;
+      diagChat.scrollTop=diagChat.scrollHeight;
+    });
+  });
+}
+function diagSend(){
+  const inp=document.getElementById('diag-input');const v=inp.value.trim();if(!v)return;inp.value='';
+  addUserMsg(v);
+  setTimeout(()=>{
+    const b=addAIBubble();
+    streamText(b,'基于刚才调取的档案数据：该设备 30 天内已 2 次同类故障（均为出货机构），本次为<b>复发</b>，建议维修工单中直接申请更换出货电机总成而非再次校正——同类校正平均仅维持 12 天（案例 #78 复发间隔）。此结论已同步到工单备注建议中。');
+  },400);
+}
+
+/* ==================== AI 抽屉 ==================== */
+const dChat=document.getElementById('drawer-chat');
+function openDrawer(){document.getElementById('drawer').classList.add('show');document.getElementById('drawer-mask').classList.add('show')}
+function closeDrawer(){document.getElementById('drawer').classList.remove('show');document.getElementById('drawer-mask').classList.remove('show')}
+function drawerSend(){const i=document.getElementById('drawer-input');const v=i.value.trim();if(!v)return;i.value='';drawerAsk(v)}
+function drawerAsk(q){
+  openDrawer();
+  const d=document.createElement('div');d.className='msg user';d.innerHTML=`<div class="ava">👤</div><div class="bubble">${q}</div>`;dChat.appendChild(d);dChat.scrollTop=dChat.scrollHeight;
+  setTimeout(()=>{
+    const replies={
+      '先看紧急的':`🚨 <b>2 条紧急建议</b>（48h内缺货）：\n① 01000043 望京SOHO · 可口可乐 B3 道 → 建议 +13（现仅2瓶）\n② 01000012 中关村创业大厦 · 即饮咖啡 C1 道 → 建议 +9（现仅1罐）\n\n可到「补货工作台」逐条调整或直接确认。`,
+      '为什么补这么多可乐？':`01000043 的可乐连续 5 天日均销 4.2 瓶——高于同商圈同品类均值 38%（判断为会展客流带动），且今明两天点位周边有展会活动。按 7 天预测缺口 13 瓶、货道容量 15 一次性补足，避免 3 天内二次派单（二次派单人工成本 > 滞销风险）。如果认为偏高，可在工作台「调整」并选择原因"销量预估偏高"，模型会学习修正。`,
+      '暂停明天的自动分析':`好的，已为你<b>暂停</b>明日 06:00 的自动补货分析（当前清单仍可继续处理确认）。可随时在补货工作台点击「恢复自动分析」。<br><span style="color:#909399;font-size:11px">演示提示：对应界面顶部黄色横幅状态。</span>`,
+      '上周补货准确率怎么样？':`上期复盘（RP-20260913-006）：建议量与实际消耗偏差 ≤±15% 的货道占 <b>91%</b>，2 条偏差较大的均为促销未报备导致——已提示运营录入促销计划后，预测将自动纳入校准因子。人工调整类建议采纳率 100%，全部留痕可审计。`
+    };
+    const text=replies[q]||'收到。该问题已转交 Supervisor 路由：涉及实时数据我会调用工具取数后回答；涉及工单创建的操作会在你确认后经 Java 回调执行（演示环境返回此说明）。';
+    const m=document.createElement('div');m.className='msg ai';m.innerHTML='<div class="ava">🤖</div><div class="bubble typing-cursor"></div>';
+    dChat.appendChild(m);const b=m.querySelector('.bubble');
+    let i=0;const html=text.replace(/\n/g,'<br>');
+    const t=setInterval(()=>{b.innerHTML=html.slice(0,i+=3)+(i<html.length?'<span style="color:#409EFF">▌</span>':'');dChat.scrollTop=dChat.scrollHeight;
+      if(i>=html.length){clearInterval(t);b.classList.remove('typing-cursor')}},12);
+  },350);
+}
+
+/* ==================== 运营分析 Copilot ==================== */
+const cpState={time:'7d',dim:'region',chart:'trend'};
+const timeName={today:'今日','7d':'近7天','30d':'近30天'};
+const tf={today:0.14,'7d':1,'30d':4.3};
+const dimData={
+ region:{name:'区域',cats:['朝阳区','海淀区','西城区','丰台区','东城区'],vals:[48210,39875,27640,19430,16220],prev:[42900,37580,28730,21160,15800]},
+ node:{name:'点位',cats:['望京SOHO T3','中关村创业大厦','合生汇B1','金融街购物中心','丰台万达广场'],vals:[12840,10320,8760,7420,5980],prev:[11200,9800,9050,7100,6200]},
+ sku:{name:'品类',cats:['饮品-碳酸','咖啡/功能饮','饮用水','零食','其他'],vals:[38600,31200,27400,18400,9830],prev:[35200,27800,26800,19600,9600]}
+};
+const trendSeries={
+ '7d':{labels:['周一','周二','周三','周四','周五','周六','周日'],cur:[5200,4800,6100,5900,8400,10600,9800],prev:[4900,5100,5400,5200,7300,9100,8600]},
+ '30d':{labels:['第1周','第2周','第3周','第4周'],cur:[32800,35100,38900,41200],prev:[30100,33900,35800,37200]},
+ today:{labels:['09时','10时','11时','12时','13时','14时','15时','16时'],cur:[380,520,610,780,640,590,720,660],prev:[350,470,560,700,610,560,650,600]}
+};
+function fmt(v){return v>=10000?(v/10000).toFixed(1)+'万':Math.round(v).toLocaleString()}
+function setTime(t){cpState.time=t;document.querySelectorAll('[data-t]').forEach(b=>b.classList.toggle('on',b.dataset.t===t));renderCopilot()}
+function setDim(d){cpState.dim=d;document.querySelectorAll('[data-d]').forEach(b=>b.classList.toggle('on',b.dataset.d===d));renderCopilot()}
+function setChart(c){cpState.chart=c;document.querySelectorAll('[data-c]').forEach(b=>b.classList.toggle('on',b.dataset.c===c));renderCopilot()}
+function askQuick(q,cfg){
+  document.getElementById('nl-input').value=q;
+  if(cfg.time)setTime(cfg.time);
+  if(cfg.dim)setDim(cfg.dim);
+  if(cfg.chart)setChart(cfg.chart);
+  toast('✓ 已按问题自动设置筛选并分析（演示）');
+}
+function runNL(){
+  const q=document.getElementById('nl-input').value;
+  if(/趋势|对比/.test(q))setChart('trend');
+  else if(/占比|分布|结构/.test(q))setChart('share');
+  else if(/漏斗|转化/.test(q))setChart('funnel');
+  else if(/排行|最好|top|Top/.test(q))setChart('rank');
+  toast('✓ 分析完成：SQL 校验通过，图表已更新');
+  renderCopilot();
+}
+/* --- 图表渲染（纯 SVG，无外部依赖） --- */
+function lineChart(labels,cur,prev){
+  const W=640,H=240,L=52,R=70,T=16,B=30;
+  const max=Math.max(...cur,...prev)*1.12;
+  const px=i=>L+(W-L-R)*i/(labels.length-1);
+  const py=v=>T+(H-T-B)*(1-v/max);
+  const pts=a=>a.map((v,i)=>px(i).toFixed(1)+','+py(v).toFixed(1)).join(' ');
+  let g='';
+  for(let k=0;k<=3;k++){const y=T+(H-T-B)*k/3;const val=Math.round(max*(1-k/3)/100)*100;
+    g+=`<line x1="${L}" y1="${y}" x2="${W-R}" y2="${y}" stroke="#eee"/><text x="${L-6}" y="${y+4}" font-size="10" fill="#909399" text-anchor="end">${val>=10000?(val/10000).toFixed(1)+'w':val}</text>`;}
+  labels.forEach((l,i)=>{g+=`<text x="${px(i)}" y="${H-8}" font-size="10" fill="#909399" text-anchor="middle">${l}</text>`});
+  g+=`<polyline points="${pts(prev)}" fill="none" stroke="#C0C4CC" stroke-width="2" stroke-dasharray="5 4"/>`;
+  g+=`<polyline points="${pts(cur)}" fill="none" stroke="#409EFF" stroke-width="2.5"/>`;
+  cur.forEach((v,i)=>{g+=`<circle cx="${px(i)}" cy="${py(v)}" r="3" fill="#409EFF"/>`});
+  g+=`<text x="${px(cur.length-1)+6}" y="${py(cur[cur.length-1])+4}" font-size="11" fill="#409EFF" font-weight="600">${fmt(cur[cur.length-1])}</text>`;
+  g+=`<text x="${px(prev.length-1)+6}" y="${py(prev[prev.length-1])+4}" font-size="10" fill="#909399">${fmt(prev[prev.length-1])}</text>`;
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${g}
+    <line x1="${L}" y1="${T}" x2="${L}" y2="${H-B}" stroke="#ddd"/><line x1="${L}" y1="${H-B}" x2="${W-R}" y2="${H-B}" stroke="#ddd"/></svg>
+    <div style="display:flex;gap:18px;font-size:12px;color:var(--text-2);margin-top:6px">
+      <span><i style="display:inline-block;width:18px;height:3px;background:#409EFF;vertical-align:middle;margin-right:5px"></i>本期</span>
+      <span><i style="display:inline-block;width:18px;height:2px;background:#C0C4CC;vertical-align:middle;margin-right:5px;border-top:2px dashed #C0C4CC;height:0"></i>上期（环比基准）</span></div>`;
+}
+function donutChart(cats,vals){
+  const total=vals.reduce((a,b)=>a+b,0);
+  const colors=['#409EFF','#67C23A','#E6A23C','#F56C6C','#7b5cff'];
+  const C=2*Math.PI*80;let segs='';let acc=0;
+  vals.forEach((v,i)=>{const f=v/total;
+    segs+=`<circle cx="130" cy="130" r="80" fill="none" stroke="${colors[i%colors.length]}" stroke-width="36"
+      stroke-dasharray="${(C*f-2).toFixed(1)} ${(C*(1-f)+2).toFixed(1)}" stroke-dashoffset="${(-C*acc).toFixed(1)}" transform="rotate(-90 130 130)"/>`;acc+=f;});
+  const legend=cats.map((c,i)=>`<div class="lg-row"><span class="lg-dot" style="background:${colors[i%colors.length]}"></span><span class="lg-name">${c}</span><span class="lg-val">¥${fmt(vals[i])}</span><span class="lg-pct">${(vals[i]/total*100).toFixed(1)}%</span></div>`).join('');
+  return `<div style="display:flex;align-items:center;gap:28px;flex-wrap:wrap">
+    <svg viewBox="0 0 260 260" style="width:220px;height:220px;flex-shrink:0">${segs}
+      <text x="130" y="124" text-anchor="middle" font-size="12" fill="#909399">总计</text>
+      <text x="130" y="150" text-anchor="middle" font-size="17" fill="#303133" font-weight="700">¥${fmt(total)}</text></svg>
+    <div style="flex:1;min-width:230px">${legend}</div></div>`;
+}
+function funnelChart(){
+  const stages=[['曝光触达',100],['扫码进店',46],['选品加购',28],['支付成功',19],['7日复购',6]];
+  const W=640,H=252,bw=W*0.7;let g='';
+  stages.forEach((s,i)=>{
+    const w=bw*s[1]/100,y=18+i*44,x=(W-w)/2;
+    const col=['#a0cfff','#79bbff','#53a8ff','#409EFF','#337ecc'][i];
+    g+=`<rect x="${x.toFixed(1)}" y="${y}" width="${w.toFixed(1)}" height="30" rx="4" fill="${col}"/>
+      <text x="${W/2}" y="${y+19}" text-anchor="middle" font-size="12" fill="#fff" font-weight="600">${s[0]}</text>
+      <text x="${W-8}" y="${y+19}" text-anchor="end" font-size="11" fill="#606266">${s[1]}%</text>`;
+    if(i>0){const conv=stages[i][1]/stages[i-1][1]*100;
+      g+=`<text x="${W/2}" y="${y-3}" text-anchor="middle" font-size="10" fill="#909399">↓ 转化 ${conv.toFixed(0)}%</text>`;}
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${g}</svg>`;
+}
+function rankChart(cats,vals,prev){
+  const max=Math.max(...vals);
+  return `<div style="padding-right:8px">`+cats.map((c,i)=>{
+    const wow=(vals[i]-prev[i])/prev[i]*100;const up=wow>=0;
+    return `<div class="rk-row"><span class="rk-name">${i+1}. ${c}</span>
+      <div class="rk-bar"><i style="width:${(vals[i]/max*100).toFixed(1)}%"></i></div>
+      <span class="rk-val">¥${fmt(vals[i])}</span>
+      <span class="rk-wow ${up?'up':'down'}">${up?'▲':'▼'} ${Math.abs(wow).toFixed(1)}%</span></div>`;
+  }).join('')+`</div>`;
+}
+function renderCopilot(){
+  const dd=dimData[cpState.dim],f=tf[cpState.time];
+  const vals=dd.vals.map(v=>Math.round(v*f)),prev=dd.prev.map(v=>Math.round(v*f));
+  const total=vals.reduce((a,b)=>a+b,0),prevTotal=prev.reduce((a,b)=>a+b,0);
+  const wow=((total-prevTotal)/prevTotal*100);
+  const chartBox=document.getElementById('cp-chart');
+  const titleEl=document.getElementById('cp-title');
+  const insEl=document.getElementById('cp-insight');
+  let title='',chart='',insight='';
+  if(cpState.chart==='trend'){
+    const ts=trendSeries[cpState.time];
+    const growth=((ts.cur[ts.cur.length-1]-ts.prev[ts.prev.length-1])/ts.prev[ts.prev.length-1]*100);
+    title=`${timeName[cpState.time]}销售额趋势 · 环比对比 <span class="tag ${growth>=0?'p-urgent':'p-low'}">${growth>=0?'▲':'▼'} ${Math.abs(growth).toFixed(1)}%</span>`;
+    chart=lineChart(ts.labels,ts.cur,ts.prev);
+    insight=`${timeName[cpState.time]}总销售额 <b>¥${fmt(ts.cur.reduce((a,b)=>a+b,0))}</b>，较上期 ${wow>=0?'增长':'下降'} <b>${Math.abs(wow).toFixed(1)}%</b>；周末峰值达 ¥${fmt(Math.max(...ts.cur))}，建议周五前完成重点点位补货。`;
+  }else if(cpState.chart==='share'){
+    title=`${timeName[cpState.time]}${dd.name}销售占比分布`;
+    chart=donutChart(dd.cats,vals);
+    insight=`<b>${dd.cats[0]}</b> 以 ¥${fmt(vals[0])} 领先，贡献 ${(vals[0]/total*100).toFixed(1)}% 销售额；前两名合计占比 ${((vals[0]+vals[1])/total*100).toFixed(0)}%——资源可向头部${dd.name}倾斜，长尾项评估撤架。`;
+  }else if(cpState.chart==='funnel'){
+    title='用户转化漏斗 · 曝光 → 复购（近30天全渠道）';
+    chart=funnelChart();
+    insight=`整体支付转化率 <b>19%</b>。最大流失发生在「扫码→选品加购」（46%→28%），建议优化首屏商品陈列与价格标签；「支付成功→7日复购」仅 6%，可配合券包提升复访。`;
+  }else{
+    title=`${timeName[cpState.time]}${dd.name}销售排行 · 环比`;
+    chart=rankChart(dd.cats,vals,prev);
+    const worst=dd.cats[vals.map((v,i)=>(v-prev[i])/prev[i]).reduce((bi,x,i,arr)=>x<arr[bi]?i:bi,0)];
+    insight=`<b>${dd.cats[0]}</b> 居首（¥${fmt(vals[0])}）；环比下滑最明显的是 <b>${worst}</b>，建议核查点位动线与竞品情况。`;
+  }
+  titleEl.innerHTML=title;chartBox.innerHTML=chart;insEl.innerHTML='💡 '+insight;
+  // SQL 面板
+  document.getElementById('cp-sql').innerHTML=
+`<span style="color:#c678dd">SELECT</span> ${cpState.dim==='sku'?'s.class_name':'r.region_name'}, <span style="color:#c678dd">SUM</span>(o.amount) <span style="color:#c678dd">AS</span> gmv,
+       <span style="color:#c678dd">ROUND</span>((<span style="color:#c678dd">SUM</span>(o.amount) - prev.gmv) / prev.gmv * <span style="color:#d19a66">100</span>, <span style="color:#d19a66">1</span>) <span style="color:#c678dd">AS</span> wow_pct
+<span style="color:#c678dd">FROM</span> <span style="color:#e5c07b">order</span> o <span style="color:#c678dd">JOIN</span> node n <span style="color:#c678dd">ON</span> o.inner_code = n.vm_code
+     <span style="color:#c678dd">JOIN</span> ${cpState.dim==='sku'?'sku s ON n.vm_id = s.vm_id':'region r ON n.region_id = r.id'}  <span style="color:#5c6370">-- 白名单表</span>
+     <span style="color:#c678dd">LEFT JOIN</span> (...) prev  <span style="color:#5c6370">-- 上期聚合</span>
+<span style="color:#c678dd">WHERE</span> o.create_time &gt;= <span style="color:#98c379">'2026-09-13'</span> <span style="color:#c678dd">AND</span> o.pay_status = <span style="color:#d19a66">1</span>
+<span style="color:#c678dd">GROUP BY</span> <span style="color:#d19a66">1</span> <span style="color:#c678dd">ORDER BY</span> gmv <span style="color:#c678dd">DESC LIMIT</span> <span style="color:#d19a66">20</span>;  <span style="color:#5c6370">-- LIMIT 兜底已注入</span>`;
+}
+
+/* ==================== 初始化 ==================== */
+renderRestock();
+renderCopilot();
+</script>
+</body>
+</html>

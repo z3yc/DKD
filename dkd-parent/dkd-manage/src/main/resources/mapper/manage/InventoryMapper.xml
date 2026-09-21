@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.InventoryMapper">
+
+    <resultMap type="Inventory" id="InventoryResult">
+        <result property="id"    column="id"    />
+        <result property="vmId"    column="vm_id"    />
+        <result property="skuId"    column="sku_id"    />
+        <result property="channelId"    column="channel_id"    />
+        <result property="quantity"    column="current_stock"    />
+        <result property="minQuantity"    column="min_stock"    />
+        <result property="maxQuantity"    column="max_stock"    />
+        <result property="lastSupplyTime"    column="last_supply_time"    />
+        <result property="createTime"    column="create_time"    />
+        <result property="updateTime"    column="update_time"    />
+        <result property="innerCode"    column="inner_code"    />
+        <result property="skuName"    column="sku_name"    />
+        <result property="skuImage"    column="sku_image"    />
+        <result property="channelCode"    column="channel_code"    />
+    </resultMap>
+
+    <sql id="selectInventoryVo">
+        select i.id, i.vm_id, i.sku_id, i.channel_id, i.current_stock, i.min_stock, i.max_stock, i.last_supply_time, i.create_time, i.update_time,
+               vm.inner_code, s.sku_name, s.sku_image, c.channel_code
+        from tb_inventory i
+        left join tb_vending_machine vm on i.vm_id = vm.id
+        left join tb_sku s on i.sku_id = s.sku_id
+        left join tb_channel c on i.channel_id = c.id
+    </sql>
+
+    <select id="selectInventoryList" parameterType="Inventory" resultMap="InventoryResult">
+        <include refid="selectInventoryVo"/>
+        <where>
+            <if test="vmId != null">and i.vm_id = #{vmId}</if>
+            <if test="skuId != null">and i.sku_id = #{skuId}</if>
+            <if test="channelId != null">and i.channel_id = #{channelId}</if>
+            <if test="quantity != null">and i.current_stock = #{quantity}</if>
+            <if test="minQuantity != null">and i.min_stock = #{minQuantity}</if>
+            <if test="maxQuantity != null">and i.max_stock = #{maxQuantity}</if>
+            <if test="innerCode != null and innerCode != ''">and vm.inner_code like concat('%', #{innerCode}, '%')</if>
+            <if test="skuName != null and skuName != ''">and s.sku_name like concat('%', #{skuName}, '%')</if>
+            <if test="channelCode != null and channelCode != ''">and c.channel_code like concat('%', #{channelCode}, '%')</if>
+        </where>
+        order by i.create_time desc
+    </select>
+
+    <select id="selectInventoryById" parameterType="Long" resultMap="InventoryResult">
+        <include refid="selectInventoryVo"/>
+        where i.id = #{id}
+    </select>
+
+    <select id="selectByVmIdAndSkuIdAndChannelId" resultMap="InventoryResult">
+        <include refid="selectInventoryVo"/>
+        where i.vm_id = #{vmId} and i.sku_id = #{skuId} and i.channel_id = #{channelId}
+    </select>
+
+    <select id="selectLowInventoryList" resultMap="InventoryResult">
+        <include refid="selectInventoryVo"/>
+        where i.current_stock = i.min_stock
+        order by i.current_stock asc
+    </select>
+
+    <select id="selectOutOfStockList" resultMap="InventoryResult">
+        <include refid="selectInventoryVo"/>
+        where i.current_stock &lt; i.min_stock
+        order by i.current_stock asc
+    </select>
+
+    <insert id="insertInventory" parameterType="Inventory" useGeneratedKeys="true" keyProperty="id">
+        insert into tb_inventory
+        (vm_id, sku_id, channel_id, current_stock, min_stock, max_stock, last_supply_time, create_time, update_time)
+        values (#{vmId}, #{skuId}, #{channelId}, #{quantity}, #{minQuantity}, #{maxQuantity}, #{lastSupplyTime}, #{createTime}, #{updateTime})
+    </insert>
+
+    <update id="updateInventory" parameterType="Inventory">
+        update tb_inventory
+        <trim prefix="SET" suffixOverrides=",">
+            <if test="vmId != null">vm_id = #{vmId},</if>
+            <if test="skuId != null">sku_id = #{skuId},</if>
+            <if test="channelId != null">channel_id = #{channelId},</if>
+            <if test="quantity != null">current_stock = #{quantity},</if>
+            <if test="minQuantity != null">min_stock = #{minQuantity},</if>
+            <if test="maxQuantity != null">max_stock = #{maxQuantity},</if>
+            <if test="lastSupplyTime != null">last_supply_time = #{lastSupplyTime},</if>
+            <if test="createTime != null">create_time = #{createTime},</if>
+            <if test="updateTime != null">update_time = #{updateTime},</if>
+        </trim>
+        where id = #{id}
+    </update>
+
+    <delete id="deleteInventoryById" parameterType="Long">
+        delete from tb_inventory where id = #{id}
+    </delete>
+
+    <delete id="deleteInventoryByIds" parameterType="String">
+        delete from tb_inventory where id in
+        <foreach item="id" collection="array" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </delete>
+
+    <insert id="batchInsertInventory" parameterType="java.util.List" useGeneratedKeys="true" keyProperty="id">
+        insert into tb_inventory
+        (vm_id, sku_id, channel_id, current_stock, min_stock, max_stock, last_supply_time, create_time, update_time)
+        values
+        <foreach collection="list" item="item" separator=",">
+            (#{item.vmId}, #{item.skuId}, #{item.channelId}, #{item.quantity}, #{item.minQuantity}, #{item.maxQuantity}, #{item.lastSupplyTime}, #{item.createTime}, #{item.updateTime})
+        </foreach>
+    </insert>
+
+</mapper>

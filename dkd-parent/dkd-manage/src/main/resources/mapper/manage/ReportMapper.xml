@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.ReportMapper">
+
+    <resultMap type="Report" id="ReportResult">
+        <result property="id"              column="id"              />
+        <result property="reportType"      column="report_type"    />
+        <result property="reportDate"      column="report_date"    />
+        <result property="totalRevenue"    column="total_revenue"  />
+        <result property="totalOrders"     column="total_orders"   />
+        <result property="totalDevices"    column="total_devices"  />
+        <result property="onlineDevices"   column="online_devices" />
+        <result property="faultDevices"    column="fault_devices"  />
+        <result property="lowStockDevices" column="low_stock_devices" />
+        <result property="topProducts"     column="top_products"   />
+        <result property="topNodes"        column="top_nodes"      />
+        <result property="anomalyAlerts"   column="anomaly_alerts" />
+        <result property="aiAnalysis"      column="ai_analysis"    />
+        <result property="retryCount"      column="retry_count"    />
+        <result property="status"          column="status"         />
+        <result property="createTime"      column="create_time"    />
+        <result property="updateTime"      column="update_time"    />
+    </resultMap>
+
+    <sql id="selectReportVo">
+        select id, report_type, report_date, total_revenue, total_orders, total_devices,
+               online_devices, fault_devices, low_stock_devices, top_products, top_nodes,
+               anomaly_alerts, ai_analysis, retry_count, status, create_time, update_time
+        from tb_report
+    </sql>
+    <select id="selectReportById" parameterType="Long" resultMap="ReportResult">
+        <include refid="selectReportVo"/>
+        where id = #{id}
+    </select>
+
+    <select id="selectReportList" parameterType="Report" resultMap="ReportResult">
+        <include refid="selectReportVo"/>
+        <where>
+            <if test="reportType != null and reportType != ''">
+                AND report_type = #{reportType}
+            </if>
+            <if test="reportDate != null">
+                AND report_date = #{reportDate}
+            </if>
+            <if test="status != null">
+                AND status = #{status}
+            </if>
+            <if test="params.beginTime != null and params.beginTime != ''">
+                AND report_date &gt;= #{params.beginTime}
+            </if>
+            <if test="params.endTime != null and params.endTime != ''">
+                AND report_date &lt;= #{params.endTime}
+            </if>
+        </where>
+        order by report_date desc
+    </select>
+
+    <select id="selectLatestReport" parameterType="String" resultMap="ReportResult">
+        <include refid="selectReportVo"/>
+        where report_type = #{reportType} and status = 1
+        order by report_date desc limit 1
+    </select>
+
+    <insert id="insertReport" parameterType="Report" useGeneratedKeys="true" keyProperty="id">
+        insert into tb_report (
+            report_type, report_date, total_revenue, total_orders,
+            total_devices, online_devices, fault_devices, low_stock_devices,
+            top_products, top_nodes, anomaly_alerts, ai_analysis,
+            retry_count, status, create_time
+        ) values (
+            #{reportType}, #{reportDate}, #{totalRevenue}, #{totalOrders},
+            #{totalDevices}, #{onlineDevices}, #{faultDevices}, #{lowStockDevices},
+            #{topProducts}, #{topNodes}, #{anomalyAlerts}, #{aiAnalysis},
+            #{retryCount}, #{status}, sysdate()
+        )
+    </insert>
+
+    <update id="updateReport" parameterType="Report">
+        update tb_report
+        <set>
+            <if test="totalRevenue != null">total_revenue = #{totalRevenue},</if>
+            <if test="totalOrders != null">total_orders = #{totalOrders},</if>
+            <if test="totalDevices != null">total_devices = #{totalDevices},</if>
+            <if test="onlineDevices != null">online_devices = #{onlineDevices},</if>
+            <if test="faultDevices != null">fault_devices = #{faultDevices},</if>
+            <if test="lowStockDevices != null">low_stock_devices = #{lowStockDevices},</if>
+            <if test="topProducts != null">top_products = #{topProducts},</if>
+            <if test="topNodes != null">top_nodes = #{topNodes},</if>
+            <if test="anomalyAlerts != null">anomaly_alerts = #{anomalyAlerts},</if>
+            <if test="aiAnalysis != null">ai_analysis = #{aiAnalysis},</if>
+            <if test="retryCount != null">retry_count = #{retryCount},</if>
+            <if test="status != null">status = #{status},</if>
+            update_time = sysdate(),
+        </set>
+        where id = #{id}
+    </update>
+
+    <delete id="deleteReportByIds">
+        delete from tb_report where id in
+        <foreach item="item" collection="array" separator="," open="(" close=")">
+            #{item}
+        </foreach>
+    </delete>
+
+    <insert id="insertOrIgnoreReport" parameterType="Report" useGeneratedKeys="true" keyProperty="id">
+        insert into tb_report (
+            report_type, report_date, total_revenue, total_orders,
+            total_devices, online_devices, fault_devices, low_stock_devices,
+            top_products, top_nodes, anomaly_alerts, ai_analysis,
+            retry_count, status, create_time
+        ) values (
+            #{reportType}, #{reportDate}, #{totalRevenue}, #{totalOrders},
+            #{totalDevices}, #{onlineDevices}, #{faultDevices}, #{lowStockDevices},
+            #{topProducts}, #{topNodes}, #{anomalyAlerts}, #{aiAnalysis},
+            #{retryCount}, #{status}, sysdate()
+        )
+    </insert>
+
+    <!-- 数据聚合查询：统计所有已完成订单 -->
+    <select id="sumRevenueByStatusAndDateRange" resultType="Long">
+        select COALESCE(sum(amount), 0) from tb_order
+        where status &gt;= 1
+    </select>
+
+    <select id="countOrdersByStatusAndDateRange" resultType="Integer">
+        select count(*) from tb_order
+        where status &gt;= 1
+    </select>
+
+    <select id="topNodesByRevenue" resultType="java.util.HashMap">
+        select node_name as nodeName, sum(amount) as revenue
+        from tb_order
+        where status &gt;= 1
+        group by node_id, node_name
+        order by revenue desc limit 10
+    </select>
+
+    <select id="topProductsBySales" resultType="java.util.HashMap">
+        select sku_name as skuName, count(*) as sales
+        from tb_order
+        where status &gt;= 1
+        group by sku_id, sku_name
+        order by sales desc limit 10
+    </select>
+
+    <select id="countLowStockDevices" resultType="Integer">
+        select count(*) from tb_inventory where current_stock = min_stock
+    </select>
+
+</mapper>
