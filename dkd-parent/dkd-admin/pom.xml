@@ -78,6 +78,15 @@
             <version>2.3.0</version>
             <scope>compile</scope>
         </dependency>
+
+        <!-- 单元测试（JUnit5 + Mockito + spring-test）：支撑任务 0-6 网关/0-7 回调的单测。
+             为什么版本写死 2.5.15：本模块未继承 spring-boot-starter-parent，无依赖管理兜底 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <version>2.5.15</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -106,6 +115,14 @@
                     <warName>${project.artifactId}</warName>
                 </configuration>
            </plugin>
+            <plugin>
+                <!-- 为什么必须固定版本：父 POM 未继承 spring-boot-starter-parent，而 Maven 3.8 默认绑定的
+                     surefire 2.12.4 不识别 JUnit5（Jupiter）用例（会静默跳过后报“no tests”），
+                     测试看起来“绿”实则没跑，比红灯更危险 -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>2.22.2</version>
+            </plugin>
         </plugins>
         <finalName>${project.artifactId}</finalName>
     </build>
