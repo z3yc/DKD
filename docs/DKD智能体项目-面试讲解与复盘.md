@@ -316,6 +316,16 @@ Postgres saver（landing zone）
   - **同名头不代表同语义**：`Last-Event-ID` 是“续传游标”，不能当普通请求参数满天飞；
   - **JS 的错误陷阱**：所有返回 Promise 的 API 在 `try/catch` 里必须 `await`，否则异常跑到全局（控制台报错、甚至变成静默 bug）。
 
+### 坑 18 口令轮换把潜伏的依赖缺口炸出来了：`caching_sha2_password` 需要 `cryptography`
+
+- **现象**：轮换完 `dkd_agent` 库账号口令后，Python 服务健康检查正常，但一旦有一次对话需要写留痕/计量，连库直接报 `RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods`（对话本身不断，因为审计属旁路——这反而让问题更隐若）。
+- **定位**：MySQL 8 默认 `caching_sha2_password`。前 N 次连接走的是**快速路径**（服务端缓存了 SHA2 条目，无需加密）；`ALTER USER` 会**清掉缓存** ⇒ 下一次必须走全量握手；非 TLS 连接下全量握手必须用 RSA 公钥加密口令 ⇒ PyMySQL/aiomysql 此时必须有 `cryptography`。本机之所以一直正常，是因为服务器缓存一直没失效——**同一个 MySQL 只要重启或改口令，生产也会一样炸**。
+- **修复**：`uv add cryptography`（写进 `pyproject.toml`/`uv.lock` 做声明，而不是“本机装一个”）；轮换后重跑链路：9 帧流式正常 + `agent_decision_log` 新行写入成功。
+- **教训**：
+  - **依赖声明要用“最严苛路径”验证**：平时跑得通不代表换密码/重启后跑得通；认证类依赖尤其如此；
+  - **旁路能力的降级放行会掩盖问题**：审计写失败只打 WARN（这是对的设计），但因此**必须靠“换口令后主动复测写入”**才能发现问题；
+  - **轮换本身是一次“依赖体检”**：能把“只在本机缓存有效”的隐性假设全部暴露出来。
+
 ---
 
 ## 五之二、知识点清单（可背诵，面试按需展开）
@@ -365,7 +375,7 @@ Postgres saver（landing zone）
 | 读写分离的落地 | MySQL 两级授权：业务表**仅 SELECT**（白名单 + 无 `tb_` 前缀即拒）、自有表可 `INSERT/UPDATE` 但**无 DELETE/DDL**；验证矩阵含**读非白名单表被拒**（只验“写被拒”不够，只读账号默认能读全库表结构与其他库） |
 | 客户端可控字段入日志 | 必须净化（visible ASCII + 长度上限）——日志注入与非法响应头都会以“莫名报错”的形式出现 |
 | LLM 输出不可信 | 结构化解析 + **范围夹取**（数量 clamp 到 `[0, 货道容量-现库存]`）+ 写操作人工确认；前端渲染一律过 `DOMPurify` |
-| 密钥不落仓库 | 配置全 `${ENV}` 占位符；`.env` 与 `var/*.db` 进 `.gitignore`；**改完还要清 Git 历史与 dangling 对象**（本轮实测：清理前对象库命中 2 处密钥 → 清理后 0、未可达对象 0） |
+| 密钥不落仓库 | 配置全 `${ENV}` 占位符；`.env` 与 `var/*.db` 进 `.gitignore`；**改完还要清 Git 历史与 dangling 对象**（本轮实测：清理前对象库命中 2 处密钥 → 清理后 0、未可达对象 0）；**轮换本身要当一次“依赖体检”**（MySQL 8 `caching_sha2_password` 全量握手需 `cryptography`，详见坑 18） |
 | fail-closed | 密钥未配置 → **503 拒绝服务**，绝不“默认放行”；审计库挂了 → 记录 WARN **降级放行**（旁路不能打断主流程）——两者语义要分清 |
 
 ### E. 可观测性与测试工程

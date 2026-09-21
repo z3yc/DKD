@@ -230,7 +230,7 @@
 | 0-11 | 前端 SSE 客户端 + 侧边栏壳 | ✅ | `sseFrames.js`（纯分帧）/`sse.js`（fetch+ReadableStream+AbortController+空闲超时）/`api/manage/agent.js`/`store/modules/agent.js`/`components/AgentAssistant/index.vue` + Navbar 入口 + layout 挂载；`npm run build:prod` exit 0；**用真实抓包字节流跑 18 项分帧断言全过**（含 303 个二分切点/逐字符/随机分片/CRLF/半帧） |
 | 0-12 | request_id + 留痕 + 成本计量与限额 | ✅ | 留痕/消息投影实写 MySQL（手机号实测脱敏为 `138****5678`，明文 0 行）；限额熔断 429；`/agents/usage/summary` 鉴权 401/200 正确；**审计库故障降级不中断对话**（3 项降级测试覆盖） |
 | 0-13 | LangGraph 版本锁定 + state schema 评审 | ✅ 评审稿就绪（待开会确认） | 交付 `docs/dkd-agent-restock-state-schema.md`（冻结表 + 中断契约 + 兼容规则 + 10 项检查清单）；代码侧 `restock_state.py` 冻结 + 15 项契约测试；**评审中发现 `expect_capacity` 语义陷阱**（见该稿 §4.2） |
-| 0-14 | 安全整改（14a ✅ / **14c ✅ 本轮完成** / 14b 待值班窗口） | 🔄 | **14c A/B 实测**：清理前对象库密钥模式命中 **2** 处、未可达提交 2 个（`5d56572`/`0fdbd15`，实测 6 行明文凭据）→ `reflog expire + gc --prune=now` 后未可达对象 **0**、密钥命中 **0**；附带扫描：跟踪文件明文凭据命中 0，`.env`/`*.db` 均已 gitignore。**14b 仍需人工轮换**（OSS AK/SK、MySQL/Redis 弱口令；JWT secret 轮换会踢所有在线用户） |
+| 0-14 | 安全整改（14a ✅ / 14c ✅ / **14b 部分完成**） | 🔄 | **14c A/B 实测**：清理前对象库密钥模式命中 **2** 处、未可达提交 2 个（`5d56572`/`0fdbd15`，实测 6 行明文凭据）→ `reflog expire + gc --prune=now` 后未可达对象 **0**、密钥命中 **0**；**14b 新增进展**：新增 `docs/security-credential-rotation.md` runbook（四步流程 + 逐凭据影响面/验证/回滚 + 变更记录）；已实际轮换 `dkd_agent` 库账号（旧口令 1045、权限矩阵 3 项拒绝全中、Python 侧留痕写入复测通过），并连带修复依赖缺口（新增 `cryptography`，否则口令变更会因 `caching_sha2_password` 全量握手把智能体打挂）；**待人工**：MySQL root / Redis / JWT secret / OSS AK / Druid 口令（#1~#4、#6）需值班窗口与云控制台 |
 | 0-15 | **M1 验收（G2）**：全链路演示 + 降级演练 + 安全复查 | ✅ 主体通过（2 项明确未达，见备注） | ① 真 LLM 全链路：前端→网关→Python→DeepSeek→SSE，`meta.mode=llm` / `model=deepseek-flash`，980ms，`X-Request-Id` 从网关贯穿到 `agent_decision_log`/`agent_message`；② 降级演练：停 Python → `upstream=down` + `degrade:true` 帧；`--agent.enabled=false` → 503 信封 + SSE 降级帧；未认证仍拒（信封 401）；③ 安全复查：跟踪文件明文凭据 0、对象库密钥 0、回调 4 类拒绝路径全过、`agent_decision_log` 明文手机号 0 行；④ 质量门禁：pytest **70 passed**/93.58%、mvn **42 passed**、`npm run build:prod` exit 0。**未达项**：(a) 0-14b 凭据轮换需人工/值班窗口；(b) 前端浏览器视觉未验（见下之 6）。**新发现缺口**：(c) LLM 节点仍用 `ainvoke`，属**帧级**流式而非 token 级（首帧延迟 ≈ 整段 LLM 时延），建议 Phase 1 的 1-5 节点改 `astream` + `stream_mode="messages"` |
 
 ### 质量门禁现状
@@ -290,6 +290,7 @@
 ### 阻塞与待办需求（需项目负责人决策/提供）
 
 1. **0-15（M1 验收）待排**：Python 侧改 `DKD_AGENT_USE_LLM=1` 后跑真 LLM 全链（本轮为 echo 链路）；`agent.enabled=false` 降级演练已提前完成；
-2. **0-14b 凭据轮换需值班窗口**（OSS AK/SK、MySQL/Redis 弱口令；JWT secret 轮换会踢掉全部在线用户）；
+2. **0-14b 剩余凭据轮换需值班窗口**（MySQL root / Redis / JWT secret / OSS AK / Druid）；
+   其中 JWT secret 轮换会踢掉全部在线用户；完整步骤与回滚见 `docs/security-credential-rotation.md`；
 3. **`DKD_AGENT_SERVICE_SECRET` 两端一致性**：本机 `.env` 已生成，Java 与 Python 均已读取并实测通过；上线前需在部署环境注入同一值；
 4. **`.env` 不会自动生效**：Spring Boot / Python 均不读 `.env`，需在 IDE/`setx` 注入（详见 `dkd-agent/README.md`）；
