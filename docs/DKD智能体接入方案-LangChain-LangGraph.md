@@ -215,7 +215,7 @@
 
 | 路径 | 方法 | 行为 |
 | --- | --- | --- |
-| `/agent/chat` | POST | SSE 透传（`text/event-stream`；帧 `meta`/`delta`/`done`/`error`，delta 帧带 `id`，支持 `Last-Event-ID` 续传） |
+| `/agent/chat` | POST | SSE 透传（`text/event-stream`）。帧：`meta` → `delta`×N → `done`（异常时插入 `error`）。**token 级流式**：LLM 分片回调逐块下发（实测真 LLM：13 帧，首 token 距 meta **545ms**、末 token 距首 token **487ms**）。`delta` 带自增 `id`，支持 `Last-Event-ID` 续传。**帧字段分工**：`meta` 只带“开始时已知”的（conversation_id/request_id/scene/user/mode[echo\|llm]/resumed）；服务端**实际模型名**、`history_len`、`tokens_in/out`、`frames` 由 `done` 帧补全（首轮请求的 `meta.model` 为 `null`，**不写配置里的假值**） |
 | `/agent/status` | GET | `{code:200,data:{enabled,upstream:"up"\|"down"}}`，供前端决定是否隐藏/禁用对话入口 |
 | 其余 `/agent/**` | 任意 | 泛化代理（同方法/路径/查询串/Body），上游 2xx/4xx 原样透传 |
 | `/agent/callback/**` | 任意 | **拒绝**（HTTP 404）：回调是 Python → Java 单向通道，不经网关暴露给前端 |
@@ -234,6 +234,8 @@
 
 **D. 未认证口径（沿用 RuoYi 约定，与 `/manage/**` 完全一致）**：HTTP **200** + `{"code":401,"msg":"请求访问：…，认证失败"}`。
 → Python 侧无需感知；**前端 SSE 客户端必须按 `Content-Type` 判定是否为 SSE**，只看 `response.ok` 会把该信封当流解析，导致空白气泡（0-11 已按此修复）。
+
+**D2. token 级流式（M1 缺口修复，2026-09-21）**：此前 LLM 节点用 `ainvoke` 整段取回、再按 24 字符分帧，属**帧级**流式（首字延迟 ≈ 整段 LLM 时延）。现改为：节点 `build_chat_model(streaming=True)` + API 层 `graph.astream(..., stream_mode=["messages","values"])`——`messages` 抽 LLM 分片回调（逐 token 下发），`values` 取每步后的完整 state（留痕/计量用）。**两个已踩的坑**：① `messages` 模式除了分片回调，也会把节点**直接返回的完整 `AIMessage`** 吐出来（echo 节点就是），因此必须按 `AIMessageChunk` 类型过滤，否则 echo 模式会重复发一遗；② 只有 `streaming=True` 或回调触发时 langchain 才真流式，显式打开以免版本升级静默回退。echo 节点（USE_LLM=0 的自检/降级演练）走兜底分帧路径，行为不变。
 
 **E. 回调（Python → Java 写操作）**
 

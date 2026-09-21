@@ -239,7 +239,7 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | 29 files already formatted |
-| `uv run pytest` | **70 passed**（1 live 用例默认 deselect），覆盖率 **93.58%**（要求 ≥70%） |
+| `uv run pytest` | **71 passed**（1 live 用例默认 deselect），覆盖率 **93%+**（要求 ≥70%） |
 | `mvn -pl dkd-admin -am test`（**本轮新增**） | **Tests run: 42, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
@@ -264,7 +264,7 @@
 
 **6. 风险与未验证项（不隐瞒）**：
 - **前端未做浏览器视觉验证**：Playwright/Chrome 自动化会引入未声明依赖，按 AGENTS §8 以“构建通过 + 手测清单”交付（清单见下）；SSE 增量到达（51 帧/3.2s）已在 HTTP 层证实；
-- **流式为帧级而非 token 级（M1 新发现，Phase 1 修）**：LLM 节点用 `ainvoke` 整段取回后再按 24 字符分帧，因此首帧延迟 ≈ 整段 LLM 时延（实测 980ms），用户看到的是“一次性到达后逐字打印”而非“边生成边到达”。修法：1-5 校准节点改 `astream`，API 层用 `graph.astream(stream_mode="messages")`；不修不影响功能，但会拉低长回答的体感；
+- **流式为帧级而非 token 级（M1 发现，✅ 已修）**：已改为 `astream(stream_mode=["messages","values"])` 逐 token 下发，实测 13~14 帧 / 首 token 距 meta **545ms** / 末 token 距首 token **487ms**（修复前整段 980ms）；回归锚点 `tests/test_chat_llm_mode.py::test_llm_tokens_arrive_as_multiple_delta_frames`（帧数退化成 1 即失败）；
 - **回调不回传 `taskId/taskCode`**（`insertTaskDto` 只返回影响行数）→ 1-3/1-8 需一并处理，已标 TODO；
 - **`X-Agent-Region` 缺省**：当前 schema 无 sys_user → 区域映射（影响仅审计上下文，1-8 按设备区域选人不受影响）；
 - **`@RateLimiter` 的 Redis 依赖**：Redis 不可用时回调用例会失败（fail-closed），属预期行为，未做演练；
