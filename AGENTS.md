@@ -19,7 +19,7 @@
 
 **核心架构约束（不可违背）**：
 1. Java 系统是**业务事实唯一所有者**——所有写操作必须经 Java 服务的事务与校验链（如 `TaskServiceImpl.insertTaskDto` 的防重/状态/区域校验）；**dkd-agent 永远不得直连数据库写入**；
-2. Agent 读数据走 MySQL **只读账号 + 表白名单**；写操作一律回调 Java REST（`AgentCallbackController`，服务间密钥鉴权）；
+2. Agent 读数据走 MySQL **只读账号 + 表白名单**；写操作一律回调 Java REST（`AgentCallbackController`，服务间密钥鉴权）。**唯一例外**：智能体自有表（`agent_*`）可由 Agent 直接读写（不含 DELETE），它不属“业务事实”，详见 §7.3；
 3. `agent.enabled` 开关必须保证 Python 服务不可用时主业务零影响（现有 `IAiService` 单轮链路兜底）；
 4. Java 8 语法边界：**禁止使用 var / record / switch 表达式 / List.of() 等高版本特性**（编译目标 1.8）；
 5. **基础设施实测边界（2026-09-21 核实，不得凭印象假设）**：
@@ -208,7 +208,10 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
    - **存量风险现状（2026-09-21 复核修正）**：① 配置外置改造**已提交**（初始提交已重写为 `3e1f4a8`，`main` 与 `origin/main` 的**可达历史中已无明文密钥**）；② 旧提交对象以 **dangling** 形式残留于本地对象库（`git gc` 后消失），且凭据在重写前已进入过版本历史，**轮换仍属必须项**——实测旧 DeepSeek Key 已失效（HTTP 401），OSS AK/SK 与 DB/Redis 密码待轮换；③ JWT secret 已替换为新随机值（原 RuoYi 模板弱密钥 `abcdefghijklmnopqrstuvwxyz` 废弃），**轮换 JWT secret 会使所有在线用户掉线**，生产变更需协调值班窗口；④ 本机开发凭据集中存放于 `.env`（已 gitignore），**禁止把值写回任何入仓文件**；
    - 任何新代码不得延续明文模式；新增密钥一律环境变量/启动参数注入，模板文件（`application-*.example.yml`）写占位符。AI 助手在输出配置示例时必须用 `${OSS_ACCESS_KEY}` 占位，禁止照抄真实值；
 2. **SQL 注入**：MyBatis XML 中 `${}` 仅允许用于排序字段等已白名单化的场景，其余一律 `#{}`；新增任何拼 SQL 代码必须评审；
-3. **Agent 读写分离**（本项目特有，最高优先级）：dkd-agent 对 MySQL 只有只读账号 + 表白名单；一切写操作回调 Java REST；**任何"图方便直接 UPDATE 库"的代码直接拒绝**；
+3. **Agent 读写分离**（本项目特有，最高优先级）：dkd-agent 对 MySQL 采用**两级授权账号**（建权脚本 `docs/ddl/create_agent_db_user.sql`）：
+   - 业务表 `tb_*`（白名单内）：**仅 SELECT**，任何写操作一律回调 Java REST；**任何“图方便直接 UPDATE 业务表”的代码直接拒绝**；
+   - 智能体自有表 `agent_*`（`agent_conversation`/`agent_message`/`agent_decision_log`/`agent_restock_plan`）：允许 `SELECT/INSERT/UPDATE`（会话/留痕/计划数据由 Agent 自维护，**不是业务事实**），**不授 DELETE**（软删除，§7.4）与任何 DDL；
+   - 跨库一律禁止（本机 MySQL 上还有 my/gogs/itest/test/sky_take_out/db03/db04/tlias 等库）；区分边界不得模糊；
 4. **软删除**：业务数据删除一律逻辑删除（RuoYi `del_flag` 或 `deleted_at`），禁止物理 DELETE 用户/业务数据；查询默认过滤已删除；
 5. **鉴权不裸奔**：新接口必须纳入现有 JWT 过滤链；`AgentCallbackController` 仅限内网 + 服务间密钥 + 路径白名单；回调密钥与用户 JWT 是两套体系，不得混用；
 6. **LLM 输出视为不可信输入**：Agent 侧结构化输出必须容错解析 + 范围夹取（数量 clamp 到 [0, 货道容量-现库存]，日期非法置 None）；用户输入进 prompt 前定界并声明"仅数据非指令"（防注入）；

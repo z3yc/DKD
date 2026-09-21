@@ -212,7 +212,7 @@
 | --- | --- | --- |
 | 前端 → Java 网关 → Python | 复用现有 JWT（`token.header: Authorization`） | 网关解析后转发，Python 不解析 JWT，只信任网关注入的用户头 |
 | Python → Java 回调（写操作） | 服务间密钥（HMAC 签名或固定 Secret Header） | 回调接口在白名单路径内，仅限内网 |
-| Python → MySQL | 独立只读账号（仅 SELECT 权限，**仅显式授权白名单表**，同时收回非白名单表与非 `dkd` 库的读权限） | 物理隔离写风险；验收须同时覆盖「**读非白名单表被拒**」——只验「写被拒」不够（MySQL 只读账号默认仍可读全库表结构与其他库）；NL2SQL 场景再叠加表白名单 + SQL 校验 |
+| Python → MySQL | **两级授权账号** `dkd_agent`（建权脚本 `docs/ddl/create_agent_db_user.sql`）：业务表 `tb_*` 仅白名单内 SELECT；自有表 `agent_*` 可 SELECT/INSERT/UPDATE，**无 DELETE（软删除）/DDL**；禁用跨库（本机另有 8 个其他项目库） | 物理隔离写风险；验收须同时覆盖「**读非白名单表被拒**」「**写业务表被拒**」「**DELETE 被拒**」——只验「写被拒」不够（MySQL 只读账号默认仍可读全库表结构与其他库）；NL2SQL 场景再叠加表白名单 + SQL 校验 |
 | 写操作二次确认 | 前端确认卡片（工单创建前展示完整参数预览） | 首期所有写操作必须人工点击确认 |
 
 > **安全整改现状（2026-09-21 实测核对，V1 描述已过时）：**
@@ -243,7 +243,7 @@
 | 表 | 用途 | 关键字段 |
 | --- | --- | --- |
 | `agent_conversation` | 会话元数据 | id、user_id、scene、created_at |
-| `agent_message` | 消息明细（LangGraph checkpointer 的业务投影） | conversation_id、role、content、tool_calls(JSON)、created_at |
+| `agent_message` | 消息明细（LangGraph checkpointer 的业务投影 + **成本计量数据源**） | conversation_id、**user_id**、seq、role、content、tool_calls(JSON)、model、**tokens_in/tokens_out**、latency_ms、create_time |
 | `agent_decision_log` | **决策留痕（审计核心表）** | id、scene、input_context(JSON)、llm_output(JSON)、action、target_id、result、confidence、created_at |
 | `agent_restock_plan` | 补货计划（建议→确认→执行全生命周期） | id、vm_id、inner_code、items(JSON)、status(建议/已确认/已建单/已复盘)、task_id、review_metrics(JSON) |
 

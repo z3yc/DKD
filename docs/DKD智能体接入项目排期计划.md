@@ -206,3 +206,43 @@
 ---
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.1）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。*
+
+---
+
+## 七、执行进度（滚动更新）
+
+> 更新于 **2026-09-21**（W1 周一，Phase 0 第 1 天）。状态图例：✅ 已完成并验证 / 🔄 进行中 / ⏳ 待办 / ⛔ 阻塞。
+
+### Phase 0（W1~W3，09-21 ~ 10-09）
+
+| # | 任务 | 状态 | 证据 / 备注 |
+| --- | --- | --- | --- |
+| 0-1 | 方案评审会 | ✅ | 2026-09-21 评审通过，方案 V1.1 + 排期 V2 已定稿 |
+| 0-2 | Python 环境与依赖锁定（uv + Python 3.11.13） | ✅ | `uv.lock` 锁定：langgraph **1.2.11** / langgraph-checkpoint **4.2.0** / checkpoint-sqlite **3.1.1**（方案原写 `≥0.2`，实际落 1.x，印证版本漂移风险） |
+| 0-3 | LLM 连通（DeepSeek） | ✅ | live 冒烟 HTTP 200 / 5.4s；单元测试全打桩（§8 要求）。**实测服务端返回 `deepseek-flash` 而非配置的 `deepseek-chat`** → 计量按实际模型记 |
+| 0-4 | 只读账号 + 白名单 | ✅ | `dkd_agent` 两级授权；**8 项拒绝路径实测**：写业务表 / 读非白名单表 / 读系统表 / 跨库读 / DELETE 自有表 / DDL 全部 `ERROR 1142` 被拒 |
+| 0-5 | `agent_*` 四表 DDL | ✅ | 本地 dkd 库执行通过；幂等重跑退出码 0；唯一键拒绝路径命中 `ERROR 1062`；`agent_message` 后续补 `user_id` 列（计量需要） |
+| 0-6 | Java 网关（`AgentGatewayController` 等） | ⏳ | **未开工**：需 Java 工程师 ≥80% 投入（排期前提），且需确定执行人 |
+| 0-7 | Java 回调（`AgentCallbackController`） | ⏳ | 同上 |
+| 0-8 | G1 中间验收（SSE 端到端透传） | ⏳ | Python 侧 /health + SSE 已通过真实进程冒烟；待 Java 网关接入 |
+| 0-9 | Python 服务骨架（/health + SSE + 鉴权 + request_id） | ✅ | ruff / pytest 全绿；SSE 实测 meta→delta→done 逐帧输出、身份头透传、客户端断开即停 |
+| 0-10 | checkpointer 落地（SQLite） | ✅ | 跨请求恢复（history_len 2→4）、进程重启后仍可读回、`Last-Event-ID` 断点续传（只补发未收帧）均已验证 |
+| 0-11 | 前端 SSE 客户端 + 侧边栏壳 | ⏳ | **未开工**：需前端同学（§2.2 要求 fetch+ReadableStream，不得复用 axios） |
+| 0-12 | request_id + 留痕 + 成本计量与限额 | ✅ | 留痕/消息投影实写 MySQL（手机号实测脱敏为 `138****5678`，明文 0 行）；限额熔断 429；`/agents/usage/summary` 鉴权 401/200 正确；**审计库故障降级不中断对话**（3 项降级测试覆盖） |
+| 0-13 | LangGraph 版本锁定 + state schema 评审 | ⏳ | `ChatState` 字段已冻结（含兼容规则）；**补货图 schema 需在 1-6 开工前评审**（全员，0.5d） |
+| 0-14 | 安全整改（14a 已完成） | 🔄 | 初始提交已重写、可达历史无明文；**剩余 14b 凭据轮换 + 14c 清 dangling 对象**，需值班窗口 |
+
+### 质量门禁现状
+
+| 项目 | 结果 |
+| --- | --- |
+| `uv run ruff check .` | All checks passed |
+| `uv run ruff format --check .` | 14 files already formatted |
+| `uv run pytest` | **52 passed**（1 live 用例默认 deselect），覆盖率 **90.2%**（要求 ≥70%） |
+| DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测 |
+
+### 阻塞与待办需求（需项目负责人决策/提供）
+
+1. **0-6 / 0-7 / 0-11 需要人**：Java 与前端任务当前无人认领（排期前提是 Java W1~W3 ≥80%、前端 ≥50%）。
+2. **服务间密钥需两端一致**：`DKD_AGENT_SERVICE_SECRET`（已生成于本机 `.env`）需在 Java 侧 `AgentProperties.secret` 配同一值——这是 0-7 联调的前置。
+3. **`.env` 不会自动生效**：Spring Boot / Python 均不读 `.env`，需在 IDE/`setx` 注入（详见 `dkd-agent/README.md`）。
