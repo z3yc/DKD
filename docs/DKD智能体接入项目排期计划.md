@@ -231,14 +231,15 @@
 | 0-12 | request_id + 留痕 + 成本计量与限额 | ✅ | 留痕/消息投影实写 MySQL（手机号实测脱敏为 `138****5678`，明文 0 行）；限额熔断 429；`/agents/usage/summary` 鉴权 401/200 正确；**审计库故障降级不中断对话**（3 项降级测试覆盖） |
 | 0-13 | LangGraph 版本锁定 + state schema 评审 | ✅ 评审稿就绪（待开会确认） | 交付 `docs/dkd-agent-restock-state-schema.md`（冻结表 + 中断契约 + 兼容规则 + 10 项检查清单）；代码侧 `restock_state.py` 冻结 + 15 项契约测试；**评审中发现 `expect_capacity` 语义陷阱**（见该稿 §4.2） |
 | 0-14 | 安全整改（14a ✅ / **14c ✅ 本轮完成** / 14b 待值班窗口） | 🔄 | **14c A/B 实测**：清理前对象库密钥模式命中 **2** 处、未可达提交 2 个（`5d56572`/`0fdbd15`，实测 6 行明文凭据）→ `reflog expire + gc --prune=now` 后未可达对象 **0**、密钥命中 **0**；附带扫描：跟踪文件明文凭据命中 0，`.env`/`*.db` 均已 gitignore。**14b 仍需人工轮换**（OSS AK/SK、MySQL/Redis 弱口令；JWT secret 轮换会踢所有在线用户） |
+| 0-15 | **M1 验收（G2）**：全链路演示 + 降级演练 + 安全复查 | ✅ 主体通过（2 项明确未达，见备注） | ① 真 LLM 全链路：前端→网关→Python→DeepSeek→SSE，`meta.mode=llm` / `model=deepseek-flash`，980ms，`X-Request-Id` 从网关贯穿到 `agent_decision_log`/`agent_message`；② 降级演练：停 Python → `upstream=down` + `degrade:true` 帧；`--agent.enabled=false` → 503 信封 + SSE 降级帧；未认证仍拒（信封 401）；③ 安全复查：跟踪文件明文凭据 0、对象库密钥 0、回调 4 类拒绝路径全过、`agent_decision_log` 明文手机号 0 行；④ 质量门禁：pytest **70 passed**/93.58%、mvn **42 passed**、`npm run build:prod` exit 0。**未达项**：(a) 0-14b 凭据轮换需人工/值班窗口；(b) 前端浏览器视觉未验（见下之 6）。**新发现缺口**：(c) LLM 节点仍用 `ainvoke`，属**帧级**流式而非 token 级（首帧延迟 ≈ 整段 LLM 时延），建议 Phase 1 的 1-5 节点改 `astream` + `stream_mode="messages"` |
 
 ### 质量门禁现状
 
 | 项目 | 结果 |
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
-| `uv run ruff format --check .` | 28 files already formatted |
-| `uv run pytest` | **67 passed**（1 live 用例默认 deselect），覆盖率 **92.27%**（要求 ≥70%） |
+| `uv run ruff format --check .` | 29 files already formatted |
+| `uv run pytest` | **70 passed**（1 live 用例默认 deselect），覆盖率 **93.58%**（要求 ≥70%） |
 | `mvn -pl dkd-admin -am test`（**本轮新增**） | **Tests run: 42, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
@@ -262,11 +263,17 @@
 **5. 与任务书的偏离（需项目负责人知悉，已同步方案 §3.3）**：任务书要求 `StreamingResponseBody`/`HandlerInterceptor`，但 **`dkd-common` 只依赖 `spring-web`、不含 `spring-webmvc`**（`dependency:tree` 实测为空），在该模块无法编译。落地改用：SSE = 控制器直接写 `HttpServletResponse` 输出流、读一块写一块并 flush；回调 = `AgentCallbackAuthFilter`。语义合同（禁止先读完再返回、逐帧 flush）不变，且同步写不受 Tomcat 异步 `asyncTimeout`（30s）掐流影响；代价是每个在途对话占用一个 Tomcat 工作线程（max=800）。若改回原名 API，只需给 `dkd-common` 加 `spring-webmvc` 依赖。
 
 **6. 风险与未验证项（不隐瞒）**：
-- **前端未做浏览器视觉验证**：Playwright/Chrome 自动化会引入未声明依赖，按 AGENTS §8 以“构建通过 + 手测清单”交付（清单见下）；SSE 增量到达已在 HTTP 层证实；
+- **前端未做浏览器视觉验证**：Playwright/Chrome 自动化会引入未声明依赖，按 AGENTS §8 以“构建通过 + 手测清单”交付（清单见下）；SSE 增量到达（51 帧/3.2s）已在 HTTP 层证实；
+- **流式为帧级而非 token 级（M1 新发现，Phase 1 修）**：LLM 节点用 `ainvoke` 整段取回后再按 24 字符分帧，因此首帧延迟 ≈ 整段 LLM 时延（实测 980ms），用户看到的是“一次性到达后逐字打印”而非“边生成边到达”。修法：1-5 校准节点改 `astream`，API 层用 `graph.astream(stream_mode="messages")`；不修不影响功能，但会拉低长回答的体感；
 - **回调不回传 `taskId/taskCode`**（`insertTaskDto` 只返回影响行数）→ 1-3/1-8 需一并处理，已标 TODO；
 - **`X-Agent-Region` 缺省**：当前 schema 无 sys_user → 区域映射（影响仅审计上下文，1-8 按设备区域选人不受影响）；
-- **Python 侧真 LLM 未联调**：本轮 Python 以 `DKD_AGENT_USE_LLM=0`（echo）跑通链路，真实 LLM 回流放在 M1 验收（0-15）；
-- **`@RateLimiter` 的 Redis 依赖**：Redis 不可用时回调用例会失败（fail-closed），属预期行为，未做演练。
+- **`@RateLimiter` 的 Redis 依赖**：Redis 不可用时回调用例会失败（fail-closed），属预期行为，未做演练；
+- **0-14b 凭据轮换未做**：旧凭据虽已不在仓库与对象库（14a/14c 已验），但轮换前仍算“已泄露过的凭据”，属上线阻塞项。
+
+**6b. 0-15 M1 验收实测证据（2026-09-21）**：
+- 真 LLM 全链路：`POST /agent/chat`（经网关，带 JWT 与 `X-Request-Id: m1b-***`）→ 980ms 返回；meta 帧 `{"mode":"llm","model":"deepseek-flash"}`；`X-Request-Id` 响应头与 meta 帧一致；
+- 留痕/计量：`agent_decision_log` 新增 2 行（`request_id` 为网关注入值、`cost_tokens` 26/30）；`agent_message` 2 行（`model=deepseek-flash`，tokens 17/9 与 17/13）；`/agents/usage/summary` → `total_calls=2, tokens_total=56`；
+- 发现 1 个观测性缺陷并已修：`meta.mode` 硬编码 `echo`（真 LLM 调用被误标）→ 见 `fix(agent)` 提交（含 3 项新测试，LLM 节点全打桩）。
 
 **7. 前端 0-11 人工冒测清单（未完成项，需人工执行）**：
 1. 登录后顶栏出现「AI 助手」入口（绿点=在线，橙点=降级），点击打开右侧抽屉；
