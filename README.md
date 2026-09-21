@@ -159,6 +159,7 @@ mysql -h127.0.0.1 -uroot -p    < ../docs/ddl/create_agent_db_user.sql   # dkd_ag
 | `docs/DKD智能体项目-面试讲解与复盘.md` | 面试讲解分层话术 / 技术选型理由 / **9 类真实踩坑复盘** / 知识库与向量库选型讨论 |
 | `docs/ddl/agent_tables.sql` | `agent_*` 四表 DDL（含回滚与增量 ALTER） |
 | `docs/ddl/create_agent_db_user.sql` | `dkd_agent` 两级授权账号 + 8 项权限验证矩阵（6 拒绝 / 2 允许） |
+| `docs/scripts/g1-gateway-smoke.sh` | **网关端到端冒烟脚本**（0-8 验收）：登录 → SSE 逐帧 → requestId 贯穿 → 回调 4 类拒绝 → 未认证信封 → 停机降级，16 项断言 |
 | `docs/prototypes/dkd-agent-prototype.html` | 前端原型 V2（AI 侧边栏 / 补货工作台 / 分析 Copilot） |
 | `dkd-agent/README.md` | 智能体服务：环境准备 / 运行 / 环境变量 / 进度 |
 
@@ -166,16 +167,19 @@ mysql -h127.0.0.1 -uroot -p    < ../docs/ddl/create_agent_db_user.sql   # dkd_ag
 
 ## 七、当前状态（2026-09-21）
 
-**已完成并验证**（Phase 0 Python 侧）：`agent_*` 四表 DDL 真库执行、两级授权账号（8 项验证矩阵实测：6 项拒绝 + 2 项允许）、
+**已完成并验证**（Phase 0：Python 侧 + Java 侧 + 前端壳）：`agent_*` 四表 DDL 真库执行、两级授权账号（8 项验证矩阵实测：6 项拒绝 + 2 项允许）、
 `uv.lock` 精确版本锁定、LLM 连通（含 live 冒烟）、服务骨架（`/health` + SSE + `request_id` 贯穿）、
 SQLite checkpointer（跨请求恢复 / 重启可读回 / `Last-Event-ID` 断点续传）、
 决策留痕与成本计量（强制脱敏、限额熔断 429、用量报表、**审计库故障降级不中断对话**）、
-补货 state schema 冻结（含契约测试）。
+补货 state schema 冻结（含契约测试）；
+**Java 网关与回调**（`/agent/**` 转发 + 身份头白名单重建 + SSE 逐块中继 + 回调密钥/白名单/限流，纯单测 42 项）；
+**前端 AI 助手侧边栏**（`fetch`+`ReadableStream` SSE 客户端、逐帧渲染、可取消、降级横幅）。
 
-**质量门禁**：`pytest` 67 passed / 覆盖率 92.3% / `ruff` 全过。
+**质量门禁**：Python `pytest` **67 passed / 1 deselected / 覆盖率 92.27%**（要求 ≥70%）/ `ruff` 全过；Java `mvn -pl dkd-admin -am test` **42 passed**；
+前端 `npm run build:prod` exit 0；端到端 `bash docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**（含 SSE 不缓冲实测：51 帧/3.2s，首 delta 距首行 70ms）。
 
-**待办（需人力或决策）**：Java 网关与回调（0-6/0-7）、前端 SSE 客户端与侧边栏（0-11）、
-凭据轮换（0-14b）、补货与诊断 Agent 主体（Phase 1/2）。
+**待办**：Python 侧真 LLM 全链联调（0-15 M1 验收）、前端人工手测（清单见排期 §七之 7）、
+凭据轮换（0-14b，需值班窗口）、补货与诊断 Agent 主体（Phase 1/2）。
 
 ---
 

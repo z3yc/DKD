@@ -222,27 +222,67 @@
 | 0-3 | LLM 连通（DeepSeek） | ✅ | live 冒烟 HTTP 200 / 5.4s；单元测试全打桩（§8 要求）。**实测服务端返回 `deepseek-flash` 而非配置的 `deepseek-chat`** → 计量按实际模型记 |
 | 0-4 | 只读账号 + 白名单 | ✅ | `dkd_agent` 两级授权；**8 项拒绝路径实测**：写业务表 / 读非白名单表 / 读系统表 / 跨库读 / DELETE 自有表 / DDL 全部 `ERROR 1142` 被拒 |
 | 0-5 | `agent_*` 四表 DDL | ✅ | 本地 dkd 库执行通过；幂等重跑退出码 0；唯一键拒绝路径命中 `ERROR 1062`；`agent_message` 后续补 `user_id` 列（计量需要） |
-| 0-6 | Java 网关（`AgentGatewayController` 等） | ⏳ | **未开工**：需 Java 工程师 ≥80% 投入（排期前提），且需确定执行人 |
-| 0-7 | Java 回调（`AgentCallbackController`） | ⏳ | 同上 |
-| 0-8 | G1 中间验收（SSE 端到端透传） | ⏳ | Python 侧 /health + SSE 已通过真实进程冒烟；待 Java 网关接入 |
+| 0-6 | Java 网关（`AgentGatewayController` 等） | ✅ | `dkd-common` 新增 `com.dkd.common.agent`（9 类）+ 6 个测试类；**SSE 不缓冲实测证据**：51 帧/3.2s，首 delta 距首行 70ms、末帧距首帧 3217ms。**偏离项**：`dkd-common` 无 `spring-webmvc` → 改同步写 Servlet 输出流逐块 flush + Filter（见下“本轮详细记录之 5”） |
+| 0-7 | Java 回调（`AgentCallbackController`） | ✅ | `/agent/callback/task` 服务间密钥 + 白名单 + 限流；实机 4 项拒绝路径：无密钥 401 / 伪造 401 / 未配置密钥 503 / 非白名单 404；正确密钥 → 鉴权放行并由 `insertTaskDto` 校验链拒绝（“售货机不存在”**原样回传**，未写库） |
+| 0-8 | G1 中间验收（SSE 端到端透传） | ✅ 服务端链路全过（前端视觉待手测） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**（登录→状态→SSE 逐帧+requestId 回带→回调 3 类拒绝→未认证信封→停机降级）；一键降级 `--agent.enabled=false` 另测 4 项全符 |
 | 0-9 | Python 服务骨架（/health + SSE + 鉴权 + request_id） | ✅ | ruff / pytest 全绿；SSE 实测 meta→delta→done 逐帧输出、身份头透传、客户端断开即停 |
 | 0-10 | checkpointer 落地（SQLite） | ✅ | 跨请求恢复（history_len 2→4）、进程重启后仍可读回、`Last-Event-ID` 断点续传（只补发未收帧）均已验证 |
-| 0-11 | 前端 SSE 客户端 + 侧边栏壳 | ⏳ | **未开工**：需前端同学（§2.2 要求 fetch+ReadableStream，不得复用 axios） |
+| 0-11 | 前端 SSE 客户端 + 侧边栏壳 | ✅ | `sseFrames.js`（纯分帧）/`sse.js`（fetch+ReadableStream+AbortController+空闲超时）/`api/manage/agent.js`/`store/modules/agent.js`/`components/AgentAssistant/index.vue` + Navbar 入口 + layout 挂载；`npm run build:prod` exit 0；**用真实抓包字节流跑 18 项分帧断言全过**（含 303 个二分切点/逐字符/随机分片/CRLF/半帧） |
 | 0-12 | request_id + 留痕 + 成本计量与限额 | ✅ | 留痕/消息投影实写 MySQL（手机号实测脱敏为 `138****5678`，明文 0 行）；限额熔断 429；`/agents/usage/summary` 鉴权 401/200 正确；**审计库故障降级不中断对话**（3 项降级测试覆盖） |
 | 0-13 | LangGraph 版本锁定 + state schema 评审 | ✅ 评审稿就绪（待开会确认） | 交付 `docs/dkd-agent-restock-state-schema.md`（冻结表 + 中断契约 + 兼容规则 + 10 项检查清单）；代码侧 `restock_state.py` 冻结 + 15 项契约测试；**评审中发现 `expect_capacity` 语义陷阱**（见该稿 §4.2） |
-| 0-14 | 安全整改（14a 已完成） | 🔄 | 初始提交已重写、可达历史无明文；**剩余 14b 凭据轮换 + 14c 清 dangling 对象**，需值班窗口 |
+| 0-14 | 安全整改（14a ✅ / **14c ✅ 本轮完成** / 14b 待值班窗口） | 🔄 | **14c A/B 实测**：清理前对象库密钥模式命中 **2** 处、未可达提交 2 个（`5d56572`/`0fdbd15`，实测 6 行明文凭据）→ `reflog expire + gc --prune=now` 后未可达对象 **0**、密钥命中 **0**；附带扫描：跟踪文件明文凭据命中 0，`.env`/`*.db` 均已 gitignore。**14b 仍需人工轮换**（OSS AK/SK、MySQL/Redis 弱口令；JWT secret 轮换会踢所有在线用户） |
 
 ### 质量门禁现状
 
 | 项目 | 结果 |
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
-| `uv run ruff format --check .` | 14 files already formatted |
-| `uv run pytest` | **52 passed**（1 live 用例默认 deselect），覆盖率 **90.2%**（要求 ≥70%） |
+| `uv run ruff format --check .` | 28 files already formatted |
+| `uv run pytest` | **67 passed**（1 live 用例默认 deselect），覆盖率 **92.27%**（要求 ≥70%） |
+| `mvn -pl dkd-admin -am test`（**本轮新增**） | **Tests run: 42, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
+| `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
+| 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测 |
+
+### 本轮（0-6 / 0-7 / 0-8 / 0-11 / 0-14c）详细记录
+
+**1. 新增文件（Java）**：`dkd-common` 的 `config/AgentConfig|AgentProperties`、`controller/AgentGatewayController`、`filter/AgentTokenFilter|AgentCallbackAuthFilter`、`domain/AgentHeaders|AgentUserContext|AgentUpstreamResult`、`support/AgentUpstreamClient|AgentRequestId|AgentUpstreamException|AgentClientAbortException|AgentRegionResolver|DefaultAgentRegionResolver`；`dkd-manage` 的 `AgentCallbackController`；`dkd-admin/src/test` 6 个测试类 + `FakeAgentServer` 夹具。
+*未改动任何现有业务类*；`dkd-admin/pom.xml` 仅新增 `spring-boot-starter-test`（test scope）与 pin `surefire 2.22.2`（父 POM 无 Boot parent，默认 surefire 2.12.4 会**静默跳过** JUnit5 用例，比红灯更危险）。
+
+**2. 测试发现并修掉的两个真 bug（均已加回归用例）**：
+- `forward()` 必须先读状态码再读响应体：JDK `HttpURLConnection.getErrorStream()` 仅在响应码已读出时才返回错误流，顺序反了会把上游 4xx/5xx 误判为“不可达”，**4xx 透传语义直接失效**；
+- requestId 被解析两次（响应头与转发头各生成一个 UUID）→ 全链路 trace 断裂。
+
+**3. 评审追加的两处修正（本次 CR 发现）**：
+- 回调过滤器原注册在 order=0（安全链**之后**），导致“非白名单路径 → 404”永远被 Spring Security 的 401 抢先（白名单形同装饰）→ 改为 order=-200，实测 404 生效；
+- `X-Request-Id` 原样透传客户端头（日志注入/非法响应头面）→ 新增 `AgentRequestId` 净化（仅可见 ASCII、≤64 字符、全非法则重新生成）+ 2 项回归用例，并将 filter 与网关重复的 requestId 解析合并为一处。
+
+**4. 一键降级实测（`--agent.enabled=false` 启动）**：`/agent/status` → `enabled=false, upstream=down`（开关关闭时不再探活）；非 SSE 路径 → HTTP 503 + 信封；`/agent/chat` → `error{degrade:true}` + `done` 帧；未认证访问 → 沿用 RuoYi 约定 HTTP 200 + `code:401`（与 `/manage/**` 行为逐字对比一致，**降级不等于免鉴权**）。
+
+**5. 与任务书的偏离（需项目负责人知悉，已同步方案 §3.3）**：任务书要求 `StreamingResponseBody`/`HandlerInterceptor`，但 **`dkd-common` 只依赖 `spring-web`、不含 `spring-webmvc`**（`dependency:tree` 实测为空），在该模块无法编译。落地改用：SSE = 控制器直接写 `HttpServletResponse` 输出流、读一块写一块并 flush；回调 = `AgentCallbackAuthFilter`。语义合同（禁止先读完再返回、逐帧 flush）不变，且同步写不受 Tomcat 异步 `asyncTimeout`（30s）掐流影响；代价是每个在途对话占用一个 Tomcat 工作线程（max=800）。若改回原名 API，只需给 `dkd-common` 加 `spring-webmvc` 依赖。
+
+**6. 风险与未验证项（不隐瞒）**：
+- **前端未做浏览器视觉验证**：Playwright/Chrome 自动化会引入未声明依赖，按 AGENTS §8 以“构建通过 + 手测清单”交付（清单见下）；SSE 增量到达已在 HTTP 层证实；
+- **回调不回传 `taskId/taskCode`**（`insertTaskDto` 只返回影响行数）→ 1-3/1-8 需一并处理，已标 TODO；
+- **`X-Agent-Region` 缺省**：当前 schema 无 sys_user → 区域映射（影响仅审计上下文，1-8 按设备区域选人不受影响）；
+- **Python 侧真 LLM 未联调**：本轮 Python 以 `DKD_AGENT_USE_LLM=0`（echo）跑通链路，真实 LLM 回流放在 M1 验收（0-15）；
+- **`@RateLimiter` 的 Redis 依赖**：Redis 不可用时回调用例会失败（fail-closed），属预期行为，未做演练。
+
+**7. 前端 0-11 人工冒测清单（未完成项，需人工执行）**：
+1. 登录后顶栏出现「AI 助手」入口（绿点=在线，橙点=降级），点击打开右侧抽屉；
+2. 首次打开时探测 `/agent/status`：`enabled=false` 或 `upstream=down` → 显示降级横幅且输入框禁用，点「重试」可恢复；
+3. 发送问题 → AI 气泡**逐字增长**（`delta` 帧驱动）+ 光标闪动，结束时消失；
+4. 生成中点「停止」→ 立即中止（AbortController），气泡显示“（已取消）”，`finally` 复位后可再发；
+5. 快捷问题条点击即发送；场景 Tab 切换会清空会话并提示新会话；
+6. 新建会话按钮清空消息与 `conversation_id`（下一轮重新下发）；
+7. 关掉抽屉再打开：对话内容保留（组件挂在 layout 层）；
+8. AI 气泡内 Markdown/HTML 已过 DOMPurify（发送 `<img src=x onerror=alert(1)>` 应不执行）；
+9. 停掉 Python 进程后再发一条：出现“暂不可用”错误气泡 + 降级横幅，输入框禁用；
+10. `agent.enabled=false` 重启 Java 后打开抽屉：横幅提示“智能体服务未启用”。
 
 ### 阻塞与待办需求（需项目负责人决策/提供）
 
-1. **0-6 / 0-7 / 0-11 需要人**：Java 与前端任务当前无人认领（排期前提是 Java W1~W3 ≥80%、前端 ≥50%）。
-2. **服务间密钥需两端一致**：`DKD_AGENT_SERVICE_SECRET`（已生成于本机 `.env`）需在 Java 侧 `AgentProperties.secret` 配同一值——这是 0-7 联调的前置。
-3. **`.env` 不会自动生效**：Spring Boot / Python 均不读 `.env`，需在 IDE/`setx` 注入（详见 `dkd-agent/README.md`）。
+1. **0-15（M1 验收）待排**：Python 侧改 `DKD_AGENT_USE_LLM=1` 后跑真 LLM 全链（本轮为 echo 链路）；`agent.enabled=false` 降级演练已提前完成；
+2. **0-14b 凭据轮换需值班窗口**（OSS AK/SK、MySQL/Redis 弱口令；JWT secret 轮换会踢掉全部在线用户）；
+3. **`DKD_AGENT_SERVICE_SECRET` 两端一致性**：本机 `.env` 已生成，Java 与 Python 均已读取并实测通过；上线前需在部署环境注入同一值；
+4. **`.env` 不会自动生效**：Spring Boot / Python 均不读 `.env`，需在 IDE/`setx` 注入（详见 `dkd-agent/README.md`）；
