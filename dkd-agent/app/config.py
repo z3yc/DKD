@@ -88,6 +88,18 @@ class Settings(BaseSettings):
         """解析为集合，便于 O(1) 校验工具层 SQL 的取表名。"""
         return frozenset(t.strip() for t in self.table_whitelist.split(",") if t.strip())
 
+    # --- 只读查询护栏（Phase 1 / 任务 1-2：时分窗口 + 分批 + 超时熔断）---
+    # 为什么需要这三个：本机只有一个主库（无只读从库，application-druid.yml slave.enabled=false），
+    # 分析类查询会和业务抢同一台 MySQL，所以任何聚合都必须能“限时、限批、限行”。
+    read_query_timeout_s: float = Field(
+        default=5.0, validation_alias="DKD_AGENT_READ_QUERY_TIMEOUT_S"
+    )
+    read_batch_size: int = Field(default=50, validation_alias="DKD_AGENT_READ_BATCH_SIZE")
+    read_row_limit: int = Field(default=2000, validation_alias="DKD_AGENT_READ_ROW_LIMIT")
+
+    # 订单“销量”口径：事实依据 ReportServiceImpl.java:28 的 ORDER_STATUS_SUCCESS=2
+    sales_order_status: int = Field(default=2, validation_alias="DKD_AGENT_SALES_ORDER_STATUS")
+
     @property
     def dsn(self) -> str:
         """SQLAlchemy async DSN。

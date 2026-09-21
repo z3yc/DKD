@@ -287,6 +287,20 @@
 9. 停掉 Python 进程后再发一条：出现“暂不可用”错误气泡 + 降级横幅，输入框禁用；
 10. `agent.enabled=false` 重启 Java 后打开抽屉：横幅提示“智能体服务未启用”。
 
+### Phase 1（W4~W7，10-12 ~ 11-06）——已开工
+
+| # | 任务 | 状态 | 证据 |
+| --- | --- | --- | --- |
+| 1-1 | 工具层-读：库存 / 货道档案 / 设备 / 点位查询 | ✅ | `app/tools/read_tools.py`：`get_machine_profile` / `list_operating_machines` / `list_channel_stock`；**12 项单测**（SQL 形状、分批、超时、行数上限、白名单拒绝路径）+ **4 项 live 抽样**（真库 3 台设备逐字段核对）；发现并如实暴露”inventory 与 channel 档案 3/3 不一致“ |
+| 1-2 | 工具层-读：近 30 天订单聚合 + 在途补货工单 | ✅ | 范围比较（删 `date_format`）+ 按 vm 分批（120 设备→3 批）+ 超时熔断 + LIMIT；**对账通过**（tool amount=7/count=5 == 独立 SQL）；`list_inflight_tasks` 合并明细货道；EXPLAIN 留档 `docs/ddl/business_tables_survey.md`（量化：同一查询预估行 199430 → 2） |
+| 1-3 ~ 1-14 | 工单回调封装 / 基线引擎 / LLM 校准 / 状态机 / 前端工作台等 | ⏳ | 下一步 |
+
+**Phase 1 首轮发现（待产品/Java 侧决策，详见勘查记录 §三）**：
+① **Java 报表 SQL 丢了参数绑定**（`ReportMapper.xml:122-130` 只用 `status >= 1`，未用 `#{status}`/时间窗）→ 现有报表数字与时间窗无关，不能作为对账基准；
+② **`tb_order` 无 `inner_code`/`create_time` 索引** → 已出待评审 DDL `docs/ddl/add_index_tb_order_and_tb_task.sql`（附回滚）；
+③ **`tb_inventory` 与 `tb_channel` 的 `sku_id`/容量实测 3/3 不一致** → 读工具如实双返并标记 `data_consistent=false`，需业务确认权威源；
+④ 销量口径固定 `status=2`（出货成功，`ReportServiceImpl.java:28`），已做成配置项。
+
 ### 阻塞与待办需求（需项目负责人决策/提供）
 
 1. **0-15（M1 验收）待排**：Python 侧改 `DKD_AGENT_USE_LLM=1` 后跑真 LLM 全链（本轮为 echo 链路）；`agent.enabled=false` 降级演练已提前完成；
