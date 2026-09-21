@@ -53,6 +53,27 @@ def client_with_secret(tmp_path, monkeypatch) -> Iterator[TestClient]:
     _clear_caches()
 
 
+@pytest.fixture
+def client_with_llm(tmp_path, monkeypatch) -> Iterator[TestClient]:
+    """启用了 LLM 节点的客户端（节点本身由用例打桩，**不得真实调外部 API**，AGENTS §8）。
+
+    为什么要单独一个夹具：`mode`/`model` 字段在 M1 后要能区分 echo 与真 LLM，
+    而 echo 夹具（USE_LLM=0）永远走不到 LLM 分支。
+    """
+    monkeypatch.setenv("DKD_AGENT_SQLITE_PATH", str(tmp_path / "checkpoints.db"))
+    monkeypatch.setenv("DKD_AGENT_AUDIT_ENABLED", "0")
+    monkeypatch.setenv("DKD_AGENT_USE_LLM", "1")
+    # 占位密钥：lifespan 在 USE_LLM=1 且无密钥时会拒绝启动；实际不会发起网络调用（节点已打桩）
+    monkeypatch.setenv("DKD_DEEPSEEK_API_KEY", "sk-unit-test-placeholder")
+    _clear_caches()
+    from app.main import create_app
+
+    app = create_app()
+    with TestClient(app) as c:
+        yield c
+    _clear_caches()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_env() -> Iterator[None]:
     """防止本机 .env 里的真实配置影响断言（如 USE_LLM/SERVICE_SECRET）。"""

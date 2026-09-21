@@ -66,11 +66,30 @@ def _chunks(text: str) -> list[str]:
     return [text[i : i + _CHUNK] for i in range(0, len(text), _CHUNK)] or [""]
 
 
-async def _load_turn_from_checkpoint(graph: object, config: dict) -> tuple[str, int]:
-    """断线重连：从 checkpoint 读回**上一轮**的回复与历史长度（不重跑图，避免重复追加上下文）。"""
+async def _load_turn_from_checkpoint(graph: object, config: dict) -> tuple[str, int, str | None]:
+    """断线重连：从 checkpoint 读回上一轮回复、历史长度与实际模型（不重跑图，避免重复追加上下文）。
+
+    为什么连模型一起读回：meta 帧要如实标注本轮是不是走了真 LLM（`mode`），
+    而续传路径不重跑图，模型名只能从 checkpoint 取。
+    """
     snapshot = await graph.aget_state(config)  # type: ignore[attr-defined]
     values = getattr(snapshot, "values", None) or {}
-    return str(values.get("reply", "")), len(values.get("messages", []))
+    model = values.get("model")
+    return (
+        str(values.get("reply", "")),
+        len(values.get("messages", [])),
+        (str(model) if model else None),
+    )
+
+
+def _mode_of(model: str | None) -> str:
+    """如实标注本轮回复来源（M1 起 DKD_AGENT_USE_LLM=1）。
+
+    为什么不能硬编码 "echo"（2026-09-21 M1 验收发现）：echo 节点写 `model="echo"`，
+    LLM 节点写服务端实际返回的模型名；若 meta 永远写 echo，审计与排障会把真 LLM 调用误判为链路回显，
+    也让排期 0-12 的成本归因失去依据。
+    """
+    return "echo" if not model or model == "echo" else "llm"
 
 
 async def _meter(session: object, *, settings: Settings, scene: int, user_id: int | None) -> None:
@@ -93,10 +112,12 @@ async def _echo_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
     last_event_id = request.headers.get(HEADER_LAST_EVENT_ID)
     resuming = last_event_id is not None
     offset = int(last_event_id) if (last_event_id or "").isdigit() else 0
+    # 本轮实际使用的模型名：echo 节点为 "echo"，LLM 节点为服务端返回的真实模型名
+    model: str | None = None
 
     try:
         if resuming:
-            reply, history_len = await _load_turn_from_checkpoint(graph, config)
+            reply, history_len, model = await _load_turn_from_checkpoint(graph, config)
             if not reply:
                 yield _sse("error", {"msg": "会话不存在或无可续传内容", "code": 404})
                 return
@@ -128,6 +149,7 @@ async def _echo_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
             )
             reply = str(result.get("reply", ""))
             history_len = len(result.get("messages", []))
+            model = str(result.get("model")) if result.get("model") else None
 
             # 3) 留痕与计量（基础设施故障不中断对话；编码错误仍应暴露）
             if settings.audit_enabled:
@@ -180,7 +202,8 @@ async def _echo_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
             "request_id": rid,
             "scene": payload.scene,
             "user": ctx.user_name or "system",
-            "mode": "echo",
+            "mode": _mode_of(model),
+            "model": model,
             "resumed": resuming,
             "history_len": history_len,
         },
