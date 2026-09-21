@@ -51,11 +51,21 @@ class Settings(BaseSettings):
         default=Path("var/checkpoints.db"), validation_alias="DKD_AGENT_SQLITE_PATH"
     )
 
+    # --- 对话模式与限额（任务 0-12：成本计量与熔断）---
+    use_llm: bool = Field(default=False, validation_alias="DKD_AGENT_USE_LLM")
+    audit_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_AUDIT_ENABLED")
+    token_daily_limit_per_user: int = Field(
+        default=200_000, validation_alias="DKD_AGENT_TOKEN_LIMIT_PER_USER"
+    )
+    token_daily_limit_global: int = Field(
+        default=2_000_000, validation_alias="DKD_AGENT_TOKEN_LIMIT_GLOBAL"
+    )
+
     # --- MySQL 只读账号 ---
     db_host: str = Field(default="127.0.0.1", validation_alias="DKD_AGENT_DB_HOST")
     db_port: int = Field(default=3306, validation_alias="DKD_AGENT_DB_PORT")
     db_name: str = Field(default="dkd", validation_alias="DKD_AGENT_DB_NAME")
-    db_user: str = Field(default="dkd_agent_ro", validation_alias="DKD_AGENT_DB_USER")
+    db_user: str = Field(default="dkd_agent", validation_alias="DKD_AGENT_DB_USER")
     db_password: str = Field(default="", validation_alias="DKD_AGENT_DB_PASSWORD")
 
     # --- Java 侧回调地址（写操作只能走这里，AGENTS §7.3）---
@@ -79,8 +89,13 @@ class Settings(BaseSettings):
         return frozenset(t.strip() for t in self.table_whitelist.split(",") if t.strip())
 
     @property
-    def readonly_dsn(self) -> str:
-        """SQLAlchemy async DSN（只读账号）。"""
+    def dsn(self) -> str:
+        """SQLAlchemy async DSN。
+
+        账号 `dkd_agent` 采用两级授权：业务表（tb_*）只读白名单，
+        智能体自有表（agent_*）可 SELECT/INSERT/UPDATE（不授 DELETE/DDL）。
+        详见 `app/db.py` 模块 docstring。
+        """
         return (
             f"mysql+aiomysql://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}?charset=utf8mb4"

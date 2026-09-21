@@ -95,7 +95,24 @@ DKD_AGENT_LIVE_LLM=1 uv run pytest -m live -v
 | `DKD_AGENT_ENV` | 运行环境 | dev / test / prod |
 | `DKD_AGENT_SERVICE_SECRET` | 服务间密钥 | 与 Java `AgentProperties.secret` 对应；未配置则回调接口返回 503 |
 | `DKD_AGENT_DB_USER` / `_PASSWORD` | MySQL **只读账号** | 默认 `dkd_agent_ro`，禁止使用 root |
-| `DKD_AGENT_SQLITE_PATH` | 会话 checkpoint 文件 | 默认 `var/checkpoints.db`，**需纳入备份** |
+| `DKD_AGENT_SQLITE_PATH` | 会话 checkpoint 文件 | 默认 `var/checkpoints.db`，**需纳入备份**；备份/恢复见 `app/checkpoint.py` docstring |
+| `DKD_AGENT_USE_LLM` | 是否真实调用 LLM | `0`=echo 链路（默认）；`1` 但无密钥则**启动即失败** |
+| `DKD_AGENT_AUDIT_ENABLED` | 留痕/计量开关 | `0` 便于本地不连库调试 |
+| `DKD_AGENT_TOKEN_LIMIT_PER_USER` / `_GLOBAL` | 日 token 限额 | `0`=不限；超限返回 **429**（防成本失控） |
+
+## 留痕与成本计量（任务 0-12）
+
+- 每轮对话写 `agent_decision_log`（含 `input_context`/`llm_output`/`result`/`cost_tokens`）；
+  落库前**强制脱敏**（手机号、卡号/订单号）。
+- `agent_message` 是成本报表的唯一数据源（`tokens_in`/`tokens_out`/`model`/`user_id`）；报表接口：
+
+```bash
+curl -H "X-Agent-Secret: $DKD_AGENT_SERVICE_SECRET" \
+     "http://127.0.0.1:8090/agents/usage/summary?days=1"
+```
+
+- **降级原则**：审计/计量属旁路，数据库故障时**记录 WARN 后放行**，不中断用户对话；
+  但限额熔断属业务规则，命中时明确返回 `429`（不静默）。
 | `DKD_AGENT_TABLE_WHITELIST` | 只读表白名单 | 表名带 `tb_` 前缀 |
 
 ## 当前进度（Phase 0）
@@ -106,5 +123,7 @@ DKD_AGENT_LIVE_LLM=1 uv run pytest -m live -v
 | 0-3 LLM 连通 | ✅ 代码 + 打桩单测 + 可选 live 冒烟；实测 HTTP 200（5.4s） |
 | 0-5 `agent_*` 四表 DDL | ✅ 已在本地 dkd 库执行通过（幂等重跑 + 唯一键拒绝路径已验证） |
 | 0-9 服务骨架（/health + SSE echo + 鉴权 + request_id） | ✅ 真实进程冒烟通过 |
-| 0-10 SQLite checkpointer 接入 | 待办 |
-| 0-12 request_id 贯穿 + 决策留痕 + 成本计量 | 部分完成（request_id 已贯穿；留痕表已建，写入未接） |
+| 0-13 LangGraph 版本锁定复核 + state schema 冻结评审 | ⏳ 部分完成：`ChatState` 字段已冻结（含兼容规则）；**补货图 schema 待 Phase 1 开工前评审**（需全员） |
+| 0-12 `request_id` 贯穿 + 决策留痕 + 成本计量与限额 | ✅ 全链：留痕/消息投影实写 MySQL（含脱敏）、限额熔断 429、`/agents/usage/summary` 报表；审计库故障降级不中断对话 |
+| 0-10 SQLite checkpointer 接入 | ✅ 跨请求恢复、进程重启后仍可读回、`Last-Event-ID` 断点续传均已验证 |
+| 0-4 只读账号 + 白名单 | ✅ `dkd_agent` 两级授权（业务表只读 + agent_* 可写无 DELETE）；8 项拒绝路径实测均被 MySQL 拒绝 |

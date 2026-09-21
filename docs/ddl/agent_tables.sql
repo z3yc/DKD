@@ -52,11 +52,13 @@ CREATE TABLE IF NOT EXISTS `agent_conversation` (
 -- ----------------------------------------------------------------------------
 -- 2. agent_message · 消息明细
 --    用途：LangGraph checkpointer 的业务投影（可读、可审计、可做成本计量）。
---    计量口径：token 消耗按用户/场景聚合本表，无需另建计量表。
+--    计量口径：token 消耗按用户/场景聚合本表，无需另建计量表；
+--              模型名记**服务端实际返回**的值（实测 deepseek-chat 会路由到 deepseek-flash）。
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `agent_message` (
   `id`              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
   `conversation_id` VARCHAR(64)  NOT NULL                COMMENT '会话ID（逻辑关联 agent_conversation.conversation_id）',
+  `user_id`         BIGINT                DEFAULT NULL   COMMENT '发起用户ID（按用户计量/限额的依据；定时任务为 NULL）',
   `seq`             INT          NOT NULL                COMMENT '会话内序号，从 1 递增（同会话唯一）',
   `msg_role`        TINYINT      NOT NULL                COMMENT '角色：1-用户 2-助手 3-工具结果 4-系统',
   `content`         MEDIUMTEXT            DEFAULT NULL   COMMENT '消息正文',
@@ -74,8 +76,14 @@ CREATE TABLE IF NOT EXISTS `agent_message` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_agent_message_conv_seq` (`conversation_id`, `seq`),
   KEY `idx_agent_message_time` (`create_time`),
+  KEY `idx_agent_message_user_time` (`user_id`, `create_time`),
   KEY `idx_agent_message_request` (`request_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='智能体消息明细';
+
+-- 若已执行过不含 user_id 的旧版本（仅限开发库，表为空时不丢数据）：
+-- ALTER TABLE `agent_message`
+--   ADD COLUMN `user_id` BIGINT DEFAULT NULL COMMENT '发起用户ID' AFTER `conversation_id`,
+--   ADD KEY `idx_agent_message_user_time` (`user_id`, `create_time`);
 
 
 -- ----------------------------------------------------------------------------
