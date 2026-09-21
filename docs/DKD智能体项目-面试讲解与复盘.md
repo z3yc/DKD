@@ -223,6 +223,23 @@ Postgres saver（landing zone）
 | `seq` off-by-one | 助手消息的 seq 记成 `history_len-1`（1、3 而非 2、4） | 位置类字段要写**断言到具体值**的测试，别只看"没报错" |
 | DDL 变更未同步已建表 | 新增列后本地老表报 `Unknown column` | DDL 文件里同时维护"增量 ALTER"段落；变更要走 `docs/ddl/` 归档（AGENTS §4.3） |
 
+### 坑 9 同一个字段名，三处含义不一致（最值得讲的一条）
+
+- **现象**：为补货建单写字段映射时，`TaskDetailsDto.expectCapacity` 的注释写的是「**货道容量**」，但直觉上"补货工单明细"应该装的是补货数量。
+- **定位**：三处交叉验证 —— `dkd-parent` 的 `TaskDetails` 实体注释是「补货数量」；`dkd-app` 的 `VendingMachineServiceImpl:62` 直接 `setCurrentCapacity(currentCapacity + d.getExpectCapacity())`（**当作补货数量累加进库存**）；只有 `TaskDetailsDto` 的注释是「货道容量」。**结论：DTO 注释是错的**。
+- **如果不查会怎样**（这是我把它单列一条的原因）：
+  ```
+  Agent 把容量 10 填进 expectCapacity（本意"这台机器该补到 10 件"）
+    → 运维现场只补了几件 → app 执行 currentCapacity + 10
+    → 库存虚增 → 下一轮预警/建议基于假数据 → 建议量继续偏离
+    → 数据滚雪球，且每一步"看起来都成功"，极难归因
+  ```
+- **修复（三层，不靠人记）**：① `RestockItem` 范围夹取 `0 ≤ 建议量 ≤ 容量 - 现库存` → 填容量必然越界被拒；② `after_restock_quantity` 必须等于「现库存 + 建议量」→ 拦掉"补到某值"的语义混用；③ 映射函数有测试断言 `expectCapacity != max_capacity`。同时建议 Java 侧**只改注释**（零行为变更），不改字段名（跨 3 模块 + 前端，成本不匹配）。
+- **教训**：
+  - **字段名/注释不是契约，行为才是契约**——契约要从"谁消费它、怎么消费"反推；
+  - 涉及"数据会被写回业务表"的映射，要做**范围夹取**而非信任上游；
+  - 发现文档与行为不一致时，**改注释**往往比改代码更划算，但要留下书面结论（我们写进了评审稿 §4.2 的"语义陷阱"专节）。
+
 ### 坑 8 一个"看起来是坑、其实是发现"的点：配置的模型 ≠ 实际服务的模型
 
 - **现象**：配置 `deepseek-chat`，但响应里 `model` 字段返回的是 `deepseek-flash`。

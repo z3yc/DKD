@@ -229,7 +229,7 @@
 | 0-10 | checkpointer 落地（SQLite） | ✅ | 跨请求恢复（history_len 2→4）、进程重启后仍可读回、`Last-Event-ID` 断点续传（只补发未收帧）均已验证 |
 | 0-11 | 前端 SSE 客户端 + 侧边栏壳 | ⏳ | **未开工**：需前端同学（§2.2 要求 fetch+ReadableStream，不得复用 axios） |
 | 0-12 | request_id + 留痕 + 成本计量与限额 | ✅ | 留痕/消息投影实写 MySQL（手机号实测脱敏为 `138****5678`，明文 0 行）；限额熔断 429；`/agents/usage/summary` 鉴权 401/200 正确；**审计库故障降级不中断对话**（3 项降级测试覆盖） |
-| 0-13 | LangGraph 版本锁定 + state schema 评审 | ⏳ | `ChatState` 字段已冻结（含兼容规则）；**补货图 schema 需在 1-6 开工前评审**（全员，0.5d） |
+| 0-13 | LangGraph 版本锁定 + state schema 评审 | ✅ 评审稿就绪（待开会确认） | 交付 `docs/dkd-agent-restock-state-schema.md`（冻结表 + 中断契约 + 兼容规则 + 10 项检查清单）；代码侧 `restock_state.py` 冻结 + 15 项契约测试；**评审中发现 `expect_capacity` 语义陷阱**（见该稿 §4.2） |
 | 0-14 | 安全整改（14a 已完成） | 🔄 | 初始提交已重写、可达历史无明文；**剩余 14b 凭据轮换 + 14c 清 dangling 对象**，需值班窗口 |
 
 ### 质量门禁现状

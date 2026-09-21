@@ -123,7 +123,7 @@ curl -H "X-Agent-Secret: $DKD_AGENT_SERVICE_SECRET" \
 | 0-3 LLM 连通 | ✅ 代码 + 打桩单测 + 可选 live 冒烟；实测 HTTP 200（5.4s） |
 | 0-5 `agent_*` 四表 DDL | ✅ 已在本地 dkd 库执行通过（幂等重跑 + 唯一键拒绝路径已验证） |
 | 0-9 服务骨架（/health + SSE echo + 鉴权 + request_id） | ✅ 真实进程冒烟通过 |
-| 0-13 LangGraph 版本锁定复核 + state schema 冻结评审 | ⏳ 部分完成：`ChatState` 字段已冻结（含兼容规则）；**补货图 schema 待 Phase 1 开工前评审**（需全员） |
+| 0-13 LangGraph 版本锁定复核 + state schema 冻结评审 | ✅ 评审稿 `docs/dkd-agent-restock-state-schema.md`；代码侧 `app/graphs/restock_state.py` 冻结 + 15 项契约测试 |
 | 0-12 `request_id` 贯穿 + 决策留痕 + 成本计量与限额 | ✅ 全链：留痕/消息投影实写 MySQL（含脱敏）、限额熔断 429、`/agents/usage/summary` 报表；审计库故障降级不中断对话 |
 | 0-10 SQLite checkpointer 接入 | ✅ 跨请求恢复、进程重启后仍可读回、`Last-Event-ID` 断点续传均已验证 |
 | 0-4 只读账号 + 白名单 | ✅ `dkd_agent` 两级授权（业务表只读 + agent_* 可写无 DELETE）；8 项拒绝路径实测均被 MySQL 拒绝 |
