@@ -38,7 +38,7 @@ function isEventStream(response) {
  * @param {string}   options.url           后端路径，如 '/agent/chat'
  * @param {Object}   options.body          请求体（JSON 序列化）
  * @param {Object}   [options.headers]     额外请求头
- * @param {string}   [options.lastEventId] 断点续传：上次收到的最后一个帧 id
+ * @param {string}   [options.lastEventId] 断点续传：**仅在重连续传时**传，普通新一轮对话绝不能带（见 api/manage/agent.js 注释）
  * @param {number}   [options.idleTimeout] 空闲超时毫秒，0 表示不启用
  * @param {Function} [options.onEvent]     每帧回调 (frame) => void
  * @returns {{ promise: Promise<void>, abort: Function }}
@@ -94,7 +94,9 @@ export function openSseStream(options) {
         abortError.aborted = true
         throw abortError
       }
-      throw new Error('智能体服务连接失败，请检查网络或稍后重试')
+      const netError = new Error('智能体服务连接失败，请检查网络或稍后重试')
+      netError.retryable = true // 网络层失败 ⇒ 可用 Last-Event-ID 续传（调用方决定）
+      throw netError
     }
 
     if (!response.ok || !isEventStream(response)) {
@@ -117,11 +119,12 @@ export function openSseStream(options) {
         // 响应体不是 JSON，保留默认提示（不得把原始报文透给用户）
         message = message + '（HTTP ' + response.status + '）'
       }
-      const envelopeError = new Error(message)
-      envelopeError.code = code
-      envelopeError.unauthorized = unauthorized
-      envelopeError.degraded = degraded
-      throw envelopeError
+      const degradeError = new Error(message)
+      degradeError.code = code
+      degradeError.unauthorized = unauthorized
+      degradeError.degraded = degraded
+      degradeError.retryable = false // 信封类错误（未认证/降级）不靠重试解决
+      throw degradeError
     }
 
     if (!response.body) {
@@ -160,14 +163,18 @@ export function openSseStream(options) {
         abortError.aborted = true
         throw abortError
       }
-      throw new Error('流式响应中断，请重试')
+      const brokenError = new Error('流式响应中断，请重试')
+      brokenError.retryable = true // 中途断开 ⇒ 同样可续传
+      throw brokenError
     } finally {
       clearIdleTimer()
       settled = true
       try {
-        reader.cancel()
+        // 必须 await：cancel() 返回 Promise，未 await 的拒绝不会被 try/catch 捕获，
+        // 会在浏览器控制台报 “AbortError: BodyStreamBuffer was aborted”（实测踩坑）
+        await reader.cancel()
       } catch (e) {
-        // reader 已关闭时 cancel 会抛，无需处理（不掩盖上面的业务异常）
+        // reader 已关闭/已被 abort 时 cancel 会拒绝，无需处理（不掩盖上面的业务异常）
       }
     }
   })()

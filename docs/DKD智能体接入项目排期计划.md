@@ -275,15 +275,15 @@
 - 留痕/计量：`agent_decision_log` 新增 2 行（`request_id` 为网关注入值、`cost_tokens` 26/30）；`agent_message` 2 行（`model=deepseek-flash`，tokens 17/9 与 17/13）；`/agents/usage/summary` → `total_calls=2, tokens_total=56`；
 - 发现 1 个观测性缺陷并已修：`meta.mode` 硬编码 `echo`（真 LLM 调用被误标）→ 见 `fix(agent)` 提交（含 3 项新测试，LLM 节点全打桩）。
 
-**7. 前端 0-11 人工冒测清单（未完成项，需人工执行）**：
-1. 登录后顶栏出现「AI 助手」入口（绿点=在线，橙点=降级），点击打开右侧抽屉；
+**7. 前端 0-11 冒测清单（✅=已由 `docs/scripts/agent-assistant-browser-check.cjs` 自动化，其余需人工）**：
+1. ✅ 顶栏出现「AI 助手」入口，点击打开右侧抽屉（绿点在线/橙点降级；颜色态未自动化）；
 2. 首次打开时探测 `/agent/status`：`enabled=false` 或 `upstream=down` → 显示降级横幅且输入框禁用，点「重试」可恢复；
-3. 发送问题 → AI 气泡**逐字增长**（`delta` 帧驱动）+ 光标闪动，结束时消失；
-4. 生成中点「停止」→ 立即中止（AbortController），气泡显示“（已取消）”，`finally` 复位后可再发；
+3. ✅ 发送问题 → AI 气泡**逐字增长**（实测 1→50 字）+ 光标闪动，结束时消失；
+4. ✅ 生成中点「停止」→ 立即中止（AbortController），气泡显示“（已取消）”，`finally` 复位后可再发；中断后继续对话亦已验证；
 5. 快捷问题条点击即发送；场景 Tab 切换会清空会话并提示新会话；
-6. 新建会话按钮清空消息与 `conversation_id`（下一轮重新下发）；
+6. ✅ 新建会话按钮清空消息（自动化）；`conversation_id` 重新下发由 API 契约保证；
 7. 关掉抽屉再打开：对话内容保留（组件挂在 layout 层）；
-8. AI 气泡内 Markdown/HTML 已过 DOMPurify（发送 `<img src=x onerror=alert(1)>` 应不执行）；
+8. ✅ AI 气泡内 Markdown/HTML 已过 DOMPurify（自动化：注入 `<img src=x onerror=...>` 不执行）；
 9. 停掉 Python 进程后再发一条：出现“暂不可用”错误气泡 + 降级横幅，输入框禁用；
 10. `agent.enabled=false` 重启 Java 后打开抽屉：横幅提示“智能体服务未启用”。
 

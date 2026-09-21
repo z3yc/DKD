@@ -90,7 +90,7 @@
 import { ElMessage } from 'element-plus'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import { chatWithAgent, probeAgentStatus } from '@/api/manage/agent'
+import { chatWithAgent, probeAgentStatus, resumeAgentStream } from '@/api/manage/agent'
 import useAgentStore from '@/store/modules/agent'
 
 // marked 配置与 views/manage/report/index.vue 保持一致（v18 用 use 取代 setOptions）
@@ -145,7 +145,9 @@ const messages = ref([])
 const bodyRef = ref(null)
 // 会话上下文：首轮由服务端下发 conversation_id（Python 侧 thread_id），后续轮次复用实现多轮
 const conversationId = ref(undefined)
-// 断点续传锚点：记录最后一个 delta 帧 id
+// 断点续传锚点：本已收到的最后一个 delta 帧 id。
+// ⚠️ 只在“断线自动续接”时使用；**新一轮对话绝不能带**（带了会被服务端当成续传请求，
+// 实测第二轮直接返回“会话不存在或无可续传内容”——真浏览器验证发现）
 const lastEventId = ref(undefined)
 // 当前流句柄（用于"停止"与卸载时释放连接）
 let stream = null
@@ -244,6 +246,7 @@ async function send(text) {
   const assistantMsg = pushMessage('assistant', '')
   assistantMsg.streaming = true
   sending.value = true
+  lastEventId.value = undefined // 新一轮：清空续传锚点（见 lastEventId 注释）
   scrollToBottom()
   // loading 状态必须在 finally 复位（AGENTS §2.2）
   try {
@@ -251,7 +254,6 @@ async function send(text) {
       message: content,
       conversationId: conversationId.value,
       scene: scene.value,
-      lastEventId: lastEventId.value,
       onEvent: (frame) => handleFrame(frame, assistantMsg)
     })
     await stream.promise
@@ -259,6 +261,8 @@ async function send(text) {
     if (e && e.aborted) {
       if (assistantMsg.content) assistantMsg.content += '\n\n_（已取消）_'
       else assistantMsg.content = '_（已取消）_'
+    } else if (e && e.retryable && (await tryResume(content, assistantMsg))) {
+      // 已自动续接完成：不当作失败（断线不丢已有内容）
     } else {
       assistantMsg.error = (e && e.message) || '对话失败'
       // 登录过期不属“智能体故障”，提示要区分，否则运维会去查错东西
@@ -270,6 +274,31 @@ async function send(text) {
     sending.value = false
     stream = null
     scrollToBottom()
+  }
+}
+
+/**
+ * 断线自动续接（最多尝试一次）
+ *
+ * 命中条件：错误可重试（非用户取消/非信封类错误）+ 同一会话 + 已有帧锚点。
+ * 服务端不会重跑对话图，只补发未收到的帧，因此不会重复计费也不会重复追加上下文。
+ *
+ * @returns {Promise<boolean>} 是否续接成功
+ */
+async function tryResume(originalMessage, assistantMsg) {
+  if (!conversationId.value || !lastEventId.value) return false
+  try {
+    stream = resumeAgentStream({
+      message: originalMessage,
+      conversationId: conversationId.value,
+      scene: scene.value,
+      lastEventId: lastEventId.value,
+      onEvent: (frame) => handleFrame(frame, assistantMsg)
+    })
+    await stream.promise
+    return true
+  } catch (e) {
+    return false
   }
 }
 
