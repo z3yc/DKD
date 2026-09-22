@@ -123,6 +123,22 @@ class ChannelSales(BaseModel):
     last_order_at: datetime | None = None
 
 
+class ChannelDailySales(BaseModel):
+    """单货道的**按日**销量（1-4 输入）。
+
+    为什么 1-2 的窗口聚合不够：分位销量必须先有“每天卖了多少”的时间序列
+    （窗口总量只能算均值，算不出分位，也看不出波动）。
+    窗口内**没有订单的日期不会出现在结果里**，补齐成 0 由基线引擎负责
+    （工具层只管把事实读出来，不做业务口径的补全）。
+    """
+
+    inner_code: str
+    channel_code: str
+    sale_date: date
+    order_count: int = 0
+    qty: int = 0
+
+
 class InflightTask(BaseModel):
     """在途工单（补货去重/在途数量必须看它，否则会重复建单）。"""
 
@@ -322,6 +338,63 @@ async def aggregate_channel_sales(
         )
         sales.extend(ChannelSales(**dict(row)) for row in rows)
     return sales
+
+
+async def aggregate_channel_daily_sales(
+    session: Any,
+    *,
+    inner_codes: Sequence[str],
+    start: datetime,
+    end: datetime,
+    limit: int | None = None,
+) -> list[ChannelDailySales]:
+    """窗口内按「货道 × 自然日」聚合销量（1-4 基线引擎的输入）。
+
+    与 {@link aggregate_channel_sales} 的区别只有一个：多一层 `group by date(...)`，
+    换来的是**分位数**（需要逐日样本）而不是只有均值。
+
+    为什么 `group by date(o.create_time)` 不算“函数包裹索引列”的违规写法（排期 1-2 禁令）：
+    禁令针对的是 **WHERE 条件**里的函数包裹（`date_format(create_time)=?` 会让索引直接失效，
+    `docs/ddl/business_tables_survey.md` §2.2 有量化证据：预估扫描行 2 → 800）。
+    这里 WHERE 仍是范围比较（可用 `(inner_code, create_time)` 索引定位），
+    `date()` 只作用在**已被索引筛出的行**上用于分组——扫描量不变。
+
+    `group by` 未使用 `date_format` 的原因：`DATE(create_time)` 是同类里最轻的写法
+    （不需要把时间格式化成字符串再比）。
+    """
+    codes = _normalize_inner_codes(inner_codes)
+    if not codes:
+        return []
+    if end <= start:
+        raise ToolError("end 必须晚于 start（半开区间 [start, end)）")
+    settings = get_settings()
+    daily: list[ChannelDailySales] = []
+    for batch in _batched(codes, settings.read_batch_size):
+        rows = await _fetch_all(
+            session,
+            """
+            select o.inner_code, o.channel_code, date(o.create_time) as sale_date,
+                   count(*) as order_count, count(*) as qty
+            from tb_order o
+            where o.inner_code in :inner_codes
+              and o.create_time >= :start
+              and o.create_time < :end
+              and o.status = :status
+            group by o.inner_code, o.channel_code, date(o.create_time)
+            order by o.inner_code, o.channel_code, sale_date
+            limit :limit
+            """,
+            {
+                "inner_codes": tuple(batch),
+                "start": start,
+                "end": end,
+                "status": settings.sales_order_status,
+                "limit": limit or settings.read_row_limit,
+            },
+            tables=("tb_order",),
+        )
+        daily.extend(ChannelDailySales(**dict(row)) for row in rows)
+    return daily
 
 
 async def list_inflight_tasks(

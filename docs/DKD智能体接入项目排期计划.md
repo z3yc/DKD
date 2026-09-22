@@ -239,7 +239,7 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | 29 files already formatted |
-| `uv run pytest` | **94 passed**（5 live 用例默认 deselect），覆盖率 **93.84%**（要求 ≥70%） |
+| `uv run pytest` | **119 passed**（5 live 用例默认 deselect），覆盖率 **95.17%**（要求 ≥70%）；`-m live` 另 4 项真库抽样通过 |
 | `mvn -pl dkd-admin -am test` | **Tests run: 47, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8 / **TaskCreate 5**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
@@ -294,13 +294,20 @@
 | 1-1 | 工具层-读：库存 / 货道档案 / 设备 / 点位查询 | ✅ | `app/tools/read_tools.py`：`get_machine_profile` / `list_operating_machines` / `list_channel_stock`；**12 项单测**（SQL 形状、分批、超时、行数上限、白名单拒绝路径）+ **4 项 live 抽样**（真库 3 台设备逐字段核对）；发现并如实暴露”inventory 与 channel 档案 3/3 不一致“ |
 | 1-2 | 工具层-读：近 30 天订单聚合 + 在途补货工单 | ✅ | 范围比较（删 `date_format`）+ 按 vm 分批（120 设备→3 批）+ 超时熔断 + LIMIT；**对账通过**（tool amount=7/count=5 == 独立 SQL）；`list_inflight_tasks` 合并明细货道；EXPLAIN 留档 `docs/ddl/business_tables_survey.md`（量化：同一查询预估行 199430 → 2） |
 | 1-3 | 工具层-写：工单创建回调封装（`POST /agent/callback/task` + TaskDto 映射） | ✅ | ① Python `app/tools/task_tools.py`：唯一写通道、**失败三分类**（鉴权/不可达/业务拒绝）、**零重试**（非幂等动作，重试会造成重复建单）、密钥只进请求头；② Java `AgentCallbackController` 改为调 `insertTaskDtoReturningTask` 并**回传 taskId/taskCode**（此前 TODO 已闭环，`ITaskService` 新增方法、原 `insertTaskDto` 语义不变）；③ 测试：Python 11 项（字段映射 `expectCapacity`=补货数量而非容量、业务拒绝原文回传、401/403/503/500 分类、超时/拒连、密钥缺失快速失败、taskId 缺失视为失败、日志无密钥）+ Java 5 项（`AgentTaskCreateServiceTest` 覆盖四条拒绝路径与字段回填）；④ **真库真回调端到端**：`docs/scripts/verify-1-3-build-task.py` 实测 taskId=**573** / taskCode=202609220001 / expectCapacity=**9**（=10-1，非容量 10）→ Agent 层幂等预检命中 → 区域不匹配被拒且**原文回传** → 拒绝路径零写入（工单数 10→10）；⑤ 回归修复：`AgentRoutingTest` 因回调改签名而 NPE，已同步打桩并断言 `$.data.taskId`（**这条 NPE 是真实信号**：说明有调用方仍依赖旧签名） |
-| 1-4 ~ 1-14 | 基线引擎 / LLM 校准 / 状态机 / 接单人分配 / 定时任务 / 前端工作台等 | ⏳ | 下一步 |
+| 1-4 | 补货子图-A：统计基线引擎（7/14/30 天分位销量 + 容量约束 + 预计撑至日期） | ✅ 主体完成（1 项验收当前不成立，见下） | ① 新增 `app/graphs/restock_baseline.py`：**纯函数**（无 IO / 无时钟 / 无随机，`today` 显式传入 → 回测可复现）。算法：日历序列补 0（末位=昨天）→ 各窗口分位 q=0.75 → 权重 0.5/0.3/0.2 **且只在有样本窗口间归一化** → **与长窗均值取大**（稀疏动销货道分位会归零，单用分位会慢性缺货）→ 目标 `ceil(需求×周期2×服务1.2)`、下限 `min_stock×2`（对齐规则版）、上限容量 → 建议量 clamp；② 三条边界各自成例：**无样本降级** 85% 兜底、**缺货自锁**（现库存 0 且零动销，无法区分“不卖”与“因缺货卖不出去”→ 必须兜底，否则货道永久空置）、**零动销但有库存** → 建议 0 且写明理由；③ 新增读工具 `aggregate_channel_daily_sales`（逐日聚合；WHERE 仍是范围比较，`date()` 只用于 group by，测试断言该函数**不出现在 WHERE**）；④ 测试 23 项（分位插值 / 序列对齐越界丢弃 / 权重重分配 / 容量夹取 / 下限抬升 / 优先级 / 三条边界 / 理由 ≤500 字 / **200 次随机序列不变量**：建议量非负且不溢出容量）；⑤ 门禁：ruff 全过 / pytest **119 passed** 95.17% / live 4 passed |
+| 1-5 ~ 1-14 | LLM 校准 / 状态机 / 接单人分配 / 定时任务 / 前端工作台等 | ⏳ | 下一步 |
 
 **1-3 关键设计取舍（为什么这么做）**：
 - **传输层不重试**：回调超时/网络抖动时重试可能造成重复建单（Java 防重只查 `task_status=2`，而新建工单是 `status=1`，**防重查不到刚建的工单**）——因此失败如实上报，重试决策交给 1-6/1-8 的计划状态机；
 - **失败分类而非统一异常**：鉴权失败（运维问题，重试无意义）/ 不可达（可稍后重试）/ 业务拒绝（文案要原样给运营看）三者上层反应完全不同，合成一个 `CallbackError` 会逼上层靠字符串猜；
 - **必须同时看 HTTP 状态码与信封 code**：RuoYi 业务失败是 `HTTP 200 + code=500`，只看状态码会把业务拒绝当成功（0-11 前端踩过同一坑）；
 - **回调成功但无 taskId 视为失败**：老版本 Java 会静默返回 None，上层会以为建成 → 显式报错。
+
+**1-4 回测结论（`docs/scripts/backtest-restock-baseline-1-4.py`，真库只读）**：
+- ✅ **容量安全 3/3 通过**：所有建议量在 `[0, 容量-现库存]` 内，补货后不溢出；
+- ✅ 与规则版（`generateRestockSuggestion` 的容量 85% 补满）建议量偏差 **-33.3%**（n=3；规则版合计 20 件 / 基线引擎 13 件）——基线引擎更保守，这正是排期 1-14 双跑要量化的差距；
+- ⛔ **「±20% vs 人工经验」这项验收当前无法成立**（不是“用规则版冒充通过”）：开发库 `tb_inventory` 仅 **3 行且无历史快照**（回测只能用“今天的库存”推“历史某天的库存”，口径已错）、`tb_order` 仅 **29 单/集中在 2023-09-10~15 共 6 天**（30 天窗口内 24 天无数据）、`tb_task_details` 仅 13 行且工单集中在 2025-11 与订单不重叠 → 缺少「历史库存快照 + 历史人工补货量」两个必要输入。**需生产/测试库导出后重跑本脚本**，已登记为 1-13 前置（见下“阻塞与待办”）；
+- 🔧 顺带修掉一个真 bug：`dispose_engine()` 原先只清 `lru_cache`、没有 `await engine.dispose()` → 连接池根本没关（进程退出时 aiomysql `Connection.__del__` 在已关闭的 event loop 上抛 `RuntimeError: Event loop is closed`，日志里看起来像崩溃）。已修为显式 dispose，回测脚本收尾噪音消失。
 
 **Phase 1 首轮发现（待产品/Java 侧决策，详见勘查记录 §三）**：
 ① **Java 报表 SQL 丢了参数绑定**（`ReportMapper.xml:122-130` 只用 `status >= 1`，未用 `#{status}`/时间窗）→ 现有报表数字与时间窗无关，不能作为对账基准；
@@ -313,5 +320,9 @@
 1. **0-15（M1 验收）待排**：Python 侧改 `DKD_AGENT_USE_LLM=1` 后跑真 LLM 全链（本轮为 echo 链路）；`agent.enabled=false` 降级演练已提前完成；
 2. **0-14b 剩余凭据轮换需值班窗口**（MySQL root / Redis / JWT secret / OSS AK / Druid）；
    其中 JWT secret 轮换会踢掉全部在线用户；完整步骤与回滚见 `docs/security-credential-rotation.md`；
-3. **`DKD_AGENT_SERVICE_SECRET` 两端一致性**：本机 `.env` 已生成，Java 与 Python 均已读取并实测通过；上线前需在部署环境注入同一值；
-4. **`.env` 不会自动生效**：Spring Boot / Python 均不读 `.env`，需在 IDE/`setx` 注入（详见 `dkd-agent/README.md`）；
+3. **生产/测试库数据导出（排期 1-4 回测与 1-13 验收的前置）**：需要
+   ① `tb_inventory` / `tb_channel` **历史快照或至少一次完整导出**（当前开发库只有 3 行库存）；
+   ② 历史人工补货量（`tb_task_details` + `tb_inventory_log` 近 90 天，用于“建议量 vs 人工经验”对比）；
+   ③ `tb_order` 近 90 天订单（当前仅 29 单、6 天）。缺这三样，1-4 的 ±20% 与 1-13 的“10 台真实设备”都无法验证。
+4. **`DKD_AGENT_SERVICE_SECRET` 两端一致性**：本机 `.env` 已生成，Java 与 Python 均已读取并实测通过；上线前需在部署环境注入同一值；
+5. **`.env` 不会自动生效**：Spring Boot / Python 均不读 `.env`，需在 IDE/`setx` 注入（详见 `dkd-agent/README.md`）；

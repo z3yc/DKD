@@ -77,6 +77,14 @@ def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
 
 
 async def dispose_engine() -> None:
-    """应用关闭时释放连接池。"""
+    """应用关闭时释放连接池。
+
+    为什么必须先 `await engine.dispose()`：只清 `lru_cache` 只是丢掉引用，
+    池里的 MySQL 连接要等 GC 才关——表现为进程退出时 `aiomysql Connection.__del__`
+    在**已关闭的 event loop** 上抛 `RuntimeError: Event loop is closed`
+    （看起来像崩溃，其实连接也没被优雅关闭）。
+    修因：1-4 回测脚本收尾时发现该噪音，进而查到 dispose 实际没关连接。
+    """
+    await get_engine().dispose()
     get_engine.cache_clear()
     get_sessionmaker.cache_clear()

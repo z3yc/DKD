@@ -93,6 +93,60 @@ async def test_sales_aggregation_uses_range_comparison_not_date_format():
     assert params["start"] == datetime(2023, 9, 1) and params["end"] == datetime(2023, 9, 16)
 
 
+async def test_daily_sales_aggregation_groups_by_day_but_filters_by_range():
+    """1-4 的输入查询：分组用 date()，但 WHERE 仍是范围比较（`date()` 只作用在索引筛出的行上）。"""
+    session = FakeSession(
+        rows_by_call=[
+            [
+                {
+                    "inner_code": "A1",
+                    "channel_code": "1-1",
+                    "sale_date": date(2023, 9, 11),
+                    "order_count": 3,
+                    "qty": 4,
+                }
+            ]
+        ]
+    )
+    rows = await read_tools.aggregate_channel_daily_sales(
+        session,
+        inner_codes=["A1"],
+        start=datetime(2023, 9, 1),
+        end=datetime(2023, 9, 16),
+    )
+    sql = session.calls[0][0].lower()
+    assert "date(o.create_time) as sale_date" in sql, "必须按自然日分组（分位数需要逐日样本）"
+    assert "group by o.inner_code, o.channel_code, date(o.create_time)" in sql
+    assert "group by" in sql and "date_format" not in sql, "分组用 DATE()，不要格式化成字符串"
+    # 关键：函数不得出现在 WHERE 里（否则索引失效，survey §2.2 量化证据：扫描行 2 → 800）
+    where_clause = sql.split("where", 1)[1].split("group by")[0]
+    assert "date(" not in where_clause and "date_format" not in where_clause
+    assert "o.create_time >= :start" in where_clause and "o.create_time < :end" in where_clause
+    assert "limit :limit" in sql
+    _, params = session.calls[0]
+    assert params["status"] == 2, "销量口径与 1-2 保持一致（出货成功）"
+    assert rows[0].qty == 4 and rows[0].sale_date == date(2023, 9, 11)
+    assert rows[0].order_count == 3, "单量（order_count）与件量（qty）分开返回，口径不混"
+
+
+async def test_daily_sales_aggregation_rejects_inverted_window_and_skips_empty_codes():
+    session = FakeSession()
+    with pytest.raises(ToolError, match="end 必须晚于 start"):
+        await read_tools.aggregate_channel_daily_sales(
+            session, inner_codes=["A1"], start=datetime(2023, 9, 16), end=datetime(2023, 9, 1)
+        )
+    assert session.calls == [], "窗口非法时不得发 SQL"
+
+    session2 = FakeSession()
+    assert (
+        await read_tools.aggregate_channel_daily_sales(
+            session2, inner_codes=["  "], start=datetime(2023, 9, 1), end=datetime(2023, 9, 2)
+        )
+        == []
+    )
+    assert session2.calls == [], "空设备列表不得发 SQL（避免无谓的全表扫描）"
+
+
 async def test_inventory_and_task_queries_keep_limit_and_join_keys():
     session = FakeSession()
     await read_tools.list_channel_stock(session, inner_codes=["A1"])

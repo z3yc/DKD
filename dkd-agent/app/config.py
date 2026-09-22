@@ -105,6 +105,43 @@ class Settings(BaseSettings):
     # （见 app/tools/task_tools.py）
     callback_timeout_s: float = Field(default=10.0, validation_alias="DKD_AGENT_CALLBACK_TIMEOUT_S")
 
+    # --- 补货基线引擎参数（Phase 1 / 任务 1-4）---
+    # 为什么全部做成配置而不是常量：这些是**业务参数**（服务水平/补货周期随运营策略变），
+    # 排期 3-6/5-2 要按复盘结果迭代它们；硬编码会让“调参”变成“改代码+发版”。
+    # 每个默认值的来历都写在 restock_baseline.py 模块 docstring 里（含“待业务确认”标记）。
+    restock_quantile: float = Field(default=0.75, validation_alias="DKD_AGENT_RESTOCK_QUANTILE")
+    restock_coverage_days: float = Field(
+        default=2.0, validation_alias="DKD_AGENT_RESTOCK_COVERAGE_DAYS"
+    )
+    restock_service_factor: float = Field(
+        default=1.2, validation_alias="DKD_AGENT_RESTOCK_SERVICE_FACTOR"
+    )
+    restock_min_stock_multiple: float = Field(
+        default=2.0, validation_alias="DKD_AGENT_RESTOCK_MIN_STOCK_MULTIPLE"
+    )
+    restock_fill_ratio: float = Field(default=0.85, validation_alias="DKD_AGENT_RESTOCK_FILL_RATIO")
+    # 多窗口权重：近窗更敏感（能跟上一周的趋势），长窗更稳（抗单日爆量）
+    restock_window_weights: str = Field(
+        default="7:0.5,14:0.3,30:0.2", validation_alias="DKD_AGENT_RESTOCK_WINDOW_WEIGHTS"
+    )
+
+    @property
+    def restock_weights(self) -> dict[int, float]:
+        """解析 `7:0.5,14:0.3,30:0.2` → {7: 0.5, 14: 0.3, 30: 0.2}。
+
+        非法格式直接抛错，不静默退回默认值——否则改错了配置没人发现，建议量却悄悄变了。
+        """
+        weights: dict[int, float] = {}
+        for chunk in self.restock_window_weights.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            days_text, _, weight_text = chunk.partition(":")
+            weights[int(days_text.strip())] = float(weight_text.strip())
+        if not weights:
+            raise ValueError("DKD_AGENT_RESTOCK_WINDOW_WEIGHTS 不能为空")
+        return weights
+
     @property
     def dsn(self) -> str:
         """SQLAlchemy async DSN。
