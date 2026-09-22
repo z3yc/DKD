@@ -367,7 +367,7 @@ def compute_baseline(
     degrade_reason: str | None = None
     if not device_has_sample:
         degraded = True
-        degrade_reason = "该设备近 30 天无任何订单，无法估计需求（新上線/断网/数据延迟均可能）"
+        degrade_reason = "该设备近 30 天无任何订单，无法估计需求（新上线/断网/数据延迟均可能）"
     elif observed_30d == 0 and current == 0:
         degraded = True
         degrade_reason = (
