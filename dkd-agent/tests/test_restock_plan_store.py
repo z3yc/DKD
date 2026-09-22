@@ -113,6 +113,8 @@ async def test_upsert_only_overwrites_items_when_status_is_editable():
     assert "if(status in (1, 2), values(sku_count), sku_count)" in sql
     assert "if(status in (1, 2), values(total_quantity), total_quantity)" in sql
     assert "delete" not in sql
+    # 唯一键包含软删行：不复活就再也无法为同一天生成计划（回归护栏）
+    assert "del_flag = '0'" in sql
     assert factory.last.commits == 1
 
     _, params = factory.last.calls[0]

@@ -182,6 +182,7 @@ graph.ainvoke(
 | `thread_id` | **`restock:{plan_date}:{region_id}`**（按区域分批）或 `restock:{plan_date}`（全量） | 与 `agent_restock_plan` 的 (vm_id, plan_date) 唯一键互补：计划落库是设备粒度，图会话可按批 |
 | 幂等 | 状态机 `can_transition()` + DB 唯一键 + 建单前查在途工单 | 三重防线，覆盖重复点击/多端并发/任务重跑 |
 | 超时未确认 | 计划保持 `status=1`（建议），**不自动建单**；次日新分析按 `plan_date` 隔离，不会互相污染 | 避免"没人确认就自动补货" |
+| **状态机变更记录（2026-09-21 / 排期 1-7）** | `ALLOWED_TRANSITIONS` 新增 **3-已跳过 → 1-建议**，且仅由显式 `restore` 动作触发（带必填原因、仅限当天） | 0-13 冻结稿原把 3 设为不可逆终态，与原型 V2 的「恢复建议」按钮冲突：误点跳过当天无法挽回，运营只能等次日新计划。**5-已复盘仍为真正终态**（结论固化后不可改写）；跨日恢复被服务层拒绝（会污染 3-6 复盘口径）。变更同步落在 `restock_state.ALLOWED_TRANSITIONS`（含理由注释）、`restock_decisions.ACTION_RESTORE` 与 `docs/ddl/agent_tables.sql` 尾部变更记录 |
 | 恢复时的越权校验 | `reviewed_by` 必须等于当前网关注入的用户；不同用户恢复同一 thread 需拒绝 | 会话归属校验（方案 §4.3 时序里写了"校验计划归属"） |
 
 ---

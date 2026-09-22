@@ -13,11 +13,13 @@ from app.graphs.restock_decisions import (
     ACTION_ADJUST,
     ACTION_ASSIGN,
     ACTION_CONFIRM,
+    ACTION_RESTORE,
     ACTION_SKIP,
     RESULT_ADJUSTED,
     RESULT_ALREADY_ORDERED,
     RESULT_ASSIGNED,
     RESULT_PENDING_ORDER,
+    RESULT_RESTORED,
     RESULT_SKIPPED,
     RESULT_UNASSIGNED,
     DecisionRejectedError,
@@ -109,14 +111,49 @@ def test_confirm_on_ordered_plan_is_idempotent_not_an_error():
 
 
 @pytest.mark.parametrize("terminal", [PLAN_STATUS_SKIPPED, PLAN_STATUS_REVIEWED])
-def test_terminal_statuses_cannot_be_changed(terminal: int):
-    """终态不可复活：否则“说好跳过”的计划几天后被建单，复盘口径作废。"""
+def test_terminal_statuses_reject_normal_actions(terminal: int):
+    """终态不可被普通动作复活：否则“说好跳过”的计划几天后被建单，复盘口径作废。"""
     with pytest.raises(DecisionRejectedError, match="终态"):
         apply_decision(_plan(status=terminal), PlanDecision(vm_id=80, action=ACTION_CONFIRM))
     with pytest.raises(DecisionRejectedError, match="终态"):
         apply_decision(_plan(status=terminal), PlanDecision(vm_id=80, action=ACTION_ADJUST))
     with pytest.raises(DecisionRejectedError, match="终态"):
         apply_decision(_plan(status=terminal), PlanDecision(vm_id=80, action=ACTION_SKIP))
+
+
+def test_restore_is_the_only_way_back_from_skipped():
+    """原型 V2 的「恢复建议」：3-已跳过 → 1-建议，必须带原因。
+
+    为什么不是“随便什么动作都能复活”：`agent_restock_plan` 按 (vm_id, plan_date) 唯一，
+    改写历史会污染复盘口径；因此只开放**一个显式、带原因**的恢复动作，
+    且“只能恢复当天”的时钟校验放在服务层（状态机不持有时钟，才可纯函数单测）。
+    """
+    with pytest.raises(DecisionRejectedError, match="必须填写原因"):
+        apply_decision(
+            _plan(status=PLAN_STATUS_SKIPPED), PlanDecision(vm_id=80, action=ACTION_RESTORE)
+        )
+
+    plan, result, note = apply_decision(
+        _plan(status=PLAN_STATUS_SKIPPED),
+        PlanDecision(vm_id=80, action=ACTION_RESTORE, reason="误点跳过"),
+    )
+    assert result == RESULT_RESTORED
+    assert plan.status == PLAN_STATUS_SUGGESTED
+    assert "误点跳过" in note
+
+
+def test_restore_rejects_non_skipped_and_reviewed_plans():
+    with pytest.raises(DecisionRejectedError, match="只有「已跳过」"):
+        apply_decision(
+            _plan(status=PLAN_STATUS_SUGGESTED),
+            PlanDecision(vm_id=80, action=ACTION_RESTORE, reason="x"),
+        )
+    # 已复盘（5）也不可恢复：提示语是“只有已跳过可恢复”，比笼统的“终态”更告诉运营该做什么
+    with pytest.raises(DecisionRejectedError, match="只有「已跳过」"):
+        apply_decision(
+            _plan(status=PLAN_STATUS_REVIEWED),
+            PlanDecision(vm_id=80, action=ACTION_RESTORE, reason="x"),
+        )
 
 
 # --------------------------------------------------------------------------------------

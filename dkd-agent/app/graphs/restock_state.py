@@ -49,8 +49,13 @@ ALLOWED_TRANSITIONS: dict[int, frozenset[int]] = {
     ),
     PLAN_STATUS_UNASSIGNED: frozenset({PLAN_STATUS_ADJUSTED, PLAN_STATUS_ORDERED}),
     PLAN_STATUS_ORDERED: frozenset({PLAN_STATUS_REVIEWED}),
-    PLAN_STATUS_SKIPPED: frozenset(),  # 终态
-    PLAN_STATUS_REVIEWED: frozenset(),  # 终态
+    # 3-已跳过 → 1-建议：**仅**由显式「恢复建议」动作触发（原型 V2 的按钮），
+    # 且必须带原因、只允许当天（跨日改写会污染 3-6 的复盘口径，故由服务层加时钟校验）。
+    # 变更记录（2026-09-21，排期 1-7）：0-13 冻结稿原把 3 设为不可逆终态，
+    # 与原型 V2 的「恢复建议」交互冲突；此处补齐该迁移，DDL 注释的变更记录同步见
+    # docs/ddl/agent_tables.sql（追加说明）+ docs/dkd-agent-restock-state-schema.md。
+    PLAN_STATUS_SKIPPED: frozenset({PLAN_STATUS_SUGGESTED}),
+    PLAN_STATUS_REVIEWED: frozenset(),  # 终态（复盘后不可再改，否则结论无法固化）
 }
 
 

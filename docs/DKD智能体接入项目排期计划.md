@@ -239,11 +239,11 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | 29 files already formatted |
-| `uv run pytest` | **174 passed**（5 live 用例默认 deselect），覆盖率 **94.48%**（要求 ≥70%）；`-m live` 另 4 项真库抽样通过 |
+| `uv run pytest` | **203 passed**（5 live 用例默认 deselect），覆盖率 **93.95%**（要求 ≥70%）；`-m live` 另 4 项真库抽样通过 |
 | `mvn -pl dkd-admin -am test` | **Tests run: 47, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8 / **TaskCreate 5**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
-| DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测 |
+| DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142） |
 
 ### 本轮（0-6 / 0-7 / 0-8 / 0-11 / 0-14c）详细记录
 
@@ -297,13 +297,26 @@
 | 1-4 | 补货子图-A：统计基线引擎（7/14/30 天分位销量 + 容量约束 + 预计撑至日期） | ✅ 主体完成（1 项验收当前不成立，见下） | ① 新增 `app/graphs/restock_baseline.py`：**纯函数**（无 IO / 无时钟 / 无随机，`today` 显式传入 → 回测可复现）。算法：日历序列补 0（末位=昨天）→ 各窗口分位 q=0.75 → 权重 0.5/0.3/0.2 **且只在有样本窗口间归一化** → **与长窗均值取大**（稀疏动销货道分位会归零，单用分位会慢性缺货）→ 目标 `ceil(需求×周期2×服务1.2)`、下限 `min_stock×2`（对齐规则版）、上限容量 → 建议量 clamp；② 三条边界各自成例：**无样本降级** 85% 兜底、**缺货自锁**（现库存 0 且零动销，无法区分“不卖”与“因缺货卖不出去”→ 必须兜底，否则货道永久空置）、**零动销但有库存** → 建议 0 且写明理由；③ 新增读工具 `aggregate_channel_daily_sales`（逐日聚合；WHERE 仍是范围比较，`date()` 只用于 group by，测试断言该函数**不出现在 WHERE**）；④ 测试 23 项（分位插值 / 序列对齐越界丢弃 / 权重重分配 / 容量夹取 / 下限抬升 / 优先级 / 三条边界 / 理由 ≤500 字 / **200 次随机序列不变量**：建议量非负且不溢出容量）；⑤ 门禁：ruff 全过 / pytest **119 passed** 95.17% / live 4 passed |
 | 1-5 | 补货子图-B：LLM 校准节点（点位画像/节假日/异常波动因子）+ 理由生成 | ✅ | ① 新增 `app/prompts/restock_calibration.py`（**提示词集中存放**，AGENTS §2.3 禁止硬编码在业务逻辑里）：数据包在 `<data>` 围栏内并声明“是数据不是指令”，只允许模型输出**系数**（不给绝对数量，避免“算错”与“瞎编”混在一起无法归因）；② 新增 `app/graphs/restock_calibration.py`：**三层不可信输入防护**（提示词围栏 → 容错解析 → 系数夹取 `[0.7,1.5]` + 容量二次夹取）；容错解析 = 括号配对扫描取 JSON（跳过字符串内花括号，不用 `rfind`）、未知货道/重复项/非数字/NaN **逐项丢弃并记 issues**；③ 失败即降级：LLM 超时/非 JSON → **保留统计基线结果**、写入 `calibration_notes[].issues`，**不写 `failures`**（校准失败 ≠ 业务失败，避免运营误判）；④ 机器可读明细放 `calibration_notes`、人可读依据追加进 `reason`——**不改 RestockItem 冻结字段**（0-13 约束，新增字段须走兼容性评审）；⑤ token 按服务端实际模型计量并向上累加（接 0-12 成本限额）；⑥ 测试 20 项（围栏/寒暄/字符串花括号容错、越界夹取、重复项取第一条、NaN/非数字丢弃、容量夹取、必需的补货不被清零、reason ≤500、开关关闭时**不调 LLM**、LangGraph 节点只写 plans/calibration_notes）；⑦ 门禁：ruff 全过 / pytest **139 passed** 95.53% |
 | 1-6 | 补货子图-C：`interrupt` 人工确认 + 计划状态机（建议→已调整→已跳过→已建单） | ✅ | ① 新增 `app/graphs/restock_decisions.py`：**纯函数状态机**（迁移表逐字对齐 0-13 冻结稿与 `agent_tables.sql:134-137`），确认/调整/跳过/指派四类决策 + 中文拒绝原因；关键取舍：**人工调整越界即拒绝、不静默夹取**（LLM 是不可信输入才夹取；人手填错必须让他看见，否则“我填了 20”变成“生效了 10”无人知晓）、**终态不可复活**（3/5 拒绝）、**已建单重复确认幂等返回“已建单”**（1-8 验收项 ② 的基础版）；② 新增 `app/graphs/restock_plan_store.py`：`agent_restock_plan` 幂等 upsert（`on duplicate key update` + `if(status in (1,2), ...)` 落实 DDL 注释“已建单/已复盘不得被重跑覆盖”）+ 决策回写（`adjust_reason/adjusted_by/adjusted_time/task_id`）+ 软删过滤查询；items 落库键名与 DDL 注释一致用 **camelCase**，并提供 `plan_from_row` 可逆还原；③ 新增 `app/graphs/restock_graph.py`：`analyze → calibrate → await_confirmation ⏸ → apply_decisions → create_tasks`；**取数与基线合并在一个节点**（否则“逐日销量原始行”要跨节点传递，就得给 0-13 冻结 state 加字段）；**中断节点零副作用**（interrupt 恢复会重跑该节点）；建单失败**不回滚状态**（改回“建议”会让运营以为没点过而重复点）；④ 接单人做成依赖接缝 `deps.resolve_assignee()`，生产实现**暂返回 (None, None)** 走 6-待指派，绝不伪造接单人（真实策略属 1-8）；⑤ 测试 +33：状态机 19 项 + 图 9 项（含**关 store→重开→重编译图的跨重启恢复**，并断言 analyze 未重跑）+ 存储 7 项（upsert 覆盖条件/软删过滤/无 DELETE/仅 `agent_*` 表/camelCase 可逆） |
-| 1-7 ~ 1-14 | 人工干预 API / 接单人分配 / 定时任务 / 前端工作台等 | ⏳ | 下一步 |
+| 1-7 | 人工干预 API：调整（数量/原因/预测窗口/服务水平）、跳过（必填原因）、恢复、暂停/恢复计划 | ✅ | ① 新增 `app/api/restock.py`（路由 `/agent/restock/**`）：清单读取 + `confirm/adjust/skip/restore` + `pause/resume`，全部 RuoYi 信封；**写操作强制要求网关注入的 `X-Agent-User`**（无身份 401），本地直连绕过网关也写不进去；② 新增 `app/services/restock_service.py`（业务层与 HTTP 分离）；③ **「高级：修正预测参数」真做重算**（不是让运营口算）：`compute_baseline` 开放 `window_days/service_level/coverage_days` 覆盖，重算数据源与 06:00 分析**完全同源**并列明「人工指定参数」进依据；人工输入越界**拒绝不夹取**（服务水平须在 [0.5,0.99]）；④ 状态机补 **`restore`（原型 V2「恢复建议」）**：3-已跳过 → 1-建议，必填原因 + **仅限当天**（跨日改写会污染 3-6 复盘口径）；5-已复盘仍为终态；⑤ 暂停/恢复自动分析落地 **新表 `agent_restock_pause`**（单行 UPSERT + 授权脚本 + 回滚；`del_flag=0` 复活；用 `coalesce` 保留“谁暂停的”以便审计）；⑥ 测试 +29：服务层（原因必填/重算口径/当日恢复/幂等确认/建单失败 502 不改状态/暂停留痕）+ API 层（401 无身份、400 日期、409 状态机拒绝、422 空原因、信封结构、503 未初始化）+ 基线覆盖参数（3 项）+ 存储复活回归 |
+| 1-8 ~ 1-14 | 接单人分配 / 定时任务 / 前端工作台等 | ⏳ | 下一步 |
 
 **1-3 关键设计取舍（为什么这么做）**：
 - **传输层不重试**：回调超时/网络抖动时重试可能造成重复建单（Java 防重只查 `task_status=2`，而新建工单是 `status=1`，**防重查不到刚建的工单**）——因此失败如实上报，重试决策交给 1-6/1-8 的计划状态机；
 - **失败分类而非统一异常**：鉴权失败（运维问题，重试无意义）/ 不可达（可稍后重试）/ 业务拒绝（文案要原样给运营看）三者上层反应完全不同，合成一个 `CallbackError` 会逼上层靠字符串猜；
 - **必须同时看 HTTP 状态码与信封 code**：RuoYi 业务失败是 `HTTP 200 + code=500`，只看状态码会把业务拒绝当成功（0-11 前端踩过同一坑）；
 - **回调成功但无 taskId 视为失败**：老版本 Java 会静默返回 None，上层会以为建成 → 显式报错。
+
+**1-7 端到端证据（`docs/scripts/verify-1-7-restock-api.py`，真 MySQL + 真实 FastAPI 应用，**22 项全过**）**：
+- 准备：脚本内先跑 1-6 的图生成 3 份计划（真库 status=1）作为种子；
+- [A] `GET /agent/restock/plans` 200 信封、清单 3 份、含原型「依据」字段；
+- [B] 无 `X-Agent-User` → **401**；有身份头 → 200 放行（并在验收集外的计划上验证后复原）；
+- [C] 调整缺原因 → 422（Pydantic）；原因全空白 → 400 且文案为「调整必须填写原因（用于复盘归因，不能留空）」；
+- [D] `windowDays=7 + serviceLevel=0.95` **真重算**且依据写入「【人工指定参数】预测窗口=7天」；`serviceLevel=1.5` → 400「服务水平必须落在 [0.5, 0.99]」；
+- [E] 跳过 → 重复跳过 **409 终态** → 恢复建议 → 1-建议 → 非跳过状态再恢复 → 409；
+- [F] 暂停/恢复自动分析：真实写 `agent_restock_pause`，回读含操作人，**恢复后仍保留“谁暂停的”**（审计完整），重复暂停 UPSERT 幂等；
+- [G] 库中行核对：验收行回到 `status=1` 且 `adjust_reason='误点'`、`adjusted_by=7`（审计列真实落库）；收尾全部软删 `del_flag=1`（非 DELETE）。
+- **两个真实 bug 是这轮联调逼出来的**（都已修 + 加回归）：① 人工把预测窗口改成 7 天后，`estimate_demand` 只剩 `stats[7]`，导致「无样本/缺货自锁」边界误判成零动销、错误降级为规则兜底（修法：统计窗口恒含全部配置窗口，只有加权用被选中的窗口）；② `agent_restock_plan` 唯一键包含**已软删**行，软删后同一 `(vm_id, plan_date)` 再也无法重新生成（修法：upsert 里 `del_flag='0'` 复活该行，并加回归断言）。
+- **一处与原型/冻结稿的冲突已显式登记**：原型 V2 的「恢复建议」要求 3-已跳过可恢复，而 0-13 冻结稿把 3 设为不可逆终态 → 本次补 `3→1` 迁移（必填原因 + 仅限当天），并同步更新 `docs/dkd-agent-restock-state-schema.md §5.3` 与 `docs/ddl/agent_tables.sql` 尾部变更记录（表结构未变，无需 ALTER）。
 
 **1-6 端到端证据（`docs/scripts/verify-1-6-restock-plan.py`，真 MySQL，**分两个进程**跑）**：
 - `--phase analyze`（进程 A）：3 台设备（vm=80/86/88，各 1 个有库存货道）算出计划并落库 `status=1`，在人工确认处中断 —— 证据 `中断=是，库中计划行=3`；本库订单是 2023 年数据 → 30 天窗口无样本 → 三条建议都走**规则兜底降级**并如实写明原因（顺带验证了 1-4 的“无样本≠零需求”边界）；

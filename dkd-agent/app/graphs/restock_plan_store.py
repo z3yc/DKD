@@ -19,6 +19,7 @@ import logging
 from datetime import date, datetime
 from typing import Any, Protocol
 
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from app.db import assert_table_allowed, get_sessionmaker
@@ -27,6 +28,9 @@ from app.graphs.restock_state import RestockItem, RestockPlan
 logger = logging.getLogger("dkd.agent.graphs.restock_plan_store")
 
 TABLE = "agent_restock_plan"
+# 自动分析开关表（1-7）：单行、按 scope 唯一
+PAUSE_TABLE = "agent_restock_pause"
+PAUSE_SCOPE_GLOBAL = "global"
 
 _UPSERT_SQL = """
 insert into agent_restock_plan
@@ -42,7 +46,10 @@ on duplicate key update
   sku_count = if(status in (1, 2), values(sku_count), sku_count),
   total_quantity = if(status in (1, 2), values(total_quantity), total_quantity),
   update_by = values(update_by),
-  update_time = values(update_time)
+  update_time = values(update_time),
+  -- 复活软删行：唯一键 (vm_id, plan_date) 包含已软删的行，
+  -- 不在此复活则某天被软删的计划将永远无法重新生成（每天都会撞唯一键）
+  del_flag = '0'
 """
 
 _UPDATE_SQL = """
@@ -267,3 +274,99 @@ class SqlPlanStore:
                 text(_SELECT_SQL), {"plan_date": plan_date, "limit": limit}
             )
             return [dict(row) for row in result.mappings().all()]
+
+
+_PAUSE_SELECT_SQL = """
+select paused, reason, paused_by, paused_time, resumed_by, resumed_time
+  from agent_restock_pause
+ where scope = :scope
+   and del_flag = '0'
+ limit 1
+"""
+
+_PAUSE_UPSERT_SQL = """
+insert into agent_restock_pause
+  (scope, paused, reason, paused_by, paused_time, resumed_by, resumed_time,
+   create_by, create_time, update_by, update_time, del_flag)
+values
+  (:scope, :paused, :reason, :paused_by, :paused_time, :resumed_by, :resumed_time,
+   :by, :now, :by, :now, '0')
+on duplicate key update
+  paused = values(paused),
+  reason = values(reason),
+  paused_by = coalesce(values(paused_by), paused_by),
+  paused_time = coalesce(values(paused_time), paused_time),
+  resumed_by = coalesce(values(resumed_by), resumed_by),
+  resumed_time = coalesce(values(resumed_time), resumed_time),
+  del_flag = '0',
+  update_by = values(update_by),
+  update_time = values(update_time)
+"""
+
+
+class PauseState(BaseModel):
+    """自动分析开关状态（原型 V2 的「⏸ 暂停自动分析 / 恢复自动分析」）。"""
+
+    paused: bool = False
+    reason: str | None = None
+    paused_by: str | None = None
+    paused_time: datetime | None = None
+    resumed_by: str | None = None
+    resumed_time: datetime | None = None
+
+
+class SqlPauseStore:
+    """`agent_restock_pause` 单行表的读写（1-7）。
+
+    为什么单行 + UPSERT 而不是插历史行：历史留痕在 `agent_decision_log`（那才是留痕表），
+    这张表只回答一个问题「现在的开关是什么状态」。多插行会让“读当前状态”变成
+    “按时间倒序取第一条”，每个调用方都要写对排序 —— 一个必然有人写错的地方。
+    """
+
+    def __init__(self, session_factory: Any | None = None) -> None:
+        self._session_factory = session_factory or get_sessionmaker()
+
+    async def get(self, *, scope: str = PAUSE_SCOPE_GLOBAL) -> PauseState:
+        """读开关；**没有行 = 未暂停**（首次部署不该因为缺数据就把自动分析停掉）。"""
+        assert_table_allowed(PAUSE_TABLE)
+        async with self._session_factory() as session:
+            result = await session.execute(text(_PAUSE_SELECT_SQL), {"scope": scope})
+            row = result.mappings().first()
+        if not row:
+            return PauseState()
+        data = dict(row)
+        return PauseState(
+            paused=bool(data.get("paused")),
+            reason=data.get("reason"),
+            paused_by=data.get("paused_by"),
+            paused_time=data.get("paused_time"),
+            resumed_by=data.get("resumed_by"),
+            resumed_time=data.get("resumed_time"),
+        )
+
+    async def set_paused(
+        self, *, paused: bool, by: str, reason: str, scope: str = PAUSE_SCOPE_GLOBAL
+    ) -> PauseState:
+        """暂停/恢复（幂等：重复暂停只更新原因与时间，不会插第二行）。
+
+        用 `coalesce(values(x), x)` 保留另一侧的操作记录：恢复时不清掉“谁暂停的”，
+        暂停时也不清掉“上次谁恢复的”——审计要能看到完整的开关历史（AGENTS §6.3）。
+        """
+        assert_table_allowed(PAUSE_TABLE, writable=True)
+        now = datetime.now()
+        params = {
+            "scope": scope,
+            "paused": 1 if paused else 0,
+            "reason": reason,
+            "by": by,
+            "now": now,
+            "paused_by": by if paused else None,
+            "paused_time": now if paused else None,
+            "resumed_by": None if paused else by,
+            "resumed_time": None if paused else now,
+        }
+        async with self._session_factory() as session:
+            await session.execute(text(_PAUSE_UPSERT_SQL), params)
+            await session.commit()
+        logger.info("自动分析开关已更新 paused=%s by=%s reason=%s", paused, by, reason)
+        return await self.get(scope=scope)

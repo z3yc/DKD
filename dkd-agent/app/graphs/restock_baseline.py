@@ -199,16 +199,36 @@ def _window_stat(values: Sequence[int], *, days: int, q: float) -> WindowStat:
 
 
 def estimate_demand(
-    values: Sequence[int], *, settings: Settings, q: float | None = None
+    values: Sequence[int],
+    *,
+    settings: Settings,
+    q: float | None = None,
+    window_days: int | None = None,
 ) -> tuple[float, dict[int, WindowStat]]:
     """多窗口加权分位日均需求。
 
     权重**只在有样本（窗口内有动销）的窗口间归一化**，理由见模块 docstring 第 3 条。
     全部窗口都无样本时返回 0.0（是否补货由上层按“无样本/零动销”两条边界决定）。
+
+    @param window_days 人工指定的**单一**预测窗口（排期 1-7 的“高级：修正预测参数”）：
+        只按该窗口算需求，等效于把它权重设为 1。运营的用法是“最近一周卖得猛，
+        就按 7 天窗口重算”，此时再把长窗口混进来会让调整效果被稀释（改了半天没变化）。
     """
     quantile_q = q if q is not None else settings.restock_quantile
-    windows = settings.restock_weights
-    stats = {days: _window_stat(values, days=days, q=quantile_q) for days in sorted(windows)}
+    if window_days is not None:
+        if window_days not in settings.restock_weights:
+            raise ValueError(
+                f"不支持的预测窗口 {window_days} 天（可选：{sorted(settings.restock_weights)}）"
+            )
+        windows = {window_days: 1.0}
+    else:
+        windows = settings.restock_weights
+    # 注意：`stats` 必须**总是包含全部配置窗口**（而不只是被选中加权的窗口）。
+    # 为什么：置信度与“无样本/缺货自锁”两条边界都依赖 30 天窗口的动销天数；
+    # 若人工把窗口改成 7 天就只剩 stats[7]，边界判断会把“有 7 天动销”误判成“零动销”而错误降级
+    # （这是 1-7 联调中真实踩到的 bug，回归用例见 tests/test_restock_baseline.py）。
+    stat_windows = sorted(set(settings.restock_weights) | set(windows))
+    stats = {days: _window_stat(values, days=days, q=quantile_q) for days in stat_windows}
     usable = {days: w for days, w in windows.items() if stats[days].observed_days > 0}
     if not usable:
         return 0.0, stats
@@ -275,6 +295,7 @@ def _compose_reason(
     demand: float,
     stats: dict[int, WindowStat],
     q: float,
+    overrides: tuple[int | None, float | None, float | None] = (None, None, None),
     target: int,
     suggested: int,
     estimated_days: int,
@@ -290,6 +311,11 @@ def _compose_reason(
     为什么要这么啰嗦：原型 V2 的「依据」是可展开查看的，运营要靠它判断“要不要信这条建议”；
     只写“库存偏低”等于让运营盲信模型（3-6 复盘时也无法归因）。
     """
+    window_days, service_level, coverage_days = overrides
+    effective_coverage = (
+        coverage_days if coverage_days is not None else settings.restock_coverage_days
+    )
+
     if degraded:
         parts = [
             f"【降级·规则兜底】{degrade_reason or '无销量样本'}；",
@@ -315,11 +341,21 @@ def _compose_reason(
         f"日均需求 {demand:g} 件/天（{window_text}，权重 {weight_text}）；",
         f"销量口径=出货成功(status={settings.sales_order_status})，"
         f"样本置信度={confidence}（{sample_text}）；",
-        f"按补货周期 {settings.restock_coverage_days:g} 天 × "
+        f"按补货周期 {effective_coverage:g} 天 × "
         f"服务水平 {settings.restock_service_factor:g} 得目标库存 {target}"
         f"（下限 最小预警值×{settings.restock_min_stock_multiple:g}，上限容量 {stock.capacity}），",
         f"现库存 {stock.current_stock}，建议补 {suggested}；",
     ]
+    if window_days is not None or service_level is not None or coverage_days is not None:
+        # 人工覆盖过的参数必须写进依据：否则复盘时看到“建议 +3”无法知道是哪种参数算出来的
+        applied = []
+        if window_days is not None:
+            applied.append(f"预测窗口={window_days}天")
+        if service_level is not None:
+            applied.append(f"服务水平={service_level:g}")
+        if coverage_days is not None:
+            applied.append(f"补货周期={coverage_days:g}天")
+        parts.append(f"【人工指定参数】{'、'.join(applied)}；")
     if demand > 0:
         parts.append(f"预计可支撑 {estimated_days} 天")
         parts.append(f"（撑至 {runout_date.isoformat()}）")
@@ -337,6 +373,12 @@ def _truncate(text: str, limit: int = 500) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# 人工可指定的服务水平（= 需求分位数）区间。UI 给的是 0.90~0.99 的滑块，
+# 这里放宽到 0.5 以上以便“冒风险的促销场景”也能试；超出即**拒绝**（人工输入不静默夹取）。
+SERVICE_LEVEL_MIN = 0.5
+SERVICE_LEVEL_MAX = 0.99
+
+
 def compute_baseline(
     *,
     stock: ChannelStockItem,
@@ -344,6 +386,9 @@ def compute_baseline(
     today: date,
     settings: Settings | None = None,
     device_has_sample: bool = True,
+    window_days: int | None = None,
+    service_level: float | None = None,
+    coverage_days: float | None = None,
 ) -> BaselineSuggestion:
     """单货道基线建议（核心入口，纯函数：无 IO、无随机、无时钟）。
 
@@ -352,13 +397,31 @@ def compute_baseline(
     @param today 分析基准日（**显式传入**，否则回测无法复现）
     @param device_has_sample 该设备近 30 天是否有任何订单
         （由调用方汇总，见 `compute_device_baseline`）
+    @param window_days 人工指定的单一预测窗口（1-7 的“修正预测参数”）
+    @param service_level 人工指定的服务水平（0.5~0.99，等价于该分位数；UI 是 0.90~0.99 滑块）
+    @param coverage_days 人工指定的补货周期天数（覆盖配置值）
+    @raises ValueError 参数非法（窗口不在配置内 / 服务水平越界）——人工输入越界必须报错，
+        不能像 LLM 输出那样静默夹取（见 1-6 的同类取舍）
     """
     settings = settings or get_settings()
+    service_level_ok = service_level is None or (
+        SERVICE_LEVEL_MIN <= service_level <= SERVICE_LEVEL_MAX
+    )
+    if not service_level_ok:
+        raise ValueError(
+            f"服务水平必须落在 [{SERVICE_LEVEL_MIN}, {SERVICE_LEVEL_MAX}]，收到 {service_level}"
+        )
+    quantile_q = service_level if service_level is not None else settings.restock_quantile
+    effective_coverage = (
+        coverage_days if coverage_days is not None else settings.restock_coverage_days
+    )
     capacity = stock.capacity
     current = int(stock.current_stock or 0)
     room = max(0, capacity - current)
 
-    demand, stats = estimate_demand(daily_qty, settings=settings)
+    demand, stats = estimate_demand(
+        daily_qty, settings=settings, q=quantile_q, window_days=window_days
+    )
     observed_30d = stats[SAMPLE_WINDOW_DAYS].observed_days if SAMPLE_WINDOW_DAYS in stats else 0
     confidence = _confidence(observed_30d)
 
@@ -383,9 +446,7 @@ def compute_baseline(
         target = current
         suggested = 0
     else:
-        target = math.ceil(
-            demand * settings.restock_coverage_days * settings.restock_service_factor
-        )
+        target = math.ceil(demand * effective_coverage * settings.restock_service_factor)
         if stock.min_stock:
             target = max(target, int(stock.min_stock * settings.restock_min_stock_multiple))
         target = min(target, capacity)
@@ -412,7 +473,8 @@ def compute_baseline(
         stock=stock,
         demand=demand,
         stats=stats,
-        q=settings.restock_quantile,
+        q=quantile_q,
+        overrides=(window_days, service_level, coverage_days),
         target=target,
         suggested=suggested,
         estimated_days=estimated_days,
@@ -451,6 +513,10 @@ def compute_device_baseline(
     today: date,
     settings: Settings | None = None,
     days: int | None = None,
+    window_days: int | None = None,
+    service_level: float | None = None,
+    coverage_days: float | None = None,
+    device_has_sample: bool | None = None,
 ) -> list[BaselineSuggestion]:
     """按设备批量算基线（1-4 的对外入口，供补货子图节点调用）。
 
@@ -460,7 +526,11 @@ def compute_device_baseline(
     settings = settings or get_settings()
     window = days or max(settings.restock_weights)
     series = align_daily_series(daily_rows, days=window, today=today)
-    device_has_sample = any(sum(values) > 0 for values in series.values())
+    has_sample = (
+        any(sum(values) > 0 for values in series.values())
+        if device_has_sample is None
+        else device_has_sample
+    )
     suggestions: list[BaselineSuggestion] = []
     for stock in stock_items:
         values = series.get((stock.inner_code, stock.channel_code), [0] * window)
@@ -470,7 +540,10 @@ def compute_device_baseline(
                 daily_qty=values,
                 today=today,
                 settings=settings,
-                device_has_sample=device_has_sample,
+                device_has_sample=has_sample,
+                window_days=window_days,
+                service_level=service_level,
+                coverage_days=coverage_days,
             )
         )
     # 紧迫的排前面（运营先看缺货与快断货的）；同级按建议量降序（同样急，先补量大的）

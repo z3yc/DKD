@@ -160,6 +160,84 @@ def test_demand_is_zero_when_no_window_has_sample():
 
 
 # --------------------------------------------------------------------------------------
+# 人工指定预测参数（排期 1-7 的“高级：修正预测参数”）
+# --------------------------------------------------------------------------------------
+
+
+def test_window_override_uses_single_window_instead_of_weighted_blend():
+    settings = _settings()
+    values = [0] * 16 + [1] * 7 + [5] * 7  # 近 7 天每天 5，稍早 7 天每天 1
+
+    weighted, _ = rb.estimate_demand(values, settings=settings)
+    only7, _ = rb.estimate_demand(values, settings=settings, window_days=7)
+    only30, _ = rb.estimate_demand(values, settings=settings, window_days=30)
+
+    assert weighted == pytest.approx(4.2)
+    assert only7 == pytest.approx(5.0), "按 7 天窗口重算：只看近一周（运营“最近卖得猛”的用法）"
+    assert only30 == pytest.approx(1.4), "按 30 天窗口重算：p75 为 1、均值 1.4 兜底"
+
+
+def test_window_override_keeps_sample_stats_for_boundary_checks():
+    """回归（1-7 联调踩到）：把窗口改成 7 天后，30 天动销统计不能消失。
+
+    消失会让 `compute_baseline` 把“有 7 天动销”误判为“零动销”，进而错误走
+    「缺货自锁」兜底分支（现库存 0 时）——本该按人工参数重算，结果理由与数量都变成规则兜底。
+    """
+    settings = _settings()
+    demand, stats = rb.estimate_demand(_series(last=7, value=3), settings=settings, window_days=7)
+    assert demand == pytest.approx(3.0)
+    assert 30 in stats and stats[30].observed_days == 7, "边界判断依赖的 30 天统计必须仍在"
+
+    suggestion = rb.compute_baseline(
+        stock=_stock(current=0, capacity=10),
+        daily_qty=_series(last=7, value=3),
+        today=TODAY,
+        window_days=7,
+    )
+    assert suggestion.degraded is False, "有动销样本时不得降级"
+    assert "【人工指定参数】" in suggestion.reason
+
+
+def test_window_override_rejects_unsupported_window():
+    with pytest.raises(ValueError, match="不支持的预测窗口"):
+        rb.estimate_demand([0] * 30, settings=_settings(), window_days=90)
+
+
+def test_service_level_override_replaces_quantile_and_is_written_into_reason():
+    stock = _stock(current=2, capacity=20)
+    values = _series(last=14, value=4)  # 14 天每天 4 件 → 分位数不敏感
+    high = rb.compute_baseline(
+        stock=stock, daily_qty=values, today=TODAY, service_level=0.99, window_days=14
+    )
+    assert high.windows[14].demand == pytest.approx(4.0)
+    assert "【人工指定参数】" in high.reason
+    assert "服务水平=0.99" in high.reason and "预测窗口=14天" in high.reason, (
+        "被人工覆盖的参数必须写进依据，否则复盘时无法知道这条建议是哪种参数算出来的"
+    )
+
+
+def test_service_level_out_of_range_is_rejected_not_clamped():
+    """人工输入越界必须报错（与 LLM 输出的夹取策略刻意相反，理由见 1-6 的同类取舍）。"""
+    with pytest.raises(ValueError, match="服务水平必须落在"):
+        rb.compute_baseline(
+            stock=_stock(), daily_qty=_series(last=7, value=3), today=TODAY, service_level=1.5
+        )
+    with pytest.raises(ValueError, match="服务水平必须落在"):
+        rb.compute_baseline(
+            stock=_stock(), daily_qty=_series(last=7, value=3), today=TODAY, service_level=0.1
+        )
+
+
+def test_coverage_days_override_changes_target_and_reason():
+    stock = _stock(current=2, capacity=20)
+    values = _series(last=30, value=2)  # 日均 2 件
+    seven = rb.compute_baseline(stock=stock, daily_qty=values, today=TODAY, coverage_days=7)
+    two = rb.compute_baseline(stock=stock, daily_qty=values, today=TODAY, coverage_days=2)
+    assert seven.suggested_quantity > two.suggested_quantity, "周期越长补得越多（0.7 未越界）"
+    assert "补货周期=7天" in seven.reason
+
+
+# --------------------------------------------------------------------------------------
 # 建议量：容量夹取、下限抬升、预计撑至日期
 # --------------------------------------------------------------------------------------
 

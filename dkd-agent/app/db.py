@@ -30,7 +30,14 @@ logger = logging.getLogger("dkd.agent.db")
 
 # 智能体自有表（允许写）；其余一律视为业务表（只读）
 AGENT_OWNED_TABLES = frozenset(
-    {"agent_conversation", "agent_message", "agent_decision_log", "agent_restock_plan"}
+    {
+        "agent_conversation",
+        "agent_message",
+        "agent_decision_log",
+        "agent_restock_plan",
+        # 1-7 新增：补货自动分析的暂停开关（单行表，DDL 见 docs/ddl/agent_restock_pause.sql）
+        "agent_restock_pause",
+    }
 )
 
 

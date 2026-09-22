@@ -4,10 +4,11 @@
 `docs/ddl/agent_tables.sql:134-137` 的注释逐字一致）：
 
 ```
-1-建议 ──┬─→ 2-已调整 ──┬─→ 4-已建单 ──→ 5-已复盘
+1-建议 ──┬─→ 2-已调整 ──┬─→ 4-已建单 ──→ 5-已复盘（终态）
          │              │
-         └─→ 3-已跳过    └─→ 6-待指派
-合法迁移：1→2/3/4/6，2→3/4/6，6→2/4，4→5（终态 3/5 不可再变更）
+         └─→ 3-已跳过 ←──┘   3 → 1 仅由显式 restore 触发（需原因、限当天）
+                  └────→ 6-待指派 ──→ 2/4
+合法迁移：1→2/3/4/6，2→3/4/6，6→2/4，4→5，**3→1（restore）**
 ```
 
 ## 为什么要一个"纯函数状态机"而不是把判断写在节点里
@@ -40,6 +41,7 @@ from app.graphs.restock_state import (
     PLAN_STATUS_ORDERED,
     PLAN_STATUS_REVIEWED,
     PLAN_STATUS_SKIPPED,
+    PLAN_STATUS_SUGGESTED,
     PLAN_STATUS_UNASSIGNED,
     RestockItem,
     RestockPlan,
@@ -52,8 +54,9 @@ ACTION_CONFIRM = "confirm"
 ACTION_ADJUST = "adjust"
 ACTION_SKIP = "skip"
 ACTION_ASSIGN = "assign"
+ACTION_RESTORE = "restore"
 
-ACTIONS = (ACTION_CONFIRM, ACTION_ADJUST, ACTION_SKIP, ACTION_ASSIGN)
+ACTIONS = (ACTION_CONFIRM, ACTION_ADJUST, ACTION_SKIP, ACTION_ASSIGN, ACTION_RESTORE)
 
 # 决策结果（调用方据此决定“要不要回调建单”“要不要提示已建单”）
 RESULT_PENDING_ORDER = "pending_order"  # 已放行，交由建单回调
@@ -62,7 +65,10 @@ RESULT_UNASSIGNED = "unassigned"  # 无匹配接单人 → 6-待指派，不回�
 RESULT_ADJUSTED = "adjusted"
 RESULT_SKIPPED = "skipped"
 RESULT_ASSIGNED = "assigned"
+RESULT_RESTORED = "restored"
 
+# 不可变更的终态：**3-已跳过可以通过显式 restore 复原**（原型 V2 的「恢复建议」按钮），
+# 5-已复盘则是真正的终态（复盘结论一旦固化就不该被改写）。
 TERMINAL_STATUSES = (PLAN_STATUS_SKIPPED, PLAN_STATUS_REVIEWED)
 
 
@@ -78,6 +84,14 @@ class ItemOverride(BaseModel):
     channel_code: str = Field(alias="channelCode", min_length=1, max_length=32)
     suggested_quantity: int = Field(
         alias="suggestedQuantity", ge=0, description="人工给定的补货量（增量，不是容量）"
+    )
+    note: str | None = Field(
+        default=None,
+        max_length=460,
+        description=(
+            "该项的新依据（排期 1-7 的“按人工参数重算”用）：给了就用它替换基线依据——"
+            "重算出的理由比原始基线更贴近当前参数，留着旧的会自相矛盾"
+        ),
     )
 
 
@@ -154,12 +168,14 @@ def apply_adjust(plan: RestockPlan, decision: PlanDecision, *, reason: str) -> R
                 f"超出可补空间 {room}（容量 {item.max_capacity} - 现库存 {item.current_quantity}）"
             )
         tag = f"；人工调整：{reason}"
+        # 重算路径会用重算依据替换基线依据（两者参数不同，拼在一起自相矛盾）
+        base_reason = override.note or item.reason
         new_items.append(
             item.model_copy(
                 update={
                     "suggested_quantity": override.suggested_quantity,
                     "after_restock_quantity": item.current_quantity + override.suggested_quantity,
-                    "reason": (item.reason + tag)[:500],
+                    "reason": (base_reason + tag)[:500],
                 }
             )
         )
@@ -189,7 +205,22 @@ def apply_decision(
     # 表示“签名的一部分”，避免被误认为废参数而删掉（删了审计就会退化成 NULL）。
     _ = (user_id, now)
 
-    # 1) 终态保护：任何操作都不能把 3-已跳过/5-已复盘 拉回来
+    # 0) 「恢复建议」：唯一被允许读 3-已跳过 的动作。必须带原因；
+    #    “只能恢复当天”的时钟判断由服务层做——状态机不持有时钟，写死“今天”会让测试与
+    #    跨时区部署都变脆（也让它能纯函数单测）。
+    if decision.action == ACTION_RESTORE:
+        reason = _require_reason(decision, what="恢复")
+        if plan.status != PLAN_STATUS_SKIPPED:
+            raise _reject(f"只有「已跳过」的计划可以恢复，当前状态为 {plan.status}")
+        if not can_transition(plan.status, PLAN_STATUS_SUGGESTED):
+            raise _reject("状态机不允许从「已跳过」恢复")
+        return (
+            plan.model_copy(update={"status": PLAN_STATUS_SUGGESTED}),
+            RESULT_RESTORED,
+            f"已恢复建议：{reason}",
+        )
+
+    # 1) 终态保护：其余操作都不能把 3-已跳过/5-已复盘 拉回来
     if plan.status in TERMINAL_STATUSES:
         label = "已跳过" if plan.status == PLAN_STATUS_SKIPPED else "已复盘"
         raise _reject(f"该计划为「{label}」终态，不可再变更；如需重新补货请新建计划")
@@ -305,6 +336,7 @@ def summarize_plan(plan: RestockPlan, *, plan_id: int | None = None) -> dict[str
 __all__ = [
     "ACTION_ADJUST",
     "ACTION_ASSIGN",
+    "ACTION_RESTORE",
     "ACTION_CONFIRM",
     "ACTION_SKIP",
     "ACTIONS",
@@ -315,6 +347,7 @@ __all__ = [
     "RESULT_ALREADY_ORDERED",
     "RESULT_ASSIGNED",
     "RESULT_PENDING_ORDER",
+    "RESULT_RESTORED",
     "RESULT_SKIPPED",
     "RESULT_UNASSIGNED",
     "apply_decision",

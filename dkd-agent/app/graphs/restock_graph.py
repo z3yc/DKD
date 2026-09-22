@@ -78,8 +78,10 @@ class RestockDeps(Protocol):
     """
 
     async def load(
-        self, *, plan_date: date, limit: int
-    ) -> tuple[list[ChannelStockItem], list[ChannelDailySales]]: ...
+        self, *, plan_date: date, limit: int, inner_codes: list[str] | None = None
+    ) -> tuple[list[ChannelStockItem], list[ChannelDailySales]]:
+        """取货道库存与逐日销量；`inner_codes` 非空时只取这些设备（人工重算时用）。"""
+        ...
 
     async def resolve_assignee(self, plan: RestockPlan) -> tuple[int | None, str | None]:
         """选接单人（返回 `(emp_id, 姓名)`；无匹配返回 `(None, None)`）。
@@ -123,7 +125,7 @@ class SqlRestockDeps:
         self._store = store
 
     async def load(
-        self, *, plan_date: date, limit: int
+        self, *, plan_date: date, limit: int, inner_codes: list[str] | None = None
     ) -> tuple[list[ChannelStockItem], list[ChannelDailySales]]:
         from app.db import get_sessionmaker
         from app.tools import read_tools
@@ -131,8 +133,12 @@ class SqlRestockDeps:
         factory = self._session_factory or get_sessionmaker()
         start, end = default_sales_window(days=max(self._settings.restock_weights), today=plan_date)
         async with factory() as session:
-            machines = await read_tools.list_operating_machines(session, limit=limit)
-            codes = [m.inner_code for m in machines]
+            if inner_codes:
+                # 只取指定设备：1-7 的「按新参数重算」没必要把全部设备读一遍
+                codes = list(inner_codes)
+            else:
+                machines = await read_tools.list_operating_machines(session, limit=limit)
+                codes = [m.inner_code for m in machines]
             stock = await read_tools.list_channel_stock(session, inner_codes=codes)
             daily = await read_tools.aggregate_channel_daily_sales(
                 session, inner_codes=codes, start=start, end=end
