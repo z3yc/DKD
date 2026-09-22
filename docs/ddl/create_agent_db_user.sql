@@ -51,6 +51,8 @@ GRANT SELECT, INSERT, UPDATE ON dkd.agent_conversation  TO 'dkd_agent'@'127.0.0.
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_message       TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_decision_log  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_restock_plan  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+-- 2026-09-21 追加（排期 1-7）：自动分析暂停开关（单行表，DDL 见 agent_restock_pause.sql）
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_restock_pause TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 
 FLUSH PRIVILEGES;
 
@@ -74,6 +76,8 @@ FLUSH PRIVILEGES;
 --    DELETE FROM dkd.agent_decision_log WHERE id > 0;
 -- 8) 拒绝（1142）：DDL
 --    DROP TABLE dkd.agent_decision_log;
+-- 9) 已实测（2026-09-21，排期 1-7）：agent_restock_pause 可 UPSERT；`DELETE FROM dkd.agent_restock_pause`
+--    被拒（ERROR 1142），与 7) 同一红线
 --
 -- 权限自查：
 --   SHOW GRANTS FOR 'dkd_agent'@'127.0.0.1';
