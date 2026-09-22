@@ -16,6 +16,7 @@ dependencies = [
     "langgraph>=0.2",
     "langgraph-checkpoint-sqlite>=2.0",
     "langchain-openai>=0.2",
+    "cryptography>=50.0.1",
 ]
 
 [dependency-groups]

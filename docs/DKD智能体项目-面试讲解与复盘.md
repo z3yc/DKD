@@ -248,6 +248,148 @@ Postgres saver（landing zone）
 
 ---
 
+### 坑 10 方案里写好的类，在目标模块里根本不存在（`spring-webmvc` 缺失）
+
+- **现象**：方案 §3.3 明确要求 Java 网关用 `StreamingResponseBody`（或 `ResponseBodyEmitter`）逐块写 SSE，我把它写进了任务书；实现时编译直接报错：`org.springframework.web.servlet.*` 不可解析。
+- **定位**：`mvn -pl dkd-common dependency:tree -Dincludes=org.springframework:spring-webmvc` → **空**。`dkd-common` 只依赖 `spring-web`（注解在这，所以 `@RestController` 能编译），而 `StreamingResponseBody`/`HandlerInterceptor`/`WebMvcConfigurer` 全在 **`spring-webmvc`** 里。
+- **根因**：把方案的“意图”当成了“约束”。方案是跨模块设计文档，它不会知道你最终把类放哪个 Maven 模块；我自己在任务书里既锁定了“不新增依赖”又要求“用某个类”，两条约束互斥。
+- **修复**：保持语义合同（**禁止先把响应体读完再返回、逐块 flush**）不变，改用 Servlet API 落地：控制器直接写 `HttpServletResponse.getOutputStream()`，读一块（1KB）写一块并 flush；回调鉴权改用 `OncePerRequestFilter`。附带好处：同步写不受 Tomcat 异步 `asyncTimeout`（默认 30s）掐流影响。代价记账：每个在途对话占一个 Tomcat 工作线程（`max=800`）。
+- **教训**：**跨模块落地前先跑 `dependency:tree -Dincludes=<你要用的包>`**，一分钟的事；同时“不要新增依赖”这类约束要在任务书里写清**允许的例外与升级路径**（我后来补了一句“若改回原名 API，只需给 dkd-common 加 spring-webmvc 依赖”）。
+
+### 坑 11 `HttpURLConnection` 的 `getErrorStream()` 必须“先读状态码”才有效——错误路径静默退化
+
+- **现象**：单测里“上游返回 422/503 时透传原始信封”的用例全部失败，抛的是 `ResourceAccessException: I/O error on POST ... Server returned HTTP response code: 422`，网关把它当成“**服务不可达**”去降级。
+- **定位**：Spring 的 `SimpleClientHttpResponse.getBody()` 会先取 `connection.getErrorStream()`，取不到才 `getInputStream()`；而 JDK 的实现里 **`getErrorStream()` 在响应码被读出之前恒为 null**，此时 `getInputStream()` 对 4xx/5xx 直接抛 `IOException`。我的 extractor 先读了 body、后读状态码，于是顺序反了。
+- **根因**：JDK 这个“怪癖”不在直觉里；更本质的是**异常归因做错了层**——把“上游返回了业务错误”和“连不上上游”混成了同一个异常。
+- **修复**：extractor 内强制**先 `getRawStatusCode()` 再读 body**，并在代码里写下“勿调换顺序”的注释；`forward()` 对 4xx **原样透传**（429 限额这种明确业务语义不能被换成 503），只对传输层失败/上游 5xx 降级。
+- **教训**：① HTTP 客户端的**错误路径**最容易“看起来能跑”；② 错误要按**层次**归类（传输失败 / 上游业务错 / 网关照挂），归错层会把排查引向错误方向；③ 这类 bug 靠“跑一遍正常流程”发现不了，必须写**拒绝路径用例**。
+
+### 坑 12 过滤器顺序决定“可达性”：白名单写了，但永远走不到
+
+- **现象**：任务 0-7 的验收要求“非白名单回调路径 → 404”。单测全绿（直接 new 过滤器调 `doFilter`），但真机测 `/agent/callback/other` 返回的是 **401**。
+- **定位**：我把 `AgentCallbackAuthFilter` 注册成 `order=0`，而 Spring Security 的 `springSecurityFilterChain` 是 **order=-100**（数值越小越先执行）⇒ 我的过滤器在**安全链内部**先经过安全链。`/agent/callback/other` 没被 `@Anonymous` 登记（只登记了 `/agent/callback/task`），于是被安全链以 401 拦掉，我的白名单分支**永远不可达**。
+- **根因**：把“能执行到”当成了默认。**单元测试直接调过滤器方法，绕过了整个过滤器链，天然测不出顺序问题。**
+- **修复**：改为 `order=-200`（先于安全链），让服务间密钥成为 `/agent/callback/**` 的唯一守门人：无密钥/伪造 → 401，密钥对但路径未登记 → 404，两种都不进业务；并在类注释里写清“为什么必须小于 -100”。
+- **教训**：
+  - **顺序类缺陷（过滤器/拦截器/AOP/中间件）只能靠集成或真端到端发现**，单元测试覆盖再高也给不出信号；
+  - 设计鉴权时先问一句：“**谁能先拦到请求**”，而不是“我写了什么判断”——写了不等于会执行。
+
+### 坑 13 `request_id` 被解析两次，全链路 trace 当场断掉 + 客户端可控字段未净化
+
+- **现象**：网关回给前端一个 `X-Request-Id`，Python 日志里却是**另一个值**，用户报障时两边对不上号。
+- **定位**：响应头处和转发头处各调了一次 `resolveRequestId()`，未传 header 时各自 `UUID.randomUUID()` → 两个 ID；单测里两个用例分别断言“生成了 ID”和“复用了客户端 ID”，**都通过**，所以没人发现。
+- **修复**：① 统一为 `AgentRequestId.resolve()` 一个入口（顺带消掉 filter 与网关的重复实现）；② 同时加固：客户端可控的 `X-Request-Id` 会进入日志与响应头，只保留可见 ASCII、截断 64 字符、全非法则重新生成（防**日志注入**与非法响应头触发容器异常），并补 2 条净化用例。
+- **教训**：**跨进程 trace id 只能有一个来源**（一次解析、层层传递）；“每个用例都过”不等于“这些用例拼起来是对的”——**同一概念的多次生成/重复实现，要有单点收敛的强制手段**。
+
+### 坑 14 RuoYi 的“认证失败”是 HTTP 200 + `code:401`，把前端 SSE 客户端骗出了空白气泡
+
+- **现象**：端到端验“未认证”时，`/agent/status` 返回 **HTTP 200**，我一度以为是网关漏了鉴权；对照既有 `/manage/inventory/list` 才发现行为**逐字一致**——这是 RuoYi 的约定（`AuthenticationEntryPointImpl` 渲染 `AjaxResult.error(401)`，而 `renderString` 固定写 200）。
+- **更重要的发现**：我把同一约定带入 SSE 路径 → 前端 `openSseStream` 只看 `response.ok` ⇒ 200 通过 ⇒ 把这段 JSON 当 SSE 流解析 ⇒ **得到一个永不变化的空白气泡**（无报错、无提示）。
+- **修复**：前端改为按 **`Content-Type` 判定是否为 SSE**（`text/event-stream`），不是就当 RuoYi 信封处理并按 `code` 分流（401 → “登录已过期”，503 → 降级横幅），`probeAgentStatus()` 同理。
+- **教训**：
+  - “**响应格式**”与“**状态码**”是两件事：判断“这是不是一个流”只能看 Content-Type；
+  - 与既有框架约定对齐时，要连带检查**新老入口对该约定的处理是否一致**（一致性检查我用了 `curl` 对照 `/manage/**`，成本 10 秒）；
+  - 静态检查帮不上忙，靠真机验“没有 token 会怎样”才暴露。
+
+### 坑 15 观测性字段硬编码：真 LLM 调用被标成 `echo`
+
+- **现象**：M1 验收跑真 LLM，`meta` 帧里 `"mode": "echo"`（回复内容确实是 LLM 生成的）。
+- **根因**：SSE 生成函数叫 `_echo_stream`（Phase 0 骨架期命名），`mode` 直接写死 `"echo"`；后来接了 LLM 节点，这个标签没人跟着改。
+- **修复**：`mode` 由**实际执行路径**决定（echo 节点写 `mode=echo`，LLM 节点写 `mode=llm` + **服务端实际返回的模型名**），续传路径从 checkpoint 读回模型；补 3 条测试（LLM 分支/续传/echo 分支）。
+- **教训**：**可观测字段必须从执行路径推导，不能硬编码**——不然审计、成本归因、排障全部失真，而且**失真的方式恰好是“看起来正常”**。
+
+### 坑 16 两个“静默”的工程坑：surefire 跳过 JUnit5、打桩丢了必填字段
+
+| 坑 | 现象 | 根因 / 修复 | 教训 |
+| --- | --- | --- | --- |
+| surefire 静默跳过用例 | 加完 `spring-boot-starter-test` 后 `mvn test` **BUILD SUCCESS**，但一个新用例都没跑 | 父 POM 未继承 `spring-boot-starter-parent`，Maven 3.8 默认绑定 surefire **2.12.4**，不识别 JUnit5 → pin `2.22.2` | **“构建绿”不等于“断言跑了”**：必须核对 `Tests run` 数量；测试框架引入后的第一件事是验证它真的在跑 |
+| 打桩与真实契约不一致 | 用 `AIMessage(usage_metadata={input_tokens, output_tokens})` 打桩 LLM，节点报 `ValidationError` | 本版 langchain 的 `usage_metadata` **要求 `total_tokens` 也必填** → 补上 | 打桩对象也要满足**真实契约的完整约束**，否则你测的是“桩能不能跑”，不是“代码能不能跑” |
+
+### 坑 17 浏览器层验证第一天就抳出两个真 bug（构建绿 + curl 绿都没抳到）
+
+- **现象**：把前端验收从“构建通过 + 手测清单”升到“真浏览器自动化”（Playwright-Core + 系统 Chrome，依赖装在项目外），首次运行就在“中断生成后再发一条”这步直接失败。
+- **bug 1（功能性，用户可见）**：第二轮对话返回「会话不存在或无可续传内容」。根因：前端把 `Last-Event-ID`（上游重连续传语义）当普通参数传给了**每一轮**请求 → 服务端把它当续传处理（不重跑图、去读 checkpoint）→ 新会话没有 checkpoint 就直接 404。
+  - **修复**：把两种语义拆开——新一轮绝对不带该头（`chatWithAgent`），续传单独走 `resumeAgentStream`；顺势补上“**断线自动续接**”：遇可重试错误且有帧锚点时重连一次，服务端只补发未收帧（不重跑图、不重复计费、不重复追加上下文）。
+- **bug 2（卫生类，控制台报错）**：`AbortError: BodyStreamBuffer was aborted`。根因：`try { reader.cancel() } catch {}` **抳不到 promise 拒绝**——`cancel()` 返回 Promise，不 `await` 就永远不会进入 catch。修正为 `await reader.cancel()` 包在 try 里。
+- **教训**：
+  - **验证层级要够**：单元测试/构建/HTTP curl 都无法覆盖“浏览器里的真实交互序列”（本例是“先中断、再下一轮”这种状态污染，只有按真实用户序列跑才暴露）；
+  - **同名头不代表同语义**：`Last-Event-ID` 是“续传游标”，不能当普通请求参数满天飞；
+  - **JS 的错误陷阱**：所有返回 Promise 的 API 在 `try/catch` 里必须 `await`，否则异常跑到全局（控制台报错、甚至变成静默 bug）。
+
+### 坑 18 口令轮换把潜伏的依赖缺口炸出来了：`caching_sha2_password` 需要 `cryptography`
+
+- **现象**：轮换完 `dkd_agent` 库账号口令后，Python 服务健康检查正常，但一旦有一次对话需要写留痕/计量，连库直接报 `RuntimeError: 'cryptography' package is required for sha256_password or caching_sha2_password auth methods`（对话本身不断，因为审计属旁路——这反而让问题更隐若）。
+- **定位**：MySQL 8 默认 `caching_sha2_password`。前 N 次连接走的是**快速路径**（服务端缓存了 SHA2 条目，无需加密）；`ALTER USER` 会**清掉缓存** ⇒ 下一次必须走全量握手；非 TLS 连接下全量握手必须用 RSA 公钥加密口令 ⇒ PyMySQL/aiomysql 此时必须有 `cryptography`。本机之所以一直正常，是因为服务器缓存一直没失效——**同一个 MySQL 只要重启或改口令，生产也会一样炸**。
+- **修复**：`uv add cryptography`（写进 `pyproject.toml`/`uv.lock` 做声明，而不是“本机装一个”）；轮换后重跑链路：9 帧流式正常 + `agent_decision_log` 新行写入成功。
+- **教训**：
+  - **依赖声明要用“最严苛路径”验证**：平时跑得通不代表换密码/重启后跑得通；认证类依赖尤其如此；
+  - **旁路能力的降级放行会掩盖问题**：审计写失败只打 WARN（这是对的设计），但因此**必须靠“换口令后主动复测写入”**才能发现问题；
+  - **轮换本身是一次“依赖体检”**：能把“只在本机缓存有效”的隐性假设全部暴露出来。
+
+---
+
+## 五之二、知识点清单（可背诵，面试按需展开）
+
+> 每条都来自本项目**实际写过的代码/踩过的图**，不是抄文档。括号里是“面试时怎么落地这两句”。
+
+### A. SSE 与流式（问得最多）
+
+| 知识点 | 要点 |
+| --- | --- |
+| 帧格式 | `event:` / `data:`（可多行，按 `\n` 拼接）/ `id:` / 注释行 `: keep-alive`；帧以**空行**分隔（`\n\n` / `\r\n\r\n` 都要兼容）；**注释行不是事件**，解析时要丢掉（本项目就踩过：被当成事件派发了一次空回调） |
+| 为什么不用 `EventSource` | 它**不能自定义请求头** ⇒ 带不了 `Authorization: Bearer <jwt>`；所以用 `fetch` + `ReadableStream` 手工分帧 |
+| 为什么不用现成 axios 实例 | 该实例 `timeout: 10000` 且响应拦截器按 `res.data.code` 解析 JSON，会把 `text/event-stream` 当 JSON → 另写 `utils/sse.js` |
+| 断点续传 | 客户端把最后一个帧 `id` 放在 `Last-Event-ID` 头重连；服务端**不重跑**，从 checkpointer 读回本轮回复，只补发未收帧（`index <= offset` 跳过） |
+| 不缓冲（服务端） | Tomcat 响应默认 8KB 缓冲 ⇒ 每块必须 `flush()`；响应头显式 `Cache-Control: no-cache, no-transform` + `X-Accel-Buffering: no` 对付 Nginx 缓冲/压缩 |
+| 不缓冲（怎么**证明**） | 用 `curl -N ... \| while read line; do echo $(date +%s%3N) $line; done` 打时间戳：本次实测 **51 帧 / 3.2s，首 delta 距首行 70ms、末帧距首帧 3217ms**；若被整包缓冲，所有行会在毫秒级一起到达（这条比“我看能流式”有说服力得多） |
+| 可取消 | `AbortController`；客户端断开 → 服务端写失败 → 归因为 `AgentClientAbortException`（正常操作，不打 WARN，否则监控噪声掩盖真故障） |
+| 空闲超时 | 用“多久没收到**任何字节**”做心跳判据（不是帧数）：LLM 首包可能几秒，网关读超时 120s、前端空闲 60s |
+| 帧级 vs token 级 | **本项目已实现 token 级（M1 发现后修光）**：LLM 节点 `streaming=True` + API 层 `astream(stream_mode=["messages","values"])`（messages 抽逐 token 分片、values 取最终 state）。实测真 LLM：13~14 帧 / 首 token 距 meta **545ms** / 末 token 距首 token **487ms**。两个坑：① messages 模式也会把节点返回的**完整 `AIMessage`** 吐出来（echo 节点），必须按 `AIMessageChunk` 类型过滤，否则重复发一遗；② 不显式开 `streaming=True` 时依赖 langchain 内部启发式，升级可能静默退化。**面试价值**：能区分“能流式”与“帧级 vs token 级”，并给出时间戳证据 |
+
+### B. Servlet 过滤器链 / Spring Security（Java 侧最容易被追问）
+
+| 知识点 | 要点 |
+| --- | --- |
+| 过滤器顺序 | `FilterRegistrationBean.setOrder()` 数值**越小越先执行**；Spring Security 的 `springSecurityFilterChain` 是 **-100** |
+| 谁在谁里面 | 注册为 order > -100 的过滤器，其 `doFilter` 是在 Security 链的 `doFilter` **内部**被调用的 ⇒ 能读到 `SecurityContext`（`JwtAuthenticationTokenFilter` 已填充）；order < -100 则先于安全链 |
+| `SecurityContext` 生命周期 | 安全链的 `SecurityContextPersistenceFilter/HolderFilter` 在 `finally` 里 `clearContext()` ⇒ 想在 Servlet 里拿身份，必须**在安全链内部**（本项目 `AgentTokenFilter` 用 order=0 就是这个原因） |
+| `@Anonymous` 机制 | `PermitAllUrlProperties` 扫注解、把**方法级 URL** 加进 permitAll；类级注解会把该类所有映射都加进去（本项目回调 Controller 用它绕过 JWT，因为它是**服务间密钥**这套体系的） |
+| 身份注入为何放 attribute 而不是改写请求头 | 头可被客户端伪造；attribute 由过滤器写、控制器读，**客户端没有任何路径能写进去**；转发时再按白名单**重建**头（绝不遍历客户端头） |
+| 常量时间比较 | `MessageDigest.isEqual(a.getBytes(UTF_8), b.getBytes(UTF_8))`，避免 `equals` 按字符短路泄漏密钥长度/前缀 |
+
+### C. RuoYi / 本项目既有约定（“看一眼代码就知道”的加分细节）
+
+| 约定 | 事实 |
+| --- | --- |
+| 响应信封 | 一律 `AjaxResult{code,msg,data}`；`code=200` 成功、`500` ServiceException（**HTTP 仍是 200**） |
+| 认证失败 | **HTTP 200 + `{code:401}`**（与前端 axios 拦截器约定一致 ⇒ 前端能统一跳登录） |
+| 限流 | `@RateLimiter(time, count, limitType)` 是 **Redis 计数**（Lua 脚本）的 AOP，命中抛 `ServiceException` ⇒ 天然 fail-closed |
+| 业务表前缀 | 业务表 `tb_`、系统表 `sys_`、智能体自有表 `agent_`（本项目的白名单校验器直接拿前缀当护栏） |
+| 工单校验链 | `TaskServiceImpl.insertTaskDto`：设备存在 → **设备状态与工单类型匹配** → **同设备无未完成工单（防重）** → 员工存在 → **员工区域 == 设备区域** → 建单 + 明细（同事务） |
+| 为什么 Agent 必须走回调 | 上面这条链就是“业务事实”的边界：Python 直连写库会全部绕过它（`AGENTS §1` 红线） |
+
+### D. 安全（红线级）
+
+| 知识点 | 要点 |
+| --- | --- |
+| 读写分离的落地 | MySQL 两级授权：业务表**仅 SELECT**（白名单 + 无 `tb_` 前缀即拒）、自有表可 `INSERT/UPDATE` 但**无 DELETE/DDL**；验证矩阵含**读非白名单表被拒**（只验“写被拒”不够，只读账号默认能读全库表结构与其他库） |
+| 客户端可控字段入日志 | 必须净化（visible ASCII + 长度上限）——日志注入与非法响应头都会以“莫名报错”的形式出现 |
+| LLM 输出不可信 | 结构化解析 + **范围夹取**（数量 clamp 到 `[0, 货道容量-现库存]`）+ 写操作人工确认；前端渲染一律过 `DOMPurify` |
+| 密钥不落仓库 | 配置全 `${ENV}` 占位符；`.env` 与 `var/*.db` 进 `.gitignore`；**改完还要清 Git 历史与 dangling 对象**（本轮实测：清理前对象库命中 2 处密钥 → 清理后 0、未可达对象 0）；**轮换本身要当一次“依赖体检”**（MySQL 8 `caching_sha2_password` 全量握手需 `cryptography`，详见坑 18） |
+| fail-closed | 密钥未配置 → **503 拒绝服务**，绝不“默认放行”；审计库挂了 → 记录 WARN **降级放行**（旁路不能打断主流程）——两者语义要分清 |
+
+### E. 可观测性与测试工程
+
+| 知识点 | 要点 |
+| --- | --- |
+| 全链路 trace | 网关注入/复用 `X-Request-Id` → Python `contextvar` → 工具层 → 回调 → `agent_decision_log.request_id`（本轮实测：网关头值 == 落库值） |
+| 计量归因 | 按**服务端实际返回的模型名**记（实测配置 `deepseek-chat` 路由到 `deepseek-flash`）；报表接口 `/agents/usage/summary` |
+| 用生产字节流做测试夹具 | 把 Python 真实 SSE 输出存成字节流，用**303 个二分切点 + 逐字符 + 随机分片 + CRLF** 断言“分帧结果与整块一致”——分帧这类状态机，靠“跑通一次”根本不够 |
+| 测试不触网 | Python 侧 LLM 一律打桩（另设 `-m live` 显式开关跑真实调用）；Java 侧用**回环 `HttpServer`** 提供假上游（真实 HTTP、无外部依赖） |
+| 测试要真的在跑 | 见坑 16：核对 `Tests run` 数；本次 Java **42 项**、Python **70 项 / 覆盖率 93.58%**、前端构建 exit 0 |
+
+---
+
 ## 六、工程质量与可观测（面试加分项）
 
 | 主题 | 我的做法 | 为什么这么做 |
@@ -259,8 +401,9 @@ Postgres saver（landing zone）
 | 成本 | token 计量（按用户/场景）+ 日限额熔断 429 + 用量报表接口 | LLM 一旦发出就产生费用，**事后告警太晚** |
 | 幂等 | DB 唯一键 + 状态机 + 建单前查在途工单 | 定时任务重跑、重复点击、多人并发三种场景 |
 | 可观测 | `request_id` 贯穿网关→Python→工具→回调；单行 JSON 日志（含耗时/状态码，**绝不记 prompt 与密钥**） | 排障靠它；同时守住"日志不得泄露用户数据与密钥" |
-| 测试策略 | 单元测试**全部打桩**（§8 要求测试不得真实调外部 API）；真实调用走 `-m live` 显式开关 | 测试要能离线、可重复；真实冒烟单独一条命令 |
-| 覆盖率 | 52 项测试 / 覆盖率 90.2%（门槛 70%） | 重点是**拒绝路径**（白名单、鉴权、限额、降级）而非行数 |
+| 测试策略 | 单元测试**全部打桩**（§8 要求测试不得真实调外部 API）；真实调用走 `-m live` 显式开关；前端再加一层**真浏览器自动化**（依赖装在项目外） | 测试要能离线、可重复；真实冒烟单独一条命令；浏览器层是能抳出真 bug 的那一层（实测抳出 2 个） |
+| 覆盖率 | Java **42 项**（网关/回调/过滤器/SSE 中继，纯单测不依赖 MySQL/Redis）、Python **70 项 / 覆盖率 93.58%**、前端 `build` exit 0 | 重点是**拒绝路径**（白名单、鉴权、限额、降级）而非行数；另附 10 项人工手测清单（浏览器自动化会引入未声明依赖） |
+| 端到端可回归 | `docs/scripts/g1-gateway-smoke.sh`：登录 → SSE 逐帧 → requestId 贯穿 → 回调 4 类拒绝 → 未认证信封 → 停机降级，**16/16 PASS** | 把“我本地跑通了”变成**别人一条命令能复现**的资产；里程碑验收直接用 |
 | 配置安全 | 密钥只走环境变量；缺失时**启动即失败**或返回 503，绝不默认放行 | "忘了配就用默认值"是最常见的生产事故来源 |
 | DDL 规范 | 附回滚语句 + 幂等（`IF NOT EXISTS`）+ 增量 ALTER + 锁表评估 | 变更可逆，是能上生产的前提 |
 
@@ -304,10 +447,18 @@ LangGraph checkpointer，当前用 SQLite（单机形态匹配、零新增基础
 **Q12：这套东西的 ROI 怎么算？**
 客服/运营侧省的是人工排单时间（60%+），业务侧省的是缺货损失（30%+）；成本侧是 token 消耗（有计量与限额）。我会强调**先做对照实验再谈收益**，不拍脑袋。
 
+**Q13：你说 SSE 不缓冲，怎么证明？**（能答好这题的人不多）
+不是“我看能流式”，而是**打时间戳**：`curl -N | while read line; do echo $(date +%s%3N) $line; done`，本次实测 51 帧/3.2s，**首 delta 距首行 70ms、末帧距首帧 3217ms**；若被整包缓冲，所有行会在毫秒级一起到达。另一端也有约束：Tomcat 默认 8KB 响应缓冲 ⇒ 每块必须 `flush()`；Nginx 类中间层要 `X-Accel-Buffering: no` + `no-transform`。**我会主动补一句诚实的话**：当前是帧级流式（LLM 用 `ainvoke` 整段返回后分帧），不是 token 级，改法是用 `astream` + `stream_mode="messages"`。
+
+**Q14：为什么滤波器/拦截器写了却没生效？**
+先看**顺序**：`FilterRegistrationBean.setOrder` 数值越小越先执行，Spring Security 链是 **-100**。我把回调鉴权注册在 0，于是它在安全链**内部**执行——未登记的回调路径先被安全链 401 掉，我的“非白名单→404”分支**永远不可达**（单测全绿也发现不了，因为单测直接调方法、绕过了整条链）。修法是放到 -200 让服务间密钥先守门，并用真机验 401/404 两条分支。
+
+**Q15：如果上游返回 4xx，你会怎么处理？**
+**原样透传**，不换成 503。因为 4xx 携带明确业务语义（如 token 限额 429、参数校验 422），换成“服务不可达”会让前端丢失原因。**但这里有个 JDK 陷阱**：`HttpURLConnection.getErrorStream()` 必须在读出响应码**之后**才有效，先读 body 会把 4xx/5xx 抛成 IOException、被误判为“不可达”——错误归因分层错了，排查会被带偏。
+
 ---
 
 ## 八、简历写法（STAR + 量化，直接可抄改）
-
 > **DKD 售货机运营平台 · 智能体旁路改造（Java 8 + Python/LangGraph）**
 > - **背景**：RuoYi 改造的售货机平台，AI 能力停留于"switch-case 硬编码 prompt 的单轮问答"，无法调用业务数据、无法产出可执行动作。
 > - **方案**：新增独立 Python 智能体服务（FastAPI + LangGraph），**读走 MySQL 只读白名单账号、写一律回调 Java REST**，复用 `insertTaskDto` 的事务与校验链；前端经 Java 网关统一 JWT 转发（Python 不解析 JWT，只信任注入头）。
@@ -408,3 +559,9 @@ LangGraph checkpointer，当前用 SQLite（单机形态匹配、零新增基础
 8. **不引入新组件除非它的能力是当前量级必需的**——把迁移触发条件写下来，而不是提前上重装备。
 9. **安全是流程而非代码**：提交状态 / Git 历史 / 远端 / 环境注入，四件事都要检查。
 10. **每次评审后回写规范**（本项目已回写：表名前缀、Redis 能力边界、`agent_*` 两级授权、CR 禁止 `date_format` 包裹索引列）。
+11. **顺序类缺陷只能靠端到端发现**（过滤器/拦截器/AOP/中间件顺序）：写了判断 ≠ 会执行到；设计鉴权先问“**谁能先拦到请求**”。
+12. **用一个来源生成同一概念**（trace id、幂等键）：多处生成 = 多处不一致，且单测会各自“通过”。
+13. **响应格式与状态码是两件事**：判断“是不是流”看 `Content-Type`，不看 `200`；跨入口对齐框架约定时，改完要拿旧入口做一次对照。
+14. **可观测字段从执行路径推导，不硬编码**（`mode`/`model`/`upstream`）——失真的方式恰好是“看起来正常”。
+15. **“构建/测试通过”要看数字**（`Tests run`、覆盖率、断言数）：surefire 2.12.4 会静默跳过 JUnit5；被跳过的“绿”比红灯危险。
+16. **把一次性验证沉淀成资产**：本次把“16 项网关冒烟”入库为 `docs/scripts/g1-gateway-smoke.sh`，把真实 SSE 字节流做成分帧夹具——下次回归只跑一条命令。

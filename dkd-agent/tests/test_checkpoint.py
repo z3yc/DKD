@@ -30,26 +30,32 @@ def _frames(text: str) -> list[tuple[int | None, str, dict]]:
 
 
 def test_state_persists_across_requests(client: TestClient):
-    """跨请求恢复：同 conversation_id 第二次请求时 history_len 应累加。"""
+    """跨请求恢复：同 conversation_id 第二次请求时 history_len 应累加。
+
+    注：token 级流式（M1 后）下，首轮请求的 meta 帧只能带“开始时已知”的信息，
+    history_len 与 model 由 done 帧补全（见 tests/test_chat_llm_mode.py 的契约说明）。
+    """
     first = _frames(
         client.post("/agent/chat", json={"message": "第一轮", "conversation_id": "conv-A"}).text
     )
     meta1 = next(d for _, e, d in first if e == "meta")
-    assert meta1["history_len"] == 2  # 用户 + 助手
+    done1 = next(d for _, e, d in first if e == "done")
+    assert done1["history_len"] == 2  # 用户 + 助手
     assert meta1["resumed"] is False
+    assert meta1["conversation_id"] == "conv-A"
 
     second = _frames(
         client.post("/agent/chat", json={"message": "第二轮", "conversation_id": "conv-A"}).text
     )
-    meta2 = next(d for _, e, d in second if e == "meta")
-    assert meta2["history_len"] == 4  # 历史累积，证明命中 checkpoint
-    assert meta2["conversation_id"] == "conv-A"
+    done2 = next(d for _, e, d in second if e == "done")
+    assert done2["history_len"] == 4  # 历史累积，证明命中 checkpoint
+    assert next(d for _, e, d in second if e == "meta")["conversation_id"] == "conv-A"
 
 
 def test_conversations_are_isolated(client: TestClient):
     client.post("/agent/chat", json={"message": "A轮", "conversation_id": "conv-iso-1"})
     resp = client.post("/agent/chat", json={"message": "B轮", "conversation_id": "conv-iso-2"})
-    assert next(d for _, e, d in _frames(resp.text) if e == "meta")["history_len"] == 2
+    assert next(d for _, e, d in _frames(resp.text) if e == "done")["history_len"] == 2
 
 
 def test_reconnect_resumes_from_last_event_id(client: TestClient):

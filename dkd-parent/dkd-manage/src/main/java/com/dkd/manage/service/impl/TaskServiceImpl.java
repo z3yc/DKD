@@ -131,12 +131,43 @@ public class TaskServiceImpl implements ITaskService
     public List<TaskVo> selectTaskVoList(Task task) {
         return taskMapper.selectTaskVoList(task);
     }
- /**
-     * 批量新增工单
+    /**
+     * 批量新增工单（保留原签名：返回影响行数）。
      */
     @Transactional
     @Override
     public int insertTaskDto(TaskDto taskDto) {
+        // 为什么成功后返回 1：校验失败会抛 ServiceException，成功路径下 INSERT 必然影响 1 行
+        //（与原实现返回 taskMapper.insertTask 的行数等价，调用方语义不变）
+        insertTaskDtoInternal(taskDto);
+        return 1;
+    }
+
+    /**
+     * 创建工单并返回落库后的实体（供智能体回调回传 taskId/taskCode，排期 1-3/1-8）。
+     *
+     * <p>为什么需要它：{@link #insertTaskDto} 只返回影响行数，Python 侧拿不到工单号，
+     * 也就无法回写 {@code agent_restock_plan.task_id}、无法做“重复确认直接返回已建单”的幂等对账。
+     *
+     * @param taskDto 工单入参
+     * @return 已落库的工单（含 taskId / taskCode）
+     */
+    @Transactional
+    @Override
+    public Task insertTaskDtoReturningTask(TaskDto taskDto) {
+        return insertTaskDtoInternal(taskDto);
+    }
+
+    /**
+     * 工单创建的核心校验链与落库（两个公开入口共用）。
+     *
+     * <p>**校验顺序与异常文案保持原样**：它们是 Python 侧要原样展示给运营人员的失败原因
+     *（设备状态不符 / 设备有未完成工单 / 员工区域不一致），改动会直接影响回调契约。
+     *
+     * @param taskDto 工单入参
+     * @return 已落库的工单
+     */
+    private Task insertTaskDtoInternal(TaskDto taskDto) {
         //查询售货机是否存在
         VendingMachine vm = vendinngService.selectVendingMachineByInnerCode(taskDto.getInnerCode());
         if(vm == null){
@@ -150,6 +181,9 @@ public class TaskServiceImpl implements ITaskService
         taskParam.setInnerCode(taskDto.getInnerCode());
         taskParam.setProductTypeId(taskDto.getProductTypeId());
         taskParam.setTaskStatus(DkdContants.TASK_STATUS_PROGRESS);
+        // 注意：这里是“先查后插”，**并发下可能双建单**（表上无 (inner_code, product_type_id, status)
+        // 唯一索引）。排期 1-8 在 Agent 侧用计划状态机 + 幂等键兜住并发确认；
+        // 本方法保持原语义不动（避免影响既有调用方与前端行为）。
         //查询符合条件的工单
         List<Task> taskList = taskMapper.selectTaskList(taskParam);
         //如果有未完成工单，抛出异常
@@ -173,7 +207,7 @@ public class TaskServiceImpl implements ITaskService
         task.setAddr(vm.getAddr());
         task.setCreateTime(DateUtils.getNowDate());
         task.setTaskCode(generateTaskCode());
-        int taskResult = taskMapper.insertTask(task);
+        taskMapper.insertTask(task);
         //判断是否为补货工单
         if(taskDto.getProductTypeId().equals(DkdContants.TASK_TYPE_SUPPLY)){
         //获取补货工单详
@@ -189,7 +223,7 @@ public class TaskServiceImpl implements ITaskService
                 taskDetailsService.insertTaskDetailsBatch(taskDetailsList);
             }
         }
-        return taskResult;
+        return task;
     }
     /**
      * 取消工单

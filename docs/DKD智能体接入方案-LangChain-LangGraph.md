@@ -196,15 +196,72 @@
 
 新增 `dkd-common` 下一个 `agent` 包，约 4 个类，**不改动任何现有业务代码**：
 
-1. `AgentGatewayController`：`/agent/**` 请求反向代理到 `http://localhost:8090`，透传方法/路径/Body，并在 header 注入当前登录用户（用户名、角色、区域），用于智能体侧的权限对齐与审计；
-2. `AgentCallbackController`：供 Python 服务间回调（创建工单、查询业务数据兜底），使用独立的**服务间密钥**鉴权（配置项，非用户 JWT）；
-3. `AgentProperties`：`agent.enabled / agent.baseUrl / agent.secret` 配置；
+1. `AgentGatewayController`（`dkd-common`）：`/agent/**` 请求反向代理到 `http://localhost:8090`（`agent.base-url`），透传方法/路径/查询串/Body，并按**白名单重建**用户身份头（`X-Agent-User` / `X-Agent-Username` / `X-Agent-Roles` / `X-Agent-Region` / `X-Request-Id`）——客户端自带的 `X-Agent-*` 一律丢弃（防伪造，`AgentUserContext` 以 request attribute 传递而非改写请求头）；
+2. `AgentCallbackController`（位于 **`dkd-manage`**）：供 Python 服务间回调建单（`POST /agent/callback/task` → `ITaskService.insertTaskDto`），使用独立的**服务间密钥**鉴权（配置项，非用户 JWT）。**为什么不在 `dkd-common`**：它需要注入 `ITaskService`，而 `dkd-manage` 已依赖 `dkd-common`，放进 common 会形成模块环；
+3. `AgentProperties`：`agent.enabled / agent.base-url / agent.secret / connect-timeout / read-timeout / callback-path-whitelist` 配置。配套类：`AgentConfig`（过滤器注册顺序）、`AgentTokenFilter`（安全链**之后**注入身份，依赖 SecurityContext）、`AgentCallbackAuthFilter`（安全链**之前**做密钥 + 白名单校验）、`AgentUpstreamClient`（HTTP 中继，两条通道：SSE 字节流 / JSON 转发）、`AgentRequestId`（requestId 解析 + 净化，防日志注入）；
 4. 网关超时与降级：对话类请求透传 SSE 流；Python 服务不可用时返回友好降级提示，**不影响主业务任何功能**（开关可一键下线智能体）。
-   - **流式实现约束**：项目为 Spring MVC + Tomcat，`/agent/**` 的 SSE 转发必须用 `StreamingResponseBody`（或 `ResponseBodyEmitter`）逐块写出，**禁止先把响应体读完再返回**，否则流式体验失效；
+   - **流式实现约束（0-6 落地修正）**：原方案要求用 `StreamingResponseBody`（或 `ResponseBodyEmitter`）逐块写出。实测发现 **`dkd-common` 只依赖 `spring-web`、不含 `spring-webmvc`**（`StreamingResponseBody` 在 webmvc 包内），在该模块无法编译。落地改为：控制器直接写 `HttpServletResponse` 输出流，**读一块写一块并立即 flush**（`AgentUpstreamClient.relayStream`，1KB 块）。语义与方案一致（**禁止先把响应体读完再返回**），并附带好处：同步写不受 Tomcat 异步 `asyncTimeout`（默认 30s）掐流影响。代价：每个在途对话占用一个 Tomcat 工作线程（`server.tomcat.threads.max=800`，当前规模无风险；若并发对话数长期 >50 应改回异步或调线程池）。
+     **实测证据（2026-09-21，W1 末）**：1200 字回复产生 51 个 delta 帧、总时长 3.2s，首个 delta 帧距首行仅 **70ms**、末帧距首帧 **3217ms**——若网关整包缓冲，所有行会在毫秒级一起到达；
    - **前端约束（V1 遗漏）**：现有 `dkd-vue/src/utils/request.js` 的 axios 实例 `timeout: 10000` 且响应拦截器按 `res.data.code` 解析 JSON，**无法用于 SSE**；前端需新增独立 SSE 客户端（`fetch` + `ReadableStream`，因为 `EventSource` 不能携带 `Authorization` 头），并实现 `AbortController` 取消与心跳（AGENTS §2.2 要求长请求可取消）；
    - **降级范围界定**：`IAiService` 只能兜底**单轮文本**场景（原 `/manage/ai/diagnose`），侧边栏多轮对话**没有等价兜底**，降级时前端应隐藏/禁用对话入口并给出提示，而非伪造会话能力。
 
 现有 `IAiService`/`AiOperationController` 保留为**降级兜底**：`agent.enabled=false` 或 Python 服务故障时，`/manage/ai/diagnose` 继续走原单轮逻辑，保证功能不断档。
+
+### 3.3.1 网关与回调接口契约（0-6 / 0-7 实测口径）
+
+> 本小节是 Java 侧（0-6/0-7）与 Python 侧（1-3 起）对接的**唯一口径来源**；每条均为 2026-09-21 实机验证结果，验证脚本见 `docs/scripts/g1-gateway-smoke.sh`。
+
+**A. 前端 → 网关（复用用户 JWT）**
+
+| 路径 | 方法 | 行为 |
+| --- | --- | --- |
+| `/agent/chat` | POST | SSE 透传（`text/event-stream`）。帧：`meta` → `delta`×N → `done`（异常时插入 `error`）。**token 级流式**：LLM 分片回调逐块下发（实测真 LLM：13 帧，首 token 距 meta **545ms**、末 token 距首 token **487ms**）。`delta` 带自增 `id`，支持 `Last-Event-ID` 续传。**帧字段分工**：`meta` 只带“开始时已知”的（conversation_id/request_id/scene/user/mode[echo\|llm]/resumed）；服务端**实际模型名**、`history_len`、`tokens_in/out`、`frames` 由 `done` 帧补全（首轮请求的 `meta.model` 为 `null`，**不写配置里的假值**） |
+| `/agent/status` | GET | `{code:200,data:{enabled,upstream:"up"\|"down"}}`，供前端决定是否隐藏/禁用对话入口 |
+| 其余 `/agent/**` | 任意 | 泛化代理（同方法/路径/查询串/Body），上游 2xx/4xx 原样透传 |
+| `/agent/callback/**` | 任意 | **拒绝**（HTTP 404）：回调是 Python → Java 单向通道，不经网关暴露给前端 |
+
+**B. 网关 → Python 请求头白名单**（只注入下列头，其余客户端头不转发）
+
+`X-Agent-User`、`X-Agent-Username`、`X-Agent-Roles`、`X-Agent-Region`（可缺省）、`X-Request-Id`、`X-Agent-Secret`（纵深防御，Python 侧当前仅回调/运维接口强制校验）、以及客户端原样的 `Accept` / `Content-Type` / `Last-Event-ID`。
+
+**C. 降级口径（`agent.enabled` 一键下线 + Python 故障）**
+
+| 场景 | SSE 路径（`/agent/chat`） | 非 SSE 路径 |
+| --- | --- | --- |
+| `agent.enabled=false` | HTTP 200 + `error{msg:"智能体服务未启用",code:503,degrade:true}` + `done` 帧 | HTTP **503** + `{code:503,msg:"智能体服务未启用（agent.enabled=false）"}` |
+| Python 不可达 / 超时 / 上游自身 5xx | HTTP 200 + `error{msg:"智能体服务暂不可用…",code:503,degrade:true}` + `done` 帧 | HTTP **503** + `{code:503,msg:"智能体服务暂不可用"}`（**不回显上游原始报文**） |
+| 上游 4xx（如参数错误、token 限额） | 原样降级帧（上游透传错误帧，网关不拦截） | **原样透传**状态码与信封（4xx 携带明确业务语义，替换成 503 会让前端丢失原因） |
+
+**D. 未认证口径（沿用 RuoYi 约定，与 `/manage/**` 完全一致）**：HTTP **200** + `{"code":401,"msg":"请求访问：…，认证失败"}`。
+→ Python 侧无需感知；**前端 SSE 客户端必须按 `Content-Type` 判定是否为 SSE**，只看 `response.ok` 会把该信封当流解析，导致空白气泡（0-11 已按此修复）。
+
+**D2. token 级流式（M1 缺口修复，2026-09-21）**：此前 LLM 节点用 `ainvoke` 整段取回、再按 24 字符分帧，属**帧级**流式（首字延迟 ≈ 整段 LLM 时延）。现改为：节点 `build_chat_model(streaming=True)` + API 层 `graph.astream(..., stream_mode=["messages","values"])`——`messages` 抽 LLM 分片回调（逐 token 下发），`values` 取每步后的完整 state（留痕/计量用）。**两个已踩的坑**：① `messages` 模式除了分片回调，也会把节点**直接返回的完整 `AIMessage`** 吐出来（echo 节点就是），因此必须按 `AIMessageChunk` 类型过滤，否则 echo 模式会重复发一遗；② 只有 `streaming=True` 或回调触发时 langchain 才真流式，显式打开以免版本升级静默回退。echo 节点（USE_LLM=0 的自检/降级演练）走兜底分帧路径，行为不变。
+
+**E. 回调（Python → Java 写操作）**
+
+- 端点：`POST /agent/callback/task`，Body = `TaskDto` JSON，头 `X-Agent-Secret`；
+- 拒绝路径（413 前即拒绝，不进业务、不写库）：无密钥 / 伪造密钥 → **401**；密钥未配置 → **503**；路径不在白名单 → **404**；
+- 成功与业务失败统一返回 RuoYi 信封（HTTP 200）：`{code:200,msg:"工单创建成功"}` 或 `{code:500,msg:"售货机不存在"}`——**失败原因是 `TaskServiceImpl` 校验链原文**（设备状态不符 / 设备有未完成工单 / 员工区域不一致），Python 侧应按**信封 `code`** 判定成败，不能只看 HTTP 状态码；
+- 限流：`@RateLimiter(time=60,count=60,limitType=IP)`（Redis 计数，命中即拒，fail-closed）；
+- **已知缺口（排期 1-3/1-8 处理）**：当前**不回传 `taskId`/`taskCode`**（`insertTaskDto` 只返回影响行数），Python 侧幂等回写 `agent_restock_plan.task_id` 需要它；
+- **不伪造 `assignorId`**：回调无用户上下文，创建人语义由 `agent_restock_plan` 的确认人记录承担。
+
+**F. `X-Agent-Region` 当前不注入（已知偏差）**：`tb_emp` 无 `user_id` 列、`sys_dept` 无 `region_id`，当前 schema 中**不存在 sys_user → 区域 的映射**（`DefaultAgentRegionResolver` 因此恒返回 null）。影响仅限审计上下文（Python 侧 `region_id=None`）；1-8 按**设备** `region_id` 匹配接单人不受影响。若要补全，需先定义管理端用户与区域的关联（数据模型变更）。
+
+**G. 冒烟示例**
+
+```bash
+# 1) 登录取 JWT
+TOKEN=$(curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' http://127.0.0.1:8080/login \
+  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+# 2) SSE 透传（应逐帧到达，X-Request-Id 回带）
+curl -sN -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"ping","scene":2}' http://127.0.0.1:8080/agent/chat
+# 3) 回调拒绝路径（无密钥应 401）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
+  -d '{"innerCode":"x","productTypeId":2,"userId":1}' http://127.0.0.1:8080/agent/callback/task
+```
 
 ### 3.4 鉴权与安全设计
 
@@ -266,7 +323,7 @@
 运营人员 点击「确认建单」
   → POST /agent/restock/{planId}/confirm (用户JWT)
      → Java 网关转发 → Python 校验计划归属 + 幂等预检(plan.status 必须=建议/已调整)
-     → Python 回调 Java: POST /manage/task (AgentCallback, 服务间密钥)
+     → Python 回调 Java: POST /agent/callback/task (AgentCallbackController, 服务间密钥)
         → TaskServiceImpl.insertTaskDto: 设备状态/防重/区域校验 → 创建工单(tb_task)+明细(tb_task_details)
         （失败原因原样返回前端：设备有未完成工单 / 员工区域不一致 / 售货机不存在）
      → [写] agent_restock_plan(status=已建单, task_id) + 留痕（幂等：重复确认直接返回已建单）

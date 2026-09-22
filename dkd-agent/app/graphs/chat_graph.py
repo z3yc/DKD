@@ -66,8 +66,13 @@ async def respond(state: ChatState) -> dict[str, Any]:
 
 
 async def respond_with_llm(state: ChatState) -> dict[str, Any]:
-    """LLM 版本回复节点（需 DKD_DEEPSEEK_API_KEY + DKD_AGENT_USE_LLM=1）。"""
-    client = build_chat_model()
+    """LLM 版本回复节点（需 DKD_DEEPSEEK_API_KEY + DKD_AGENT_USE_LLM=1）。
+
+    `streaming=True` 是刻意显式打开的：API 层用 `astream(stream_mode="messages")` 逐 token 下发，
+    依赖模型的流式回调。虽然 langchain 在检测到 token 回调时会自动改走流式路径，
+    但那是内部启发式——显式打开才能保证“首 token 延迟”这个体验指标不被版本升级默默改掉。
+    """
+    client = build_chat_model(streaming=True)
     history = [
         m if isinstance(m, HumanMessage) else AIMessage(content=str(m.content))
         for m in state.get("messages", [])

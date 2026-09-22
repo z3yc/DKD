@@ -74,6 +74,18 @@ public interface ITaskService
      * 批量新增工单
      */
     int insertTaskDto(TaskDto taskDto);
+
+    /**
+     * 创建工单并返回落库后的实体（含 taskId / taskCode）。
+     *
+     * <p>为什么需要：智能体回调（排期 1-3）要把工单号回传给 Python 侧，用于
+     * {@code agent_restock_plan.task_id} 回写与“重复确认返回已建单”的幂等对账；
+     * 原 {@link #insertTaskDto} 只返回影响行数，拿不到工单号。
+     *
+     * @param taskDto 工单入参
+     * @return 已落库的工单
+     */
+    Task insertTaskDtoReturningTask(TaskDto taskDto);
     /**
      * 工单取消
      */

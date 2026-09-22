@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
@@ -78,6 +79,16 @@ def _extract_served_model(message: AIMessage) -> str | None:
     meta = getattr(message, "response_metadata", None) or {}
     served = meta.get("model_name") or meta.get("model")
     return str(served) if served else None
+
+
+def extract_usage(message: Any) -> tuple[int, int]:
+    """公开版 token 计量（补货校准等子图节点也要计入成本，任务 1-5）。"""
+    return _extract_tokens(message)
+
+
+def extract_served_model(message: Any) -> str | None:
+    """公开版“服务端实际返回的模型名”（成本归因必须按实际值，不按配置猜）。"""
+    return _extract_served_model(message)
 
 
 async def ping_llm(

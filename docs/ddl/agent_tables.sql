@@ -191,3 +191,15 @@ CREATE TABLE IF NOT EXISTS `agent_restock_plan` (
 -- DROP TABLE IF EXISTS `agent_decision_log`;
 -- DROP TABLE IF EXISTS `agent_message`;
 -- DROP TABLE IF EXISTS `agent_conversation`;
+
+-- ============================================================================
+-- 变更记录
+-- ----------------------------------------------------------------------------
+-- 2026-09-21（排期 1-7）：`agent_restock_plan.status` 的**状态机注释**补充一条迁移：
+--     3-已跳过 → 1-建议（仅由原型 V2 的「恢复建议」动作触发：必填原因 + 仅限当天）。
+--   原文写「终态 3/5 不可再变更」，与原型交互冲突；5-已复盘仍为真正终态。
+--   **注意：本次未改动任何列/索引/约束**（纯注释口径变更），无需 ALTER；
+--   代码侧同步见 app/graphs/restock_state.py::ALLOWED_TRANSITIONS 与
+--   app/graphs/restock_decisions.py::ACTION_RESTORE，以及
+--   docs/dkd-agent-restock-state-schema.md §5.3 的变更记录行。
+-- ============================================================================

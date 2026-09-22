@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api import chat, ops
+from app.api import chat, ops, restock
 from app.checkpoint import get_checkpoint_store, open_checkpoint_store
 from app.config import get_settings
 from app.db import dispose_engine
@@ -42,6 +42,8 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     store = await open_checkpoint_store(s.sqlite_path)
     app.state.checkpoint_store = store
     app.state.chat_graph = build_chat_graph(checkpointer=store.saver, use_llm=s.use_llm)
+    # 补货工作台服务（1-7）：真实 store + 真实只读依赖；测试可用 app.state.restock_service 整体替换
+    app.state.restock_service = restock.build_default_service()
     logger.info("dkd-agent started (env=%s, use_llm=%s)", s.app_env, s.use_llm)
     try:
         yield
@@ -63,6 +65,7 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestContextMiddleware)
     app.include_router(chat.router)
     app.include_router(ops.router)
+    app.include_router(restock.router)
 
     @app.get("/health", tags=["ops"], summary="健康检查（含依赖就绪状态）")
     async def health() -> dict[str, object]:

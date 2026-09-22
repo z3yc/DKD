@@ -143,6 +143,7 @@ F:\DKD\
 - 表结构变更 → DDL 脚本归档至 `docs/ddl/`，注明执行环境与是否可回滚；
 - Agent 策略/参数变更（预测窗口、服务水平系数）→ 记入决策留痕设计说明，便于复盘归因；
 - **排期/方案变更 → 两份文档（方案、排期）必须同步改版并互相引用版本号**；排期变更需附「可用工日」重新核算（扣除法定假期）。
+- 完成一个功能和计划都要更新排期计划表。方便查看项目执行进度
 
 ---
 
@@ -205,7 +206,7 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 
 1. **密钥永不入库**：
    - 现状（2026-09-21 核实）：`application.yml`/`application-druid.yml`/`dkd-app application-dev.yml` 中的 OSS AK/SK、DeepSeek API Key、DB/Redis 密码、JWT secret **已改为 `${ENV}` 占位符**并新增 `.env.example`（Druid 控制台弱口令亦已占位符化）；
-   - **存量风险现状（2026-09-21 复核修正）**：① 配置外置改造**已提交**（初始提交已重写为 `3e1f4a8`，`main` 与 `origin/main` 的**可达历史中已无明文密钥**）；② 旧提交对象以 **dangling** 形式残留于本地对象库（`git gc` 后消失），且凭据在重写前已进入过版本历史，**轮换仍属必须项**——实测旧 DeepSeek Key 已失效（HTTP 401），OSS AK/SK 与 DB/Redis 密码待轮换；③ JWT secret 已替换为新随机值（原 RuoYi 模板弱密钥 `abcdefghijklmnopqrstuvwxyz` 废弃），**轮换 JWT secret 会使所有在线用户掉线**，生产变更需协调值班窗口；④ 本机开发凭据集中存放于 `.env`（已 gitignore），**禁止把值写回任何入仓文件**；
+   - **存量风险现状（2026-09-21 复核修正）**：① 配置外置改造**已提交**（初始提交已重写为 `3e1f4a8`，`main` 与 `origin/main` 的**可达历史中已无明文密钥**）；② 旧提交对象已按 14c 清理完毕（`git reflog expire --expire=now --all && git gc --prune=now` 后**未可达对象 0、对象库密钥命中 0**）；但凭据在重写前已进入过版本历史，**轮换仍属必须项**——实测旧 DeepSeek Key 已失效（HTTP 401）；`dkd_agent` 库账号已于 2026-09-21 轮换并复测通过（旧口令 1045）；**OSS AK/SK、MySQL/Redis 服务端口令、JWT secret、Druid 口令待轮换**，完整步骤/影响面/回滚见 `docs/security-credential-rotation.md`（14b）；③ JWT secret 已替换为新随机值（原 RuoYi 模板弱密钥 `abcdefghijklmnopqrstuvwxyz` 废弃），**轮换 JWT secret 会使所有在线用户掉线**，生产变更需协调值班窗口；④ 本机开发凭据集中存放于 `.env`（已 gitignore），**禁止把值写回任何入仓文件**；
    - 任何新代码不得延续明文模式；新增密钥一律环境变量/启动参数注入，模板文件（`application-*.example.yml`）写占位符。AI 助手在输出配置示例时必须用 `${OSS_ACCESS_KEY}` 占位，禁止照抄真实值；
 2. **SQL 注入**：MyBatis XML 中 `${}` 仅允许用于排序字段等已白名单化的场景，其余一律 `#{}`；新增任何拼 SQL 代码必须评审；
 3. **Agent 读写分离**（本项目特有，最高优先级）：dkd-agent 对 MySQL 采用**两级授权账号**（建权脚本 `docs/ddl/create_agent_db_user.sql`）：

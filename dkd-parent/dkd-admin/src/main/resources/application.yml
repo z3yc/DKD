@@ -152,3 +152,18 @@ ai:
   api-url: https://api.deepseek.com/chat/completions
   timeout: 60000
   # 例如通义千问: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+# 智能体服务（dkd-agent，方案 §3.3；任务 0-6 网关 / 0-7 回调）
+agent:
+  # 一键降级开关：false 时前端应隐藏对话入口，主业务零影响
+  enabled: true
+  # Python 服务基址（只监听回环/内网，对外一律经本网关）
+  base-url: http://127.0.0.1:8090
+  # 为什么用占位符：AGENTS.md §7.1 凭据不得入仓；必须与 Python 侧 DKD_AGENT_SERVICE_SECRET 一致
+  secret: ${DKD_AGENT_SERVICE_SECRET}
+  # 连接上游超时（毫秒）：本机部署，连不上就快速降级
+  connect-timeout: 2000
+  # 读取上游超时（毫秒）：同时作为 SSE 空闲心跳上限（超过即判上游失联并降级）
+  read-timeout: 120000
+  # 回调路径白名单：未列入的 /agent/callback/** 一律拒绝
+  callback-path-whitelist:
+    - /agent/callback/task

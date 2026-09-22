@@ -8,6 +8,8 @@
         <tags-view v-if="needTagsView" />
       </div>
       <app-main />
+      <!-- AI 助手抽屉常驻布局层：跨页面保留对话上下文（排期任务 0-11） -->
+      <agent-assistant />
       <settings ref="settingRef" />
     </div>
   </div>
@@ -17,6 +19,7 @@
 import { useWindowSize } from '@vueuse/core'
 import Sidebar from './components/Sidebar/index.vue'
 import { AppMain, Navbar, Settings, TagsView } from './components'
+import AgentAssistant from '@/components/AgentAssistant'
 import defaultSettings from '@/settings'
 
 import useAppStore from '@/store/modules/app'

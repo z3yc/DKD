@@ -22,6 +22,13 @@
           <size-select id="size-select" class="right-menu-item hover-effect" />
         </el-tooltip>
       </template>
+      <!-- AI 助手全局入口（排期任务 0-11）：点开右侧抽屉，页面切换不打断对话 -->
+      <el-tooltip content="AI 助手（全局可用）" effect="dark" placement="bottom">
+        <div id="ai-assistant-entry" class="right-menu-item hover-effect ai-entry" @click="agentStore.toggle()">
+          <span class="dot" :class="{ warn: agentStore.degraded }"></span>
+          <span class="ai-entry-text">AI 助手</span>
+        </div>
+      </el-tooltip>
       <div class="avatar-container">
         <el-dropdown @command="handleCommand" class="right-menu-item hover-effect" trigger="click">
           <div class="avatar-wrapper">
@@ -60,10 +67,12 @@ import RuoYiDoc from '@/components/RuoYi/Doc'
 import useAppStore from '@/store/modules/app'
 import useUserStore from '@/store/modules/user'
 import useSettingsStore from '@/store/modules/settings'
+import useAgentStore from '@/store/modules/agent'
 
 const appStore = useAppStore()
 const userStore = useUserStore()
 const settingsStore = useSettingsStore()
+const agentStore = useAgentStore()
 
 function toggleSideBar() {
   appStore.toggleSideBar()
@@ -159,6 +168,31 @@ function setLayout() {
 
         &:hover {
           background: rgba(0, 0, 0, 0.025);
+        }
+      }
+    }
+
+    // AI 助手入口：与原型 V2 顶栏的"AI 助手"按钮一致（渐变圆点 = 在线，橙色 = 降级）
+    .ai-entry {
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 0 10px;
+      color: #409eff;
+
+      .ai-entry-text {
+        font-size: 13px;
+      }
+
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #67c23a;
+
+        &.warn {
+          background: #e6a23c;
         }
       }
     }
