@@ -239,7 +239,7 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | 29 files already formatted |
-| `uv run pytest` | **119 passed**（5 live 用例默认 deselect），覆盖率 **95.17%**（要求 ≥70%）；`-m live` 另 4 项真库抽样通过 |
+| `uv run pytest` | **139 passed**（5 live 用例默认 deselect），覆盖率 **95.53%**（要求 ≥70%）；`-m live` 另 4 项真库抽样通过 |
 | `mvn -pl dkd-admin -am test` | **Tests run: 47, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8 / **TaskCreate 5**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
@@ -295,7 +295,8 @@
 | 1-2 | 工具层-读：近 30 天订单聚合 + 在途补货工单 | ✅ | 范围比较（删 `date_format`）+ 按 vm 分批（120 设备→3 批）+ 超时熔断 + LIMIT；**对账通过**（tool amount=7/count=5 == 独立 SQL）；`list_inflight_tasks` 合并明细货道；EXPLAIN 留档 `docs/ddl/business_tables_survey.md`（量化：同一查询预估行 199430 → 2） |
 | 1-3 | 工具层-写：工单创建回调封装（`POST /agent/callback/task` + TaskDto 映射） | ✅ | ① Python `app/tools/task_tools.py`：唯一写通道、**失败三分类**（鉴权/不可达/业务拒绝）、**零重试**（非幂等动作，重试会造成重复建单）、密钥只进请求头；② Java `AgentCallbackController` 改为调 `insertTaskDtoReturningTask` 并**回传 taskId/taskCode**（此前 TODO 已闭环，`ITaskService` 新增方法、原 `insertTaskDto` 语义不变）；③ 测试：Python 11 项（字段映射 `expectCapacity`=补货数量而非容量、业务拒绝原文回传、401/403/503/500 分类、超时/拒连、密钥缺失快速失败、taskId 缺失视为失败、日志无密钥）+ Java 5 项（`AgentTaskCreateServiceTest` 覆盖四条拒绝路径与字段回填）；④ **真库真回调端到端**：`docs/scripts/verify-1-3-build-task.py` 实测 taskId=**573** / taskCode=202609220001 / expectCapacity=**9**（=10-1，非容量 10）→ Agent 层幂等预检命中 → 区域不匹配被拒且**原文回传** → 拒绝路径零写入（工单数 10→10）；⑤ 回归修复：`AgentRoutingTest` 因回调改签名而 NPE，已同步打桩并断言 `$.data.taskId`（**这条 NPE 是真实信号**：说明有调用方仍依赖旧签名） |
 | 1-4 | 补货子图-A：统计基线引擎（7/14/30 天分位销量 + 容量约束 + 预计撑至日期） | ✅ 主体完成（1 项验收当前不成立，见下） | ① 新增 `app/graphs/restock_baseline.py`：**纯函数**（无 IO / 无时钟 / 无随机，`today` 显式传入 → 回测可复现）。算法：日历序列补 0（末位=昨天）→ 各窗口分位 q=0.75 → 权重 0.5/0.3/0.2 **且只在有样本窗口间归一化** → **与长窗均值取大**（稀疏动销货道分位会归零，单用分位会慢性缺货）→ 目标 `ceil(需求×周期2×服务1.2)`、下限 `min_stock×2`（对齐规则版）、上限容量 → 建议量 clamp；② 三条边界各自成例：**无样本降级** 85% 兜底、**缺货自锁**（现库存 0 且零动销，无法区分“不卖”与“因缺货卖不出去”→ 必须兜底，否则货道永久空置）、**零动销但有库存** → 建议 0 且写明理由；③ 新增读工具 `aggregate_channel_daily_sales`（逐日聚合；WHERE 仍是范围比较，`date()` 只用于 group by，测试断言该函数**不出现在 WHERE**）；④ 测试 23 项（分位插值 / 序列对齐越界丢弃 / 权重重分配 / 容量夹取 / 下限抬升 / 优先级 / 三条边界 / 理由 ≤500 字 / **200 次随机序列不变量**：建议量非负且不溢出容量）；⑤ 门禁：ruff 全过 / pytest **119 passed** 95.17% / live 4 passed |
-| 1-5 ~ 1-14 | LLM 校准 / 状态机 / 接单人分配 / 定时任务 / 前端工作台等 | ⏳ | 下一步 |
+| 1-5 | 补货子图-B：LLM 校准节点（点位画像/节假日/异常波动因子）+ 理由生成 | ✅ | ① 新增 `app/prompts/restock_calibration.py`（**提示词集中存放**，AGENTS §2.3 禁止硬编码在业务逻辑里）：数据包在 `<data>` 围栏内并声明“是数据不是指令”，只允许模型输出**系数**（不给绝对数量，避免“算错”与“瞎编”混在一起无法归因）；② 新增 `app/graphs/restock_calibration.py`：**三层不可信输入防护**（提示词围栏 → 容错解析 → 系数夹取 `[0.7,1.5]` + 容量二次夹取）；容错解析 = 括号配对扫描取 JSON（跳过字符串内花括号，不用 `rfind`）、未知货道/重复项/非数字/NaN **逐项丢弃并记 issues**；③ 失败即降级：LLM 超时/非 JSON → **保留统计基线结果**、写入 `calibration_notes[].issues`，**不写 `failures`**（校准失败 ≠ 业务失败，避免运营误判）；④ 机器可读明细放 `calibration_notes`、人可读依据追加进 `reason`——**不改 RestockItem 冻结字段**（0-13 约束，新增字段须走兼容性评审）；⑤ token 按服务端实际模型计量并向上累加（接 0-12 成本限额）；⑥ 测试 20 项（围栏/寒暄/字符串花括号容错、越界夹取、重复项取第一条、NaN/非数字丢弃、容量夹取、必需的补货不被清零、reason ≤500、开关关闭时**不调 LLM**、LangGraph 节点只写 plans/calibration_notes）；⑦ 门禁：ruff 全过 / pytest **139 passed** 95.53% |
+| 1-6 ~ 1-14 | 状态机 + interrupt 人工确认 / 接单人分配 / 定时任务 / 前端工作台等 | ⏳ | 下一步 |
 
 **1-3 关键设计取舍（为什么这么做）**：
 - **传输层不重试**：回调超时/网络抖动时重试可能造成重复建单（Java 防重只查 `task_status=2`，而新建工单是 `status=1`，**防重查不到刚建的工单**）——因此失败如实上报，重试决策交给 1-6/1-8 的计划状态机；

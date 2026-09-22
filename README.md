@@ -175,7 +175,7 @@ SQLite checkpointer（跨请求恢复 / 重启可读回 / `Last-Event-ID` 断点
 **Java 网关与回调**（`/agent/**` 转发 + 身份头白名单重建 + SSE 逐块中继 + 回调密钥/白名单/限流，纯单测 42 项）；
 **前端 AI 助手侧边栏**（`fetch`+`ReadableStream` SSE 客户端、逐帧渲染、可取消、降级横幅）。
 
-**质量门禁**：Python `pytest` **119 passed / 5 deselected / 覆盖率 95%+**（要求 ≥70%）/ `ruff` 全过；Java `mvn -pl dkd-admin -am test` **42 passed**；
+**质量门禁**：Python `pytest` **139 passed / 5 deselected / 覆盖率 95%+**（要求 ≥70%）/ `ruff` 全过；Java `mvn -pl dkd-admin -am test` **42 passed**；
 前端 `npm run build:prod` exit 0；端到端 `bash docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**（含 SSE 不缓冲实测：51 帧/3.2s，首 delta 距首行 70ms）。
 
 **待办**：Python 侧真 LLM 全链联调（0-15 M1 验收）、前端人工手测（清单见排期 §七之 7）、

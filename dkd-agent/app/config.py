@@ -125,6 +125,25 @@ class Settings(BaseSettings):
         default="7:0.5,14:0.3,30:0.2", validation_alias="DKD_AGENT_RESTOCK_WINDOW_WEIGHTS"
     )
 
+    # --- LLM 校准（Phase 1 / 任务 1-5）---
+    # 开关的意义：DeepSeek 不可用时补货链路必须能退化成“纯统计基线”
+    # （最坏退化为可解释的规则增强版），
+    # 而不是整个定时任务失败（见方案 §8 风险表“LLM 建议质量不达标”的兜底设计）。
+    restock_calibration_enabled: bool = Field(
+        default=True, validation_alias="DKD_AGENT_RESTOCK_CALIBRATION_ENABLED"
+    )
+    # 系数夹取区间：LLM 输出属**不可信输入**（AGENTS §7.6），不能允许它把建议量放大 10 倍或清零
+    restock_calibration_min_factor: float = Field(
+        default=0.7, validation_alias="DKD_AGENT_RESTOCK_CALIBRATION_MIN_FACTOR"
+    )
+    restock_calibration_max_factor: float = Field(
+        default=1.5, validation_alias="DKD_AGENT_RESTOCK_CALIBRATION_MAX_FACTOR"
+    )
+    # 单次请求最多送多少条货道（控制 prompt 体积与 token 成本；超出的分批调用）
+    restock_calibration_batch_size: int = Field(
+        default=20, validation_alias="DKD_AGENT_RESTOCK_CALIBRATION_BATCH_SIZE"
+    )
+
     @property
     def restock_weights(self) -> dict[int, float]:
         """解析 `7:0.5,14:0.3,30:0.2` → {7: 0.5, 14: 0.3, 30: 0.2}。
