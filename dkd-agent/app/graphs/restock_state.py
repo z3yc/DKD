@@ -152,7 +152,9 @@ class RestockPlan(BaseModel):
         return sum(i.suggested_quantity for i in self.items)
 
     def to_task_dto(self, *, assignor_id: int | None = None) -> dict[str, Any]:
-        """映射为 Java `TaskDto`（POST /manage/task 的请求体）。
+        """映射为 Java `TaskDto`（`POST /agent/callback/task` 的请求体）。
+
+        发送端见 `app/tools/task_tools.py`（1-3）。
 
         前置约束（缺失即不可建单，由调用方保证）：
           - `status` 必须已通过状态机卡口；

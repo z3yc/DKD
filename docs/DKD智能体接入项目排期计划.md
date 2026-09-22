@@ -239,8 +239,8 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | 29 files already formatted |
-| `uv run pytest` | **71 passed**（1 live 用例默认 deselect），覆盖率 **93%+**（要求 ≥70%） |
-| `mvn -pl dkd-admin -am test`（**本轮新增**） | **Tests run: 42, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
+| `uv run pytest` | **94 passed**（5 live 用例默认 deselect），覆盖率 **93.84%**（要求 ≥70%） |
+| `mvn -pl dkd-admin -am test` | **Tests run: 47, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8 / **TaskCreate 5**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测 |
@@ -265,7 +265,7 @@
 **6. 风险与未验证项（不隐瞒）**：
 - **前端未做浏览器视觉验证**：Playwright/Chrome 自动化会引入未声明依赖，按 AGENTS §8 以“构建通过 + 手测清单”交付（清单见下）；SSE 增量到达（51 帧/3.2s）已在 HTTP 层证实；
 - **流式为帧级而非 token 级（M1 发现，✅ 已修）**：已改为 `astream(stream_mode=["messages","values"])` 逐 token 下发，实测 13~14 帧 / 首 token 距 meta **545ms** / 末 token 距首 token **487ms**（修复前整段 980ms）；回归锚点 `tests/test_chat_llm_mode.py::test_llm_tokens_arrive_as_multiple_delta_frames`（帧数退化成 1 即失败）；
-- **回调不回传 `taskId/taskCode`**（`insertTaskDto` 只返回影响行数）→ 1-3/1-8 需一并处理，已标 TODO；
+- ~~**回调不回传 `taskId/taskCode`**（`insertTaskDto` 只返回影响行数）~~ → **✅ 1-3 已闭环**：新增 `ITaskService.insertTaskDtoReturningTask`，回传 `data.taskId`/`data.taskCode`；1-8 的幂等对账可直接用；
 - **`X-Agent-Region` 缺省**：当前 schema 无 sys_user → 区域映射（影响仅审计上下文，1-8 按设备区域选人不受影响）；
 - **`@RateLimiter` 的 Redis 依赖**：Redis 不可用时回调用例会失败（fail-closed），属预期行为，未做演练；
 - **0-14b 凭据轮换未做**：旧凭据虽已不在仓库与对象库（14a/14c 已验），但轮换前仍算“已泄露过的凭据”，属上线阻塞项。
@@ -293,7 +293,14 @@
 | --- | --- | --- | --- |
 | 1-1 | 工具层-读：库存 / 货道档案 / 设备 / 点位查询 | ✅ | `app/tools/read_tools.py`：`get_machine_profile` / `list_operating_machines` / `list_channel_stock`；**12 项单测**（SQL 形状、分批、超时、行数上限、白名单拒绝路径）+ **4 项 live 抽样**（真库 3 台设备逐字段核对）；发现并如实暴露”inventory 与 channel 档案 3/3 不一致“ |
 | 1-2 | 工具层-读：近 30 天订单聚合 + 在途补货工单 | ✅ | 范围比较（删 `date_format`）+ 按 vm 分批（120 设备→3 批）+ 超时熔断 + LIMIT；**对账通过**（tool amount=7/count=5 == 独立 SQL）；`list_inflight_tasks` 合并明细货道；EXPLAIN 留档 `docs/ddl/business_tables_survey.md`（量化：同一查询预估行 199430 → 2） |
-| 1-3 ~ 1-14 | 工单回调封装 / 基线引擎 / LLM 校准 / 状态机 / 前端工作台等 | ⏳ | 下一步 |
+| 1-3 | 工具层-写：工单创建回调封装（`POST /agent/callback/task` + TaskDto 映射） | ✅ | ① Python `app/tools/task_tools.py`：唯一写通道、**失败三分类**（鉴权/不可达/业务拒绝）、**零重试**（非幂等动作，重试会造成重复建单）、密钥只进请求头；② Java `AgentCallbackController` 改为调 `insertTaskDtoReturningTask` 并**回传 taskId/taskCode**（此前 TODO 已闭环，`ITaskService` 新增方法、原 `insertTaskDto` 语义不变）；③ 测试：Python 11 项（字段映射 `expectCapacity`=补货数量而非容量、业务拒绝原文回传、401/403/503/500 分类、超时/拒连、密钥缺失快速失败、taskId 缺失视为失败、日志无密钥）+ Java 5 项（`AgentTaskCreateServiceTest` 覆盖四条拒绝路径与字段回填）；④ **真库真回调端到端**：`docs/scripts/verify-1-3-build-task.py` 实测 taskId=**573** / taskCode=202609220001 / expectCapacity=**9**（=10-1，非容量 10）→ Agent 层幂等预检命中 → 区域不匹配被拒且**原文回传** → 拒绝路径零写入（工单数 10→10）；⑤ 回归修复：`AgentRoutingTest` 因回调改签名而 NPE，已同步打桩并断言 `$.data.taskId`（**这条 NPE 是真实信号**：说明有调用方仍依赖旧签名） |
+| 1-4 ~ 1-14 | 基线引擎 / LLM 校准 / 状态机 / 接单人分配 / 定时任务 / 前端工作台等 | ⏳ | 下一步 |
+
+**1-3 关键设计取舍（为什么这么做）**：
+- **传输层不重试**：回调超时/网络抖动时重试可能造成重复建单（Java 防重只查 `task_status=2`，而新建工单是 `status=1`，**防重查不到刚建的工单**）——因此失败如实上报，重试决策交给 1-6/1-8 的计划状态机；
+- **失败分类而非统一异常**：鉴权失败（运维问题，重试无意义）/ 不可达（可稍后重试）/ 业务拒绝（文案要原样给运营看）三者上层反应完全不同，合成一个 `CallbackError` 会逼上层靠字符串猜；
+- **必须同时看 HTTP 状态码与信封 code**：RuoYi 业务失败是 `HTTP 200 + code=500`，只看状态码会把业务拒绝当成功（0-11 前端踩过同一坑）；
+- **回调成功但无 taskId 视为失败**：老版本 Java 会静默返回 None，上层会以为建成 → 显式报错。
 
 **Phase 1 首轮发现（待产品/Java 侧决策，详见勘查记录 §三）**：
 ① **Java 报表 SQL 丢了参数绑定**（`ReportMapper.xml:122-130` 只用 `status >= 1`，未用 `#{status}`/时间窗）→ 现有报表数字与时间窗无关，不能作为对账基准；

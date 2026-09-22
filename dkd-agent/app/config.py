@@ -100,6 +100,11 @@ class Settings(BaseSettings):
     # 订单“销量”口径：事实依据 ReportServiceImpl.java:28 的 ORDER_STATUS_SUCCESS=2
     sales_order_status: int = Field(default=2, validation_alias="DKD_AGENT_SALES_ORDER_STATUS")
 
+    # --- Java 回调（写操作唯一通道，任务 1-3）---
+    # 为什么给 10s：建单是非幂等动作，超时宁可显式失败也不盲目重试
+    # （见 app/tools/task_tools.py）
+    callback_timeout_s: float = Field(default=10.0, validation_alias="DKD_AGENT_CALLBACK_TIMEOUT_S")
+
     @property
     def dsn(self) -> str:
         """SQLAlchemy async DSN。

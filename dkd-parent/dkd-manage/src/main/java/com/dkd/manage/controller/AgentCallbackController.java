@@ -1,6 +1,8 @@
 package com.dkd.manage.controller;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -16,6 +18,7 @@ import com.dkd.common.core.domain.AjaxResult;
 import com.dkd.common.enums.LimitType;
 import com.dkd.common.exception.ServiceException;
 import com.dkd.common.utils.StringUtils;
+import com.dkd.manage.domain.Task;
 import com.dkd.manage.domain.dto.TaskDetailsDto;
 import com.dkd.manage.domain.dto.TaskDto;
 import com.dkd.manage.service.ITaskService;
@@ -63,13 +66,16 @@ public class AgentCallbackController extends BaseController
         validate(taskDto);
         // 注意：回调没有登录用户上下文，因此不设置 assignorId（不伪造创建人）。
         // 工单的创建人语义是“谁下的这单”，Python 侧已有 agent_restock_plan 记录确认人，两边可对账。
-        taskService.insertTaskDto(taskDto);
-        // TODO(dkd-agent 1-3, 2026-09-21): 回传 taskId/taskCode —— insertTaskDto 当前只返回影响行数，
-        // 需服务层改造（返回 Task 实体）或按 task_code 回查；Python 侧幂等与
-        // agent_restock_plan.task_id 回写依赖它，排期任务 1-3/1-8 落地时一并处理。
-        log.info("智能体回调建单成功 innerCode={} assigneeId={} taskType={}", taskDto.getInnerCode(),
-                taskDto.getUserId(), taskDto.getProductTypeId());
-        return AjaxResult.success("工单创建成功");
+        Task created = taskService.insertTaskDtoReturningTask(taskDto);
+        // 为什么回传 taskId/taskCode（排期 1-3）：Python 侧要把工单号回写 agent_restock_plan.task_id，
+        // 并据此实现“重复确认直接返回已建单”的幂等对账；不回传就只能靠猜。
+        Map<String, Object> data = new HashMap<String, Object>();
+        data.put("taskId", created.getTaskId());
+        data.put("taskCode", created.getTaskCode());
+        log.info("智能体回调建单成功 innerCode={} assigneeId={} taskType={} taskId={} taskCode={}",
+                taskDto.getInnerCode(), taskDto.getUserId(), taskDto.getProductTypeId(), created.getTaskId(),
+                created.getTaskCode());
+        return AjaxResult.success("工单创建成功", data);
     }
 
     /**
