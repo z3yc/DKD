@@ -25,6 +25,7 @@
 5. **基础设施实测边界（2026-09-21 核实，不得凭印象假设）**：
    - **业务表全部带 `tb_` 前缀**（`tb_inventory`/`tb_order`/`tb_task`/`tb_task_details`/`tb_inventory_log`/`tb_emp`/`tb_channel`/`tb_vending_machine`/`tb_node`/`tb_region`/`tb_sku`/`tb_job`/`tb_policy`/`tb_partner`/`tb_vm_type`/`tb_sku_class`/`tb_task_type`/`tb_role`/`tb_report`）——写 SQL、搞白名单、建 Agent 工具前先核 `dkd-manage/src/main/resources/mapper/manage/*.xml`；
    - **Redis 为 3.2.100（Microsoft 2016 移植版）**：无模块系统（不支持 RedisJSON/RediSearch）、内核 3.2 < 5.0（无 Streams）、`appendonly no`（仅 RDB）——**不得用它承载 LangGraph checkpointer，也不得用作 Stream 队列**（会话持久化用 SQLite/Postgres saver）；
+   - **本机另有 PostgreSQL 17 服务（`postgresql-x64-17`，5432 已监听；2026-09-23 实测）**：**尚未纳入本期架构**，仅作为 LangGraph checkpointer / 向量检索的候选后端（评审稿 `docs/dkd-agent-postgres-selection-review.md`，D1~D5 待拍板）。**评审通过前任何代码路径不得依赖 PG**，也不得把 `agent_*` 表迁过去；
    - **数据源只有单主库**（`application-druid.yml` 中 `slave.enabled: false`）：任何批量聚合/分析类查询必须限定时间窗口 + 分批 + 超时熔断，禁止无 LIMIT 的全表扫描；
    - **存量业务表 DDL 未入库**（`dkd-parent/sql/` 只有 RuoYi 系统表、quartz、`tb_report.sql`），涉及表结构工作时需先导出归档至 `docs/ddl/`。
 
@@ -311,4 +312,4 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 
 ---
 
-*版本：V1.1（2026-09-21）。本次回写（§9.4）：① 修正业务表前缀为 `tb_`（§1 约束 5、§2.4，原描述“业务表无前缀”与实际不符）；② 新增§1 约束 5「基础设施实测边界」（Redis 3.2.100 不可作 checkpointer/Stream、单主库无从库、存量 DDL 未入库）；③ §7.1 更新密钥现状为“已占位符化但未提交 + Git 历史含密钥需轮换清理”；④ §4.3 新增排期/方案同步义务。本文档随项目推进持续修订：AI 协作中发现的规范缺口按 §9.4 回写；dkd-agent 建成后在 §2.3/§6.3 补充实例。**2026-09-23 二次回写（§9.4）**：§8 dkd-agent 行补「测试不许真连数据库通道」的纪律——1-7b 开发中实测到「未注入假写入器的失败用例仍向本机 `agent_decision_log` 写入了 2 行」。*
+*版本：V1.1（2026-09-21）。本次回写（§9.4）：① 修正业务表前缀为 `tb_`（§1 约束 5、§2.4，原描述“业务表无前缀”与实际不符）；② 新增§1 约束 5「基础设施实测边界」（Redis 3.2.100 不可作 checkpointer/Stream、单主库无从库、存量 DDL 未入库）；③ §7.1 更新密钥现状为“已占位符化但未提交 + Git 历史含密钥需轮换清理”；④ §4.3 新增排期/方案同步义务。本文档随项目推进持续修订：AI 协作中发现的规范缺口按 §9.4 回写；dkd-agent 建成后在 §2.3/§6.3 补充实例。**2026-09-23 二次回写（§9.4）**：§8 dkd-agent 行补「测试不许真连数据库通道」的纪律——1-7b 开发中实测到「未注入假写入器的失败用例仍向本机 `agent_decision_log` 写入了 2 行」；§1 约束 5 补「本机已有 PG 17 服务，但未纳入本期架构」的实测边界（评审稿 `docs/dkd-agent-postgres-selection-review.md`）。*

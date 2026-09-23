@@ -119,7 +119,7 @@ dkd-quartz 06:00 ──▶ dkd-agent:8090 【决策层/编排层】
 | 编排框架 | **LangGraph（Supervisor）** | 有状态多 Agent、`interrupt()` 原生 HITL、checkpointer、`astream` | 纯 LangChain AgentExecutor（多轮中断恢复弱）、自研状态机（等于重写一遍）、Dify/Coze（见 §4.4） |
 | LLM 接入 | **langchain-openai → DeepSeek** | 与现有 `ai.api-url` 同账号，零迁移；OpenAI 兼容 → 可切通义千问，只改配置 | 直接写 httpx（丢结构化/工具/流式封装）、各家原生 SDK（换供应商要改代码） |
 | 结构化输出 | **Pydantic** | 补货清单/诊断结论强约束；字段对齐现有 `RestockSuggestionDto`，前端可复用渲染 | 让 LLM 直接吐自然语言（前端无法渲染为可操作列表） |
-| 会话持久化 | **SQLite `AsyncSqliteSaver`** | 单机部署形态匹配、零新增基础设施、文件可备份 | Redis（本机 3.2 不可用）、Postgres（当期无 PG，留作演进） |
+| 会话持久化 | **SQLite `AsyncSqliteSaver`** | 单机部署形态匹配、零新增基础设施、文件可备份 | Redis（本机 3.2 不可用）、Postgres（**本机已有 PG 17，但未纳入本期架构**——评审稿见 `docs/dkd-agent-postgres-selection-review.md`） |
 | 数据访问 | **SQLAlchemy 2.x async + aiomysql** | ORM/Core 双模式，能写带白名单校验的聚合查询 | 裸 pymysql（无类型/连接池）、同步驱动（阻塞 event loop） |
 | 依赖管理 | **uv** | 一条命令装好 Python 3.11（方案要求 3.11+ 而本机只有 3.10）、`uv.lock` 精确锁定 | 系统 venv + requirements.txt（锁不住传递依赖；本机 PATH 有 4 个 Python，易踩错版本） |
 | 观测 | 结构化 JSON 日志 + **决策留痕表** + LangSmith（可选） | 留痕是审计要求，不是可选项；LangSmith 只做开发期 trace | 只用 logging（无法回答"AI 为什么这么建单"） |
@@ -491,7 +491,7 @@ LangGraph checkpointer，当前用 SQLite（单机形态匹配、零新增基础
 | 方案 | 形态 | 优点 | 代价/风险 | 适配本项目 |
 | --- | --- | --- | --- | --- |
 | **sqlite-vec** | SQLite 扩展（纯 C） | 零运维、单文件、跨平台；**本机依赖树里已有**（随 `langgraph-checkpoint-sqlite` 一并装了 `sqlite-vec`）；可复用现有 checkpoint 文件思路 | 能力边界在万~十万级；无服务化/多实例；生态较新 | ⭐ 首期最省事（≤10 万条） |
-| **pgvector** | PostgreSQL 扩展 | 与 MySQL 同级成熟度；**HNSW/IVFFlat 索引 + SQL 过滤 + 事务**；社区极大；还能**顺手当 LangGraph checkpointer（Postgres saver）** | 引入第二种数据库（备份/监控/权限/主从都要加一套）；本机与团队当前无 PG 经验 | ⭐⭐ 若愿意引入 PG，**一步到位**解决 checkpoint + 向量两件事 |
+| **pgvector** | PostgreSQL 扩展 | 与 MySQL 同级成熟度；**HNSW/IVFFlat 索引 + SQL 过滤 + 事务**；社区极大；还能**顺手当 LangGraph checkpointer（Postgres saver）** | 引入第二种数据库（备份/监控/权限/主从都要加一套）；**本机已有 PG 17 服务，但团队在本项目中无 PG 运维经验** | ⭐⭐ 若愿意引入 PG，**一步到位**解决 checkpoint + 向量两件事 |
 | **Milvus** | 分布式向量库 | 十亿级、多索引类型（HNSW/IVF/DiskANN）、GPU、标量过滤、生态成熟 | **运维最重**：完整部署需 etcd + 对象存储（MinIO）+ 消息队列（Pulsar/Kafka）；standalone 也需多容器；Windows 不友好（本项目开发机是 Windows） | ❌ 本阶段不合适（量级差 3~4 个数量级） |
 | **Qdrant** | Rust 单二进制/容器 | 比 Milvus 轻得多；过滤强；支持稀疏向量做混合检索；量化省内存 | 仍需独立服务 + 持久化盘；<10 万条属杀鸡用牛刀 | 🔸 中期候选（若向量检索成为核心能力） |
 | **Elasticsearch / OpenSearch** | 搜索平台 | **BM25 + kNN 混合检索**开箱即用，天然适合"关键词 + 语义"双路召回；若团队已有 ES 可直接复用 | 资源占用大（JVM 堆）；本项目当前**没有** ES | 🔸 若将来日志/搜索也要 ES，可合并考虑 |
@@ -499,6 +499,8 @@ LangGraph checkpointer，当前用 SQLite（单机形态匹配、零新增基础
 | **云托管**（百炼/向量检索服务、Zilliz Cloud 等） | SaaS | 人力成本最低、能力最全、免运维 | 数据出内网需合规评估；长期成本随量增长；锁定风险 | 🔸 若团队人手是硬约束，可作为试点 |
 
 > 版本与能力细节请以选型时的官方文档为准（本文数字为量级判断，不作为承诺）。
+>
+> **2026-09-23 实测更正**：本机已有 **PostgreSQL 17** 服务在运行（`postgresql-x64-17`，5432 已监听），上文“无 PG 经验”只对**团队经验**成立，不对**环境可得性**成立；PG 是否纳入本期架构已单独出评审稿（三层拆解 + D1~D5 决策点）：`docs/dkd-agent-postgres-selection-review.md`。另：本机已随 SQLite checkpoint 依赖装了 `sqlite-vec 0.1.9`，≤10 万条可零新增组件。
 
 ### 9.3 分阶段建议（写死触发条件，避免"拍脑袋升级"）
 
