@@ -5,9 +5,11 @@ spring:
         driverClassName: com.mysql.cj.jdbc.Driver
         druid:
             # 主库数据源
+            # 为什么 host/库名/用户名也做成占位符：容器部署下 MySQL 在另一个容器（服务名 mysql），
+            # 写死 localhost/root 会导致容器里根本连不上；带默认值的写法保证本机运行行为不变
             master:
-                url: jdbc:mysql://localhost:3306/dkd?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8&allowMultiQueries=true
-                username: root
+                url: jdbc:mysql://${DKD_DB_HOST:localhost}:${DKD_DB_PORT:3306}/${DKD_DB_NAME:dkd}?useUnicode=true&characterEncoding=utf8&zeroDateTimeBehavior=convertToNull&useSSL=true&serverTimezone=GMT%2B8&allowMultiQueries=true
+                username: ${DKD_DB_USERNAME:root}
                 # 为什么用占位符：AGENTS.md §7.1 安全红线——DB 密码禁止明文入库，由环境变量注入
                 password: ${DKD_DB_PASSWORD}
             # 从库数据源

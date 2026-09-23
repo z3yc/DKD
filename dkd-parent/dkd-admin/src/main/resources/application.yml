@@ -67,10 +67,10 @@ spring:
       enabled: true
   # redis 配置
   redis:
-    # 地址
-    host: localhost
+    # 地址（容器部署时注入服务名，如 redis）
+    host: ${DKD_REDIS_HOST:localhost}
     # 端口，默认为6379
-    port: 6379
+    port: ${DKD_REDIS_PORT:6379}
     # 数据库索引
     database: 0
     # 密码
@@ -154,10 +154,11 @@ ai:
   # 例如通义千问: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
 # 智能体服务（dkd-agent，方案 §3.3；任务 0-6 网关 / 0-7 回调）
 agent:
-  # 一键降级开关：false 时前端应隐藏对话入口，主业务零影响
-  enabled: true
+  # 一键降级开关：false 时前端应隐藏对话入口，主业务零影响（容器部署可由环境变量注入）
+  enabled: ${DKD_AGENT_ENABLED:true}
   # Python 服务基址（只监听回环/内网，对外一律经本网关）
-  base-url: http://127.0.0.1:8090
+  # 容器部署下应指向容器名（如 http://dkd-agent:8090）；默认值保持本机行为不变
+  base-url: ${DKD_AGENT_BASE_URL:http://127.0.0.1:8090}
   # 为什么用占位符：AGENTS.md §7.1 凭据不得入仓；必须与 Python 侧 DKD_AGENT_SERVICE_SECRET 一致
   secret: ${DKD_AGENT_SERVICE_SECRET}
   # 连接上游超时（毫秒）：本机部署，连不上就快速降级
