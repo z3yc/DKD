@@ -1,0 +1,18 @@
+# ============================================================================
+# 换行符策略（部署相关，不是风格偏好）
+#
+# 为什么必须有这个文件：服务器是 Linux，而本仓库的主开发机是 Windows。
+# 若 shell 脚本被检出成 CRLF，Linux 上执行会报
+#   `bash: ./deploy.sh: /usr/bin/env: bad interpreter: No such file or directory`
+# （报错信息完全看不出是换行符问题，是部署时最费时间的一类坑）。
+# 因此所有脚本与 Docker 相关文本强制 LF；Windows 批处理才用 CRLF。
+# ============================================================================
+*.sh                text eol=lf
+Dockerfile          text eol=lf
+*.conf              text eol=lf
+*.yml               text eol=lf
+*.yaml              text eol=lf
+docker-compose*.yml text eol=lf
+.env.deploy.example text eol=lf
+*.bat               text eol=crlf
+*.cmd               text eol=crlf

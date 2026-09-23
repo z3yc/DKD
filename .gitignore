@@ -48,3 +48,11 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---- Docker 部署（deploy/docker）----
+# 部署真值文件：与根 .env 同级敏感（含 DB/Redis/JWT/OSS/DeepSeek 凭据），永不入仓（AGENTS §7.1）
+deploy/docker/.env.deploy
+# 外部数据库模式下由 setup-agent-db.sh 生成的授权 SQL（内含明文口令，交给 DBA 执行后应删除）
+deploy/docker/.agent-db-grants.generated.sql
+# 备份产物（含全库数据）
+deploy/docker/backups/

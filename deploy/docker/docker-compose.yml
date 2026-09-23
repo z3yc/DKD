@@ -1,0 +1,163 @@
+# ============================================================================
+# DKD 平台 · 应用栈（管理后台 / 智能体 / 前端；运维移动端可选）
+#
+# 两种跑法（详见 README.md §3）：
+#   ① 单机自带 DB/Redis：docker compose -f docker-compose.infra.yml -f docker-compose.yml up -d
+#   ② 用外部 DB/Redis：  docker compose -f docker-compose.yml up -d
+#      （改 .env.deploy 里的 DKD_DB_HOST / DKD_REDIS_HOST 指到外部实例）
+#
+# 为什么 depends_on 带 `required: false`：跑法②里 mysql/redis 服务**不存在**，
+# 不加这个开关 compose 会直接报 “depends on undefined service” —— 部署脚本里加不加
+# infra 文件就都会失败，这是最容易在换环境时踩的坑。
+# ============================================================================
+name: dkd
+
+services:
+  # --------------------------------------------------------------------------
+  # 管理后台（Java 8 / Spring Boot）：业务事实唯一所有者，端口 8080
+  # --------------------------------------------------------------------------
+  dkd-admin:
+    build:
+      context: ../../dkd-parent
+      dockerfile: Dockerfile
+      args:
+        MAVEN_MIRROR: ${MAVEN_MIRROR:-}
+    image: dkd/dkd-admin:${DKD_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      TZ: ${DKD_TZ:-Asia/Shanghai}
+      # --- MySQL（application-druid.yml 的占位符；用户名/地址已改为可注入）---
+      DKD_DB_HOST: ${DKD_DB_HOST:-mysql}
+      DKD_DB_PORT: ${DKD_DB_PORT:-3306}
+      DKD_DB_NAME: ${DKD_DB_NAME:-dkd}
+      DKD_DB_USERNAME: ${DKD_DB_USERNAME:-root}
+      DKD_DB_PASSWORD: ${DKD_DB_PASSWORD:?请在 .env.deploy 里设置 DKD_DB_PASSWORD}
+      DKD_DRUID_PASSWORD: ${DKD_DRUID_PASSWORD:?请在 .env.deploy 里设置 DKD_DRUID_PASSWORD}
+      # --- Redis（只服务 Java：令牌/验证码。智能体不使用 Redis，见排期 FIX-14）---
+      DKD_REDIS_HOST: ${DKD_REDIS_HOST:-redis}
+      DKD_REDIS_PORT: ${DKD_REDIS_PORT:-6379}
+      DKD_REDIS_PASSWORD: ${DKD_REDIS_PASSWORD:?请在 .env.deploy 里设置 DKD_REDIS_PASSWORD}
+      # --- 应用安全 / 第三方（AGENTS §7.1：一律环境变量注入，不入库不入镜像）---
+      DKD_JWT_SECRET: ${DKD_JWT_SECRET:?请在 .env.deploy 里设置 DKD_JWT_SECRET}
+      DKD_OSS_ACCESS_KEY: ${DKD_OSS_ACCESS_KEY:?请在 .env.deploy 里设置 DKD_OSS_ACCESS_KEY}
+      DKD_OSS_SECRET_KEY: ${DKD_OSS_SECRET_KEY:?请在 .env.deploy 里设置 DKD_OSS_SECRET_KEY}
+      DKD_DEEPSEEK_API_KEY: ${DKD_DEEPSEEK_API_KEY:?请在 .env.deploy 里设置 DKD_DEEPSEEK_API_KEY}
+      # --- 智能体网关/回调：两端密钥必须逐字一致（Java AgentProperties.secret ↔ Python DKD_AGENT_SERVICE_SECRET）---
+      DKD_AGENT_SERVICE_SECRET: ${DKD_AGENT_SERVICE_SECRET:?请在 .env.deploy 里设置 DKD_AGENT_SERVICE_SECRET}
+      DKD_AGENT_ENABLED: ${DKD_AGENT_ENABLED:-true}
+      # 容器网络内按服务名互通；不再依赖 127.0.0.1:8090（原 yml 写死，容器里连不上自己）
+      DKD_AGENT_BASE_URL: ${DKD_AGENT_BASE_URL:-http://dkd-agent:8090}
+      JAVA_OPTS: ${DKD_ADMIN_JAVA_OPTS:--Xms512m -Xmx1024m}
+    ports:
+      # 只绑回环：给排查/SSH 隧道用；对外一律走 web 的 /prod-api 反代
+      - "127.0.0.1:${DKD_ADMIN_PUBLISH_PORT:-18080}:8080"
+    volumes:
+      - admin_logs:/app/logs
+    # 注意：这里**不能**写对 mysql/redis 的 depends_on。
+    #   `depends_on` 引用的服务必须存在，而外部数据库模式下本文件会单独执行
+    #   （此时 mysql/redis 未定义 → compose 直接报 “depends on undefined service”，项目起不来）。
+    #   实测 `required: false`（Compose 2.20+ 特性）在本机 compose 上不生效，故改用
+    #   “把跨文件依赖写在 docker-compose.infra.yml 里”的方式（见该文件末尾说明）。
+    #   无论哪种模式，deploy.sh 都会先等 infra healthy 再起应用。
+    networks: [dkd-net]
+
+  # --------------------------------------------------------------------------
+  # 智能体服务（Python 3.11 / FastAPI / LangGraph）
+  #   ⚠️ 不发布任何宿主机端口：它信任 X-Agent-* 头，只能由 Java 网关内网访问（AGENTS §7.5）
+  # --------------------------------------------------------------------------
+  dkd-agent:
+    build:
+      context: ../../dkd-agent
+      dockerfile: Dockerfile
+      args:
+        UV_INDEX_URL: ${UV_INDEX_URL:-}
+    image: dkd/dkd-agent:${DKD_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      TZ: ${DKD_TZ:-Asia/Shanghai}
+      DKD_AGENT_ENV: ${DKD_AGENT_ENV:-prod}
+      DKD_AGENT_SERVICE_SECRET: ${DKD_AGENT_SERVICE_SECRET:?请在 .env.deploy 里设置 DKD_AGENT_SERVICE_SECRET}
+      # 只读账号：授权由 scripts/setup-agent-db.sh 按 docs/ddl/create_agent_db_user.sql 落库
+      DKD_AGENT_DB_HOST: ${DKD_AGENT_DB_HOST:-mysql}
+      DKD_AGENT_DB_PORT: ${DKD_AGENT_DB_PORT:-3306}
+      DKD_AGENT_DB_NAME: ${DKD_AGENT_DB_NAME:-dkd}
+      DKD_AGENT_DB_USER: ${DKD_AGENT_DB_USER:-dkd_agent}
+      DKD_AGENT_DB_PASSWORD: ${DKD_AGENT_DB_PASSWORD:?请在 .env.deploy 里设置 DKD_AGENT_DB_PASSWORD}
+      # SQLite checkpoint 落在卷里；容器重建不能丢会话（0-10 / 排期 FIX-14 的运维要求）
+      DKD_AGENT_SQLITE_PATH: /app/var/checkpoints.db
+      DKD_AGENT_JAVA_BASE_URL: http://dkd-admin:8080
+      DKD_AGENT_USE_LLM: ${DKD_AGENT_USE_LLM:-1}
+      DKD_AGENT_AUDIT_ENABLED: ${DKD_AGENT_AUDIT_ENABLED:-1}
+      DKD_DEEPSEEK_API_KEY: ${DKD_DEEPSEEK_API_KEY:?请在 .env.deploy 里设置 DKD_DEEPSEEK_API_KEY}
+      DKD_AGENT_TOKEN_LIMIT_PER_USER: ${DKD_AGENT_TOKEN_LIMIT_PER_USER:-200000}
+      DKD_AGENT_TOKEN_LIMIT_GLOBAL: ${DKD_AGENT_TOKEN_LIMIT_GLOBAL:-2000000}
+    volumes:
+      - agent_var:/app/var
+    networks: [dkd-net]
+
+  # --------------------------------------------------------------------------
+  # 管理前端（Vue 静态站 + /prod-api 反代）
+  # --------------------------------------------------------------------------
+  web:
+    build:
+      context: ../../dkd-vue
+      dockerfile: Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+    image: dkd/dkd-web:${DKD_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      TZ: ${DKD_TZ:-Asia/Shanghai}
+    ports:
+      - "${DKD_HTTP_PORT:-80}:80"
+    volumes:
+      # 站点/反代配置外挂：改 SSE 超时、上传大小等不需要重建镜像
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      dkd-admin:
+        condition: service_healthy
+    networks: [dkd-net]
+
+  # --------------------------------------------------------------------------
+  # 运维移动端（dkd-app，端口 9070）—— 默认不启动：docker compose --profile mobile up -d
+  #   为什么默认关：M2 验收（1-13）尚需它与真实设备/账号联调，未就绪前不必占用服务器
+  # --------------------------------------------------------------------------
+  dkd-app:
+    profiles: ["mobile"]
+    build:
+      context: ../../dkd-app
+      dockerfile: Dockerfile
+      args:
+        MAVEN_MIRROR: ${MAVEN_MIRROR:-}
+    image: dkd/dkd-app:${DKD_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      TZ: ${DKD_TZ:-Asia/Shanghai}
+      JAVA_OPTS: ${DKD_APP_JAVA_OPTS:--Xms256m -Xmx512m}
+      # 该应用的属性名是 dkd.datasource.*（application-dev.yml）。
+      # Spring 的 SystemEnvironmentPropertySource 会把 DKD_DATASOURCE_HOST 映射到 dkd.datasource.host，
+      # 因此无需改它的 yml —— 沿用仓库现有写法，避免为部署改业务模块配置。
+      DKD_DATASOURCE_HOST: ${DKD_DB_HOST:-mysql}
+      DKD_DATASOURCE_PORT: ${DKD_DB_PORT:-3306}
+      DKD_DATASOURCE_DATABASE: ${DKD_DB_NAME:-dkd}
+      DKD_DATASOURCE_USERNAME: ${DKD_DB_USERNAME:-root}
+      DKD_DATASOURCE_PASSWORD: ${DKD_DB_PASSWORD:?请在 .env.deploy 里设置 DKD_DB_PASSWORD}
+      DKD_REDIS_HOST: ${DKD_REDIS_HOST:-redis}
+      DKD_REDIS_PORT: ${DKD_REDIS_PORT:-6379}
+      DKD_REDIS_PASSWORD: ${DKD_REDIS_PASSWORD:?请在 .env.deploy 里设置 DKD_REDIS_PASSWORD}
+    ports:
+      - "${DKD_APP_PORT:-9070}:9070"
+    volumes:
+      - app_logs:/app/logs
+    networks: [dkd-net]
+
+networks:
+  # 显式固定网络名：两个 compose 文件分别单独执行时也要落到同一张网
+  dkd-net:
+    name: dkd-net
+    driver: bridge
+
+volumes:
+  admin_logs:
+  agent_var:
+  app_logs:

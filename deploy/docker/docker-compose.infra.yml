@@ -1,0 +1,120 @@
+# ============================================================================
+# 自建基础设施（MySQL 8 / Redis 7）——单机服务器场景
+#
+# 与 docker-compose.yml 组合使用（顺序无关）：
+#   docker compose -f docker-compose.infra.yml -f docker-compose.yml up -d
+# 用外部托管数据库时**不要**带本文件。
+#
+# ⚠️ 这里没有 PostgreSQL：PG 只是候选后端（checkpointer/向量），评审未通过前
+#    任何代码路径不得依赖它，见 docs/dkd-agent-postgres-selection-review.md（AGENTS §1 约束 5）。
+# ⚠️ 这里也没有独立的智能体数据库：agent_* 五张表按排期决策留在业务库 dkd 内
+#    （搬运会让 3-7 审计页的 RuoYi/MySQL 数据通路失效），授权由
+#    scripts/setup-agent-db.sh 按 docs/ddl/create_agent_db_user.sql 落库（两级授权）。
+# ============================================================================
+name: dkd
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    command:
+      # 与仓库 AGENTS §1「业务表全部 tb_ 前缀 + 单主库」一致的服务端参数；
+      # utf8mb4 全链路（智能体留痕会存中文与手机号掩码，字符集不统一会截断）
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --default-time-zone=+08:00
+      - --max-connections=300
+      - --innodb-buffer-pool-size=512M
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DKD_DB_PASSWORD:?请在 .env.deploy 里设置 DKD_DB_PASSWORD}
+      MYSQL_DATABASE: ${DKD_DB_NAME:-dkd}
+      TZ: ${DKD_TZ:-Asia/Shanghai}
+    ports:
+      # 只绑回环：导入 dump / 排查请走 SSH 隧道（ssh -L 3306:127.0.0.1:3306 ...），
+      # 不要把 3306 直接暴露到公网——这是最常见的拖库入口。
+      - "127.0.0.1:${DKD_DB_PUBLISH_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 首次初始化（数据卷为空）时按文件名顺序执行：
+      #   01 -> RuoYi 系统表 + quartz + tb_report；02 -> agent_* 自有表
+      #   业务表（tb_inventory/tb_order/tb_task/...）DDL 不在仓库里，必须人工导入现网 dump（README §4）
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - ../../dkd-parent/sql:/sql:ro
+      - ../../docs/ddl:/ddl:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    networks: [dkd-net]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      # requirepass：AGENTS §7.1，禁止无口令实例
+      - redis-server
+      - --requirepass
+      - ${DKD_REDIS_PASSWORD:?请在 .env.deploy 里设置 DKD_REDIS_PASSWORD}
+      # appendonly yes：RuoYi 的令牌/在线用户状态丢了会踢人，属可容忍但不该每日发生
+      - --appendonly
+      - "yes"
+      # 本地开发库那台 Redis 没设 maxmemory（可与 Java 互挤）；这里显式设上限 + noeviction：
+      # noeviction 让「写满」变成显式报错而不是静默丢键（静默丢键会表现为“随机掉线”）
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    environment:
+      # 只供上面的 healthcheck 用（Redis 本身的口令走 command 的 --requirepass）
+      REDIS_PASSWORD: ${DKD_REDIS_PASSWORD:?请在 .env.deploy 里设置 DKD_REDIS_PASSWORD}
+      TZ: ${DKD_TZ:-Asia/Shanghai}
+    networks: [dkd-net]
+
+  # ==========================================================================
+  # 跨文件 depends_on —— 为什么写在基础设施文件里
+  #
+  # compose 只允许 depends_on 引用**已定义**的服务。而 docker-compose.yml 可能被单独执行
+  # （外部数据库模式，此时 mysql/redis 不存在），在里面写 depends_on 会让那种模式直接启动失败；
+  # 本机实测 `required: false`（Compose 2.20+ 的特性）不生效，因此改用多文件合并：
+  #   · 带上本文件时，下面这些依赖才生效（compose 会把两份定义合并到同一个服务上）；
+  #   · 不带本文件时，应用栈没有任何对 mysql/redis 的依赖声明，可以正常起（连外部库）。
+  # 语义等价于“有自建库时等库就绪再起应用”，且不破坏外部库模式。
+  # 注意：本段必须在 services: 之下（上面那种“放到 networks 之后”的写法会被当成网络配置项）。
+  # ==========================================================================
+  dkd-admin:
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dkd-agent:
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  dkd-app:
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+networks:
+  dkd-net:
+    name: dkd-net
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data:
