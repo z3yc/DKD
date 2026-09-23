@@ -393,6 +393,19 @@
    ② 生产是否允许新增 DB 引擎、是否已有 PG 实例。**D5 未闭环前不得进入编码**（否则只能写出本机能跑的实现）；
    决策结论会同时决定 FIX-14 的关闭方式（换 PG saver 或升级 Redis 8.0+）。
 
+### 2026-09-23 补记（V2.7 · Docker 部署栈提前交付）
+
+- **交付**：`deploy/docker/`（compose×2、`.env.deploy.example`、`deploy.sh`、`initdb/`、`nginx/default.conf`、`scripts/` 五个脚本）+ 四个镜像构建文件（`dkd-parent/Dockerfile`、`dkd-app/Dockerfile`、`dkd-vue/Dockerfile`、`dkd-agent/Dockerfile`）+ 根 `.gitattributes`（`*.sh` 强制 LF）。
+- **为容器化必须改的 3 处配置**（不改业务逻辑，带默认值所以本机行为不变）：
+  ① `application-druid.yml` 的 DB url/用户名、`application.yml` 的 Redis host/port 写死 `localhost`；
+  ② `agent.base-url` 写死 `http://127.0.0.1:8090` → 改为 `${DKD_AGENT_BASE_URL:...}`（容器里 agent 的名字是服务名）；`agent.enabled` 占位符化（一键降级可由环境变量驱动）。
+- **容器化暴露出的两个真实障碍**（已写进部署手册，不是“打完包就完事”）：
+  ① `docs/ddl/create_agent_db_user.sql` 只授 `@'127.0.0.1'`/`@'localhost'` —— 容器里 agent 的 127.0.0.1 是它自己，**不改 host 模式会直接 1045**；部署脚本改为运行时改写 host 后执行（白名单仍只有一处真相）。
+  ② **业务表 DDL 未入库（FIX-6）在部署场景下变成硬阻断**：自动初始化只能建出 RuoYi 系统表 + `agent_*`，业务表必须导入现网 dump（已提供 `import-business-dump.sh`）。
+- **验证（实跑）**：8 个 `.sh` 过 `bash -n`；`docker compose config` 三种组合均解析通过（含 infra / 仅应用栈（模拟外部库）/ 文件顺序反转），跨文件 `depends_on` 合并生效（**实测本机 compose 不支持 `required: false`**，故改用多文件合并写法）；本机重启后端加载新配置后跑 `g1-gateway-smoke.sh` **14/14 PASS**（保留 Python，跳过停机项），并实测 `DKD_AGENT_ENABLED=false` → `/agent/status` `enabled:false,upstream:down`、去掉后回到 `enabled:true,upstream:up`。
+- **未验证（不隐矞）**：真实 `docker build`/`up` 与 MySQL `initdb` 首次初始化未跑（本机 Docker 守护进程不可用：手动拉起 Docker Desktop 约 7 分钟仍不就绪）；Docker Hub 基础镜像 tag **未经拉取验证**（registry 查询被网络拦），已在手册 §9 给出备选 tag。
+- **与排期的关系**：本项**部分完成 4-1（部署 runbook）**，但**不改变** 4-1/4-2 的完成判定（上线评审与灰度演练仍未做）；启用前建讧先在本机或测试服务器跑一遍手册 §3 的分步流程。
+
 ### 2026-09-23 补记（V2.6 · PG 选型评审稿登记）
 
 - **新增评审输入**：`docs/dkd-agent-postgres-selection-review.md`（V0.1）。把“智能体知识库换 PG”拆成**三层**分别评估：
@@ -437,7 +450,9 @@
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.1）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。*
 
-*版本：**V2.6（2026-09-23，新增 PG 选型评审稿待评审）**。本次变更：① 新增 `docs/dkd-agent-postgres-selection-review.md`（V0.1：三层拆解 + A/B/C 方案 + D1~D5 决策点 + 测试策略取舍）；② §八 FIX-14 关联该评审稿；③ 「阻塞与待办需求」新增第 9 项（D5 为硬前置）；④ 补记更正复盘稿「当期无 PG」的错前提。**未写任何 PG 代码、未改依赖，故方案保持 V1.1**；若 D1 通过（引入 PG），方案 §5.1 与 AGENTS §1 约束 5 必须同步改版并互相引用版本号。*
+*版本：**V2.7（2026-09-23，Docker 部署栈提前交付）**。本次变更：① 新增 `deploy/docker/` 全套部署脚本与四个 Dockerfile（详见补记）；② 为容器化把 DB/Redis/agent 地址改为带默认值的占位符（本机行为不变）；③ 实测并登记两个容器化障碍（agent 账号 host 模式、业务表 DDL 缺失在部署场景下成为硬阻断）；④ 记录未验证项（真实构建/镜像 tag）。**方案口径未变（仍 V1.1）**；若部署脚本在真实服务器上验证后需要调整运行时形态（如引入非 root 运行/HTTPS），届时按 §4.3 同步方案 §5.1 与 runbook。*
+
+*上一版 **V2.6（2026-09-23，新增 PG 选型评审稿待评审）**。本次变更：① 新增 `docs/dkd-agent-postgres-selection-review.md`（V0.1：三层拆解 + A/B/C 方案 + D1~D5 决策点 + 测试策略取舍）；② §八 FIX-14 关联该评审稿；③ 「阻塞与待办需求」新增第 9 项（D5 为硬前置）；④ 补记更正复盘稿「当期无 PG」的错前提。**未写任何 PG 代码、未改依赖，故方案保持 V1.1**；若 D1 通过（引入 PG），方案 §5.1 与 AGENTS §1 约束 5 必须同步改版并互相引用版本号。*
 
 *上一版 **V2.5（2026-09-23，任务 1-7b / FIX-2 决策留痕闭环）**。本次变更：① §七 Phase 1 表新增 1-7b 完成行（证据 + 五条设计取舍），1-8 行补 Java FIX-1 修正位置；② §八 FIX-2 关闭、FIX-1 降级为「Java 侧已修（待真机验收）」，标题计数改为「已关闭 3 / 待修 15」；③ 质量门禁更新为实测值（pytest 258 passed / 94.91%、mvn 48 passed、verify-1-7 31/31）。**不改变方案口径，故方案保持 V1.1**（留痕义务本就是 AGENTS §6.3 的既有要求，本轮是补齐落地，不是新增约定）。*
 
