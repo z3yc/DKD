@@ -2,6 +2,13 @@
 -- agent_restock_plan.status 注释变更 · 新增取值 7-建单中（排期任务 1-8）
 -- 归档：docs/ddl/agent_restock_plan_status_ordering.sql   创建日期：2026-09-21
 -- 执行环境：本机 dkd 库（MySQL 8.0）；生产需按 AGENTS §8 走 DDL 评审 + 低峰执行
+-- 执行记录：2026-09-21 本机 dkd 库执行成功（账号 root —— dkd_agent 只读账号按 §7.3 不授 DDL；
+--   客户端 --default-character-set=utf8mb4，避免中文注释被 Windows 终端代码页写坏）。
+--   执行前自查：status=7 行数 0；执行后复核：注释长度 44→57 且含「7-建单中」，
+--   列类型/默认值/可空性（tinyint·1·NOT NULL）与全部 5 个索引（含唯一键
+--   uk_agent_restock_plan_vm_date）逐字未变，表行数 7 / 存活 0 未被触碰。
+--   变更后重跑 tests/test_restock_assignee_live.py -m live：4 passed，并发确认仍只回调 Java 1 次。
+--   ⚠️ **生产环境尚未执行**（需 §8 DDL 评审 + 低峰执行），部署前请以此行为准核对。
 -- 幂等：是（重复执行只是把同一 COMMENT 再写一次；MODIFY COLUMN 不触碰数据）
 -- 回滚：见文件末尾「回滚语句」
 -- 变更类型：**仅列注释（COMMENT）**，不改类型/索引/约束/默认值
