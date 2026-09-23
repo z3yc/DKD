@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 _AGENT_ROOT = Path(__file__).resolve().parents[2] / "dkd-agent"
@@ -108,6 +108,25 @@ async def db_rows() -> list[dict]:
         return [dict(row) for row in result.mappings().all()]
 
 
+async def decision_rows(
+    *, since: datetime, request_id: str | None = None
+) -> list[dict]:
+    """本次脚本运行期间写入的补货干预留痕（1-7b；可按 request_id 精确过滤）。"""
+    sql = (
+        "select request_id, scene, user_id, trigger_type, action, target_type, target_id, "
+        "result, error_msg, llm_output from agent_decision_log "
+        "where action like 'restock.%' and create_time >= :since"
+    )
+    params: dict[str, object] = {"since": since}
+    if request_id is not None:
+        sql += " and request_id = :rid"
+        params["rid"] = request_id
+    sql += " order by id"
+    async with get_sessionmaker()() as session:
+        result = await session.execute(text(sql), params)
+        return [dict(row) for row in result.mappings().all()]
+
+
 async def cleanup() -> None:
     """软删验收数据（非 DELETE：AGENTS §7.4，账号也没有 DELETE 权限）。"""
     async with get_sessionmaker()() as session:
@@ -150,6 +169,8 @@ async def _run_body() -> int:
     from app.main import create_app
 
     app = create_app()
+    # 留痕核对的时间下界：稍往前留 5s 余量，避免边界上漏掉第一条
+    run_started = datetime.now() - timedelta(seconds=5)
     print("=" * 84)
     print(f"[1-7 验收] 目标日期={TODAY}（真 MySQL + 真实 FastAPI 应用，同一事件循环）")
     print("=" * 84)
@@ -318,6 +339,76 @@ async def _run_body() -> int:
                 "验收行最终为 1-建议且留痕最近一次干预原因",
                 restored["status"] == 1 and restored["adjust_reason"] is not None,
             )
+
+            section("[H] 决策留痕（1-7b / FIX-2：AGENTS §6.3「写操作必留痕」+ §6.4 request_id）")
+            # 额外跑一次带显式 X-Request-Id 的干预，验证网关/Middleware 的 rid 真的落到了留痕里
+            rid = "verify-1-7b-rid"
+            resp = await client.post(
+                f"/agent/restock/plans/{other_id}/skip",
+                json={"reason": "留痕 request_id 验证"},
+                headers={**USER_HEADERS, "X-Request-Id": rid},
+            )
+            check("带 X-Request-Id 的干预成功", resp.status_code == 200, f"实际 {resp.status_code}")
+            await client.post(
+                f"/agent/restock/plans/{other_id}/restore",
+                json={"reason": "留痕验证后复原"},
+                headers=USER_HEADERS,
+            )
+            current_rows = await db_rows()
+            check(
+                "复原验收集外的计划（留痕验证后未污染 [G] 快照）",
+                all(r["status"] == 1 for r in current_rows),
+                f"statuses={[r['status'] for r in current_rows]}",
+            )
+
+            ledger = await decision_rows(since=run_started)
+            for row in ledger:
+                print(
+                    f"     {row['action']:<18} target={row['target_type']}:{row['target_id']} "
+                    f"user={row['user_id']} result={row['result']} "
+                    f"err={(row['error_msg'] or '')[:24]!r}"
+                )
+            actions = {row["action"] for row in ledger}
+            check("留痕已落到 agent_decision_log", len(ledger) >= 6, f"本次 {len(ledger)} 条")
+            check(
+                "四类计划干预 + 开关都有留痕",
+                {
+                    "restock.adjust",
+                    "restock.skip",
+                    "restock.restore",
+                    "restock.pause",
+                    "restock.resume",
+                }
+                <= actions,
+                f"actions={sorted(actions)}",
+            )
+            check(
+                "全部为人工干预口径（scene=2 / trigger_type=3）",
+                all(row["scene"] == 2 and row["trigger_type"] == 3 for row in ledger),
+            )
+            rejected = [row for row in ledger if row["result"] == 3]
+            check(
+                "被拒绝的决策也留痕且原因原样保存",
+                bool(rejected) and all(row["error_msg"] for row in rejected),
+                f"拒绝 {len(rejected)} 条",
+            )
+            check(
+                "人工干预不写 llm_output（不得把人工操作伪装成模型建议）",
+                all(row["llm_output"] is None for row in ledger),
+            )
+            plan_rows = [row for row in ledger if row["target_type"] == "plan"]
+            check(
+                "计划类留痕可定位（target_type=plan + 数字 target_id）",
+                bool(plan_rows) and all(str(row["target_id"]).isdigit() for row in plan_rows),
+            )
+            traced = await decision_rows(since=run_started, request_id=rid)
+            check(
+                "X-Request-Id 贯穿到留痕（AGENTS §6.4）",
+                bool(traced) and all(row["request_id"] == rid for row in traced),
+                f"命中 {len(traced)} 条",
+            )
+            # 留痕行**故意保留**：审计证据不随验收清理（清理只软删计划/开关两条业务夹具）
+            print("     [说明] 本次留痕行保留在库中（审计证据，非验收夹具）")
 
         section("[清理] 软删本次验收数据（非 DELETE）")
 

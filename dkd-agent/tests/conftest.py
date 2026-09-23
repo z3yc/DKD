@@ -76,8 +76,15 @@ def client_with_llm(tmp_path, monkeypatch) -> Iterator[TestClient]:
 
 @pytest.fixture(autouse=True)
 def _isolate_env() -> Iterator[None]:
-    """防止本机 .env 里的真实配置影响断言（如 USE_LLM/SERVICE_SECRET）。"""
+    """防止本机 .env 里的真实配置影响断言（如 USE_LLM/SERVICE_SECRET）。
+
+    这里额外**兜底关闭留痕写库**：单测一旦走到默认留痕写入器就会真的连本机 MySQL。
+    本轮（1-7b）实测过这个漏子：未注入假写入器的失败用例仍然向 `agent_decision_log`
+    写入了 2 行真数据。要验留痕的用例请显式注入假写入器
+    （见 `tests/test_api_restock.py` 的 `FakeAuditWriter`）。
+    """
     saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("DKD_")}
+    os.environ["DKD_AGENT_AUDIT_ENABLED"] = "0"
     yield
     for k in [k for k in os.environ if k.startswith("DKD_") and k not in saved]:
         os.environ.pop(k, None)

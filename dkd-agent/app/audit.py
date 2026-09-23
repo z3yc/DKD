@@ -28,6 +28,13 @@ logger = logging.getLogger("dkd.agent.audit")
 # SQLite 兼容：BigInteger 主键在 SQLite 上无法自增，降到 Integer（仅影响测试环境）
 _BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
 
+# JSON 列统一用 `none_as_null=True`：SQLAlchemy 默认会把 Python `None` 序列化成 JSON 文本 `null`，
+# 于是「没有 LLM 输出」在库里是 JSON null 而不是 SQL NULL——`IS NULL` 查不到，
+# `json_extract` 还会返回字符串 'null'。DDL 声明的是 `DEFAULT NULL`，这里对齐它：
+# 人工干预（1-7b）没有 llm_output，落库必须是 NULL，否则审计 SQL 会把「人做的事」
+# 当成「模型输出过 null」（AGENTS §9.3 不隐瞒）。
+_JSON = JSON(none_as_null=True)
+
 # 脱敏规则（AGENTS §7.8）：手机号、16~19 位卡号/订单号连续数字
 _PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d)(\d{4})(\d{4})(?!\d)")
 _CARD_RE = re.compile(r"(?<!\d)(\d{4})(\d{8,11})(\d{4})(?!\d)")
@@ -73,8 +80,8 @@ class DecisionLog(Base):
     scene: Mapped[int] = mapped_column(Integer)
     user_id: Mapped[int | None] = mapped_column(BigInteger)
     trigger_type: Mapped[int] = mapped_column(Integer, default=1)
-    input_context: Mapped[Any | None] = mapped_column(JSON)
-    llm_output: Mapped[Any | None] = mapped_column(JSON)
+    input_context: Mapped[Any | None] = mapped_column(_JSON)
+    llm_output: Mapped[Any | None] = mapped_column(_JSON)
     action: Mapped[str | None] = mapped_column(String(64))
     target_type: Mapped[str | None] = mapped_column(String(32))
     target_id: Mapped[str | None] = mapped_column(String(64))
@@ -98,7 +105,7 @@ class Message(Base):
     seq: Mapped[int] = mapped_column(Integer)
     msg_role: Mapped[int] = mapped_column(Integer)
     content: Mapped[str | None] = mapped_column(String(65535))
-    tool_calls: Mapped[Any | None] = mapped_column(JSON)
+    tool_calls: Mapped[Any | None] = mapped_column(_JSON)
     model: Mapped[str | None] = mapped_column(String(64))
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)

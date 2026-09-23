@@ -15,7 +15,18 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.audit import (
+    RESULT_FAIL,
+    RESULT_OK,
+    RESULT_REJECTED,
+    TRIGGER_MANUAL,
+    Base,
+    DecisionLog,
+    record_decision,
+)
 from app.config import Settings
 from app.graphs.restock_plan_store import OrderClaimConflictError, PauseState
 from app.services.restock_service import (
@@ -32,7 +43,12 @@ VM_ID = 80
 
 
 def _settings(**overrides: object) -> Settings:
-    base: dict[str, object] = {"DKD_AGENT_RESTOCK_CALIBRATION_ENABLED": "0"}
+    base: dict[str, object] = {
+        "DKD_AGENT_RESTOCK_CALIBRATION_ENABLED": "0",
+        # conftest 会在全局把留痕写库关掉（防止单测误连 MySQL）；本文件的预留痕用例
+        # 都注入了假写入器，所以这里显式打开开关，开关的拒绝路径由专门的用例覆盖。
+        "DKD_AGENT_AUDIT_ENABLED": "1",
+    }
     base.update(overrides)
     return Settings(_env_file=None, **base)  # type: ignore[arg-type]
 
@@ -142,6 +158,23 @@ class FakePauseStore:
         return self.state
 
 
+class FakeAuditWriter:
+    """记录留痕调用的假写入器（真实写库的用例见「决策留痕」小节的 SQLite 用例）。
+
+    默认注入到 `_service()`：不加它，服务层就会真的去连 MySQL —— 单测连外部依赖
+    是本项目明令禁止的（AGENTS §8），而留痕又是业务路径上的必经调用。
+    """
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.error = error
+
+    async def __call__(self, **kwargs: Any) -> None:
+        if self.error is not None:
+            raise self.error
+        self.calls.append(kwargs)
+
+
 def _stock(*, current: int = 0, capacity: int = 10) -> ChannelStockItem:
     return ChannelStockItem(
         vm_id=VM_ID,
@@ -169,12 +202,23 @@ def _daily() -> list[ChannelDailySales]:
 
 
 def _service(
-    *, rows: list[dict[str, Any]] | None = None, deps: FakeDeps | None = None
+    *,
+    rows: list[dict[str, Any]] | None = None,
+    deps: FakeDeps | None = None,
+    audit_writer: Any | None = None,
+    settings: Settings | None = None,
 ) -> tuple[RestockService, FakeStore, FakeDeps, FakePauseStore]:
     store = FakeStore(rows)
     real_deps = deps or FakeDeps()
     pause = FakePauseStore()
-    service = RestockService(store=store, deps=real_deps, settings=_settings(), pause_store=pause)
+    service = RestockService(
+        store=store,
+        deps=real_deps,
+        settings=settings or _settings(),
+        pause_store=pause,
+        # 默认注入假留痕写入器：单测不得连 MySQL（AGENTS §8）
+        audit_writer=audit_writer if audit_writer is not None else FakeAuditWriter(),
+    )
     return service, store, real_deps, pause
 
 
@@ -441,6 +485,183 @@ async def test_pause_and_resume_require_reason_and_record_actor():
     resumed = await service.set_pause(paused=False, user_id=8, reason="盘点完成")
     assert resumed.paused is False and resumed.resumed_by == "8"
     assert [c["paused"] for c in pause.calls] == [True, False]
+
+
+# --------------------------------------------------------------------------------------
+# 服务层：决策留痕（1-7b / FIX-2）—— AGENTS §6.3「每次写操作决策必须留痕」
+# 覆盖成功 / 幂等 / 状态机拒绝 / 并发冲突 / 建单失败 / 开关，以及「审计坏掉不能拖垮业务」
+# --------------------------------------------------------------------------------------
+
+
+async def test_skip_writes_decision_log_with_manual_trigger():
+    recorder = FakeAuditWriter()
+    service, _, _, _ = _service(audit_writer=recorder)
+    await service.skip(5, plan_date=PLAN_DATE, user_id=7, reason="点位撤机")
+
+    entry = recorder.calls[-1]
+    assert entry["action"] == "restock.skip"
+    assert entry["scene"] == 2 and entry["trigger_type"] == TRIGGER_MANUAL == 3
+    assert entry["target_type"] == "plan" and entry["target_id"] == "5"
+    assert entry["user_id"] == 7 and entry["result"] == RESULT_OK
+    assert entry["error_msg"] is None
+    assert "llm_output" not in entry, "人工干预没有 LLM 输出，不得塞成「模型建议」"
+    ctx = entry["input_context"]
+    assert ctx["effect"] == "skipped" and ctx["planStatusAfter"] == 3
+    assert ctx["planStatusBefore"] == 1 and ctx["reason"] == "点位撤机"
+    assert ctx["planDate"] == "2026-09-21" and ctx["vmId"] == VM_ID and ctx["innerCode"] == INNER
+
+
+async def test_adjust_writes_human_window_into_audit_context():
+    recorder = FakeAuditWriter()
+    service, _, _, _ = _service(audit_writer=recorder)
+    await service.adjust(
+        5,
+        plan_date=PLAN_DATE,
+        user_id=7,
+        payload=AdjustmentRequest(reason="最近一周卖得猛", window_days=7),
+    )
+
+    entry = recorder.calls[-1]
+    assert entry["action"] == "restock.adjust" and entry["result"] == RESULT_OK
+    ctx = entry["input_context"]
+    assert ctx["effect"] == "adjusted" and ctx["reason"] == "最近一周卖得猛"
+    assert ctx["windowDays"] == 7 and ctx["requestedQuantity"] is None
+    assert ctx["recomputedQuantity"] == 8, "重算结果要进留痕，否则无法复盘这个数是怎么来的"
+
+
+async def test_confirm_writes_assignee_and_task_into_audit_context():
+    recorder = FakeAuditWriter()
+    service, _, _, _ = _service(audit_writer=recorder)
+    await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+
+    entry = recorder.calls[-1]
+    assert entry["action"] == "restock.confirm" and entry["result"] == RESULT_OK
+    ctx = entry["input_context"]
+    assert ctx["effect"] == "created" and ctx["planStatusAfter"] == 4
+    assert ctx["taskId"] == 999 and ctx["taskCode"] == "202609210001"
+    assert ctx["assigneeId"] == 10 and ctx["assigneeName"] == "孙权", "派给了谁必须可审计（1-8）"
+
+
+async def test_state_machine_rejection_is_audited_as_rejected():
+    recorder = FakeAuditWriter()
+    service, store, deps, _ = _service(rows=[_row(status=5)], audit_writer=recorder)
+    with pytest.raises(RestockServiceError):
+        await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+
+    assert store.decisions == [] and deps.created == [], "被拒绝不得产生任何写入"
+    entry = recorder.calls[-1]
+    assert entry["result"] == RESULT_REJECTED == 3
+    assert entry["error_msg"], "拒绝原因要原样留痕（运营会问「我点了为什么没生效」）"
+    assert entry["input_context"]["effect"] == "rejected"
+
+
+async def test_task_create_failure_is_audited_as_failed():
+    recorder = FakeAuditWriter()
+    service, _, _, _ = _service(
+        deps=FakeDeps(task_error=CallbackUnavailableError("Java 不可达")), audit_writer=recorder
+    )
+    with pytest.raises(RestockServiceError):
+        await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+
+    entry = recorder.calls[-1]
+    assert entry["result"] == RESULT_FAIL == 2
+    assert entry["input_context"]["effect"] == "create_failed"
+    assert "Java 不可达" in entry["error_msg"]
+
+
+async def test_claim_conflict_is_audited_as_rejected():
+    recorder = FakeAuditWriter()
+    service, _, _, _ = _service(
+        deps=FakeDeps(task_error=OrderClaimConflictError("该计划正在建单中，请刷新后重试")),
+        audit_writer=recorder,
+    )
+    with pytest.raises(RestockServiceError):
+        await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+
+    entry = recorder.calls[-1]
+    assert entry["result"] == RESULT_REJECTED
+    assert entry["input_context"]["effect"] == "concurrent_conflict"
+
+
+async def test_idempotent_confirm_is_audited_and_does_not_write_again():
+    recorder = FakeAuditWriter()
+    service, store, deps, _ = _service(rows=[_row(status=4, task_id=567)], audit_writer=recorder)
+    await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+
+    assert store.decisions == [] and deps.created == []
+    entry = recorder.calls[-1]
+    assert entry["result"] == RESULT_OK
+    assert entry["input_context"]["effect"] == "already_ordered"
+
+
+async def test_pause_and_resume_are_audited_with_reason():
+    recorder = FakeAuditWriter()
+    service, _, _, _ = _service(audit_writer=recorder)
+    await service.set_pause(paused=True, user_id=7, reason="盘点一周")
+    await service.set_pause(paused=False, user_id=8, reason="盘点完成")
+
+    assert [c["action"] for c in recorder.calls] == ["restock.pause", "restock.resume"]
+    first = recorder.calls[0]
+    assert first["target_type"] == "restock_pause" and first["target_id"] == "global"
+    assert first["input_context"]["reason"] == "盘点一周"
+    assert [c["user_id"] for c in recorder.calls] == [7, 8]
+
+
+async def test_audit_failure_does_not_break_the_business_flow():
+    """审计是旁路：留痕写不进去（含非 SQLAlchemy 类异常）也必须让运营的点击生效。"""
+    recorder = FakeAuditWriter(error=ValueError("留痕参数处理缺陷"))
+    service, store, _, _ = _service(audit_writer=recorder)
+
+    result = await service.skip(5, plan_date=PLAN_DATE, user_id=7, reason="点位撤机")
+
+    assert result["status"] == 3 and store.decisions[-1][0].status == 3
+    assert recorder.calls == [], "失败调用不应被当成已留痕"
+
+
+async def test_audit_disabled_does_not_call_writer():
+    recorder = FakeAuditWriter()
+    service, _, _, _ = _service(
+        audit_writer=recorder, settings=_settings(DKD_AGENT_AUDIT_ENABLED="0")
+    )
+    await service.skip(5, plan_date=PLAN_DATE, user_id=7, reason="点位撤机")
+    assert recorder.calls == []
+
+
+async def test_decision_log_row_is_really_persisted(tmp_path):
+    """真 SQL 落库用例：证明留痕不是「只在假写入器里出现过」。
+
+    表结构由 SQLAlchemy 模型生成，与 `docs/ddl/agent_tables.sql::agent_decision_log`
+    列一一对应（同 `tests/test_audit.py` 的做法）。
+    """
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'audit.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _sqlite_writer(**kwargs: Any) -> None:
+        async with maker() as session:
+            await record_decision(session, **kwargs)
+
+    service, _, _, _ = _service(
+        rows=[_row(plan_id=5), _row(plan_id=6, status=5)], audit_writer=_sqlite_writer
+    )
+    await service.skip(5, plan_date=PLAN_DATE, user_id=7, reason="点位撤机")
+    with pytest.raises(RestockServiceError):
+        await service.confirm(6, plan_date=PLAN_DATE, user_id=7)
+
+    async with maker() as session:
+        rows = (await session.execute(select(DecisionLog))).scalars().all()
+    await engine.dispose()
+
+    assert len(rows) == 2, "两条决策（成功 / 被拒）都要落库"
+    by_action = {row.action: row for row in rows}
+    ok, rejected = by_action["restock.skip"], by_action["restock.confirm"]
+    assert (ok.scene, ok.trigger_type, ok.result) == (2, TRIGGER_MANUAL, RESULT_OK)
+    assert ok.del_flag == "0"
+    assert ok.target_id == "5" and ok.create_by == "7" and ok.request_id is None
+    assert ok.llm_output is None, "人工干预没有 LLM 输出"
+    assert rejected.result == RESULT_REJECTED and rejected.error_msg
+    assert rejected.input_context["effect"] == "rejected"
 
 
 # --------------------------------------------------------------------------------------
