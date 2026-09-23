@@ -43,7 +43,12 @@ from app.graphs.restock_decisions import (
     apply_decision,
     summarize_plan,
 )
-from app.graphs.restock_plan_store import PauseState, SqlPauseStore, plan_from_row
+from app.graphs.restock_plan_store import (
+    OrderClaimConflictError,
+    PauseState,
+    SqlPauseStore,
+    plan_from_row,
+)
 from app.graphs.restock_state import PLAN_STATUS_SUGGESTED, RestockPlan
 from app.tools.read_tools import default_sales_window
 from app.tools.task_tools import CallbackError
@@ -309,8 +314,15 @@ class RestockService:
                 task = await self._deps.create_task(
                     new_plan, request_id=f"restock-confirm-{plan_id}"
                 )
+            except OrderClaimConflictError as exc:
+                # 并发确认（排期 1-8）：另一个请求已经抢到该计划的建单权。
+                # 409 而不是 502 —— 这不是“Java 出错了”，是“这次请求不该执行”，
+                # 运营收到“正在建单中，请刷新”就对了。
+                logger.info("建单认领冲突 plan_id=%s reason=%s", plan_id, exc)
+                raise RestockServiceError(str(exc), status_code=409) from exc
             except CallbackError as exc:
-                # 建单失败：状态留在原处并如实回报（1-6 的同类取舍：回滚会让运营以为没点过）
+                # 建单失败：状态留在原处并如实回报（1-6 的同类取舍：回滚会让运营以为没点过）；
+                # 占位释放由 deps.create_task 内部完成（1-8），所以这里不必再动库。
                 logger.warning("建单失败 plan_id=%s err=%s", plan_id, exc)
                 raise RestockServiceError(f"建单失败：{exc}", status_code=502) from exc
             new_plan = new_plan.model_copy(update={"status": 4})

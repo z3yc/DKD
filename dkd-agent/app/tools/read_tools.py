@@ -32,7 +32,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from app.config import get_settings
 from app.db import assert_table_allowed
@@ -43,6 +43,14 @@ logger = logging.getLogger("dkd.agent.tools.read")
 VM_STATUS_RUNNING = 1
 # 补货工单类型（DkdContants.TASK_TYPE_SUPPLY = 2）
 TASK_TYPE_SUPPLY = 2
+# 接单人必须是「运营人员」角色（DkdContants.ROLE_CODE_BUSINESS = "1002"）。
+# 依据：前端补货工单页 `dkd-vue/src/views/manage/task/business.vue` 调的正是
+# `businessList` → `EmpController.businessList`
+# （region_id + ROLE_CODE_BUSINESS + EMP_STATUS_NORMAL），与 Java 侧建单校验同源；
+# 取 1003（运维/维修）会被 dkd-app 的作业队列发错人。
+ASSIGNEE_ROLE_CODE = "1002"
+# 员工启用状态（DkdContants.EMP_STATUS_NORMAL = 1）
+EMP_STATUS_NORMAL = 1
 # 工单状态：1-待接单（创建） 2-进行中（DkdContants.TASK_STATUS_CREATE/PROGRESS）
 TASK_STATUS_INFLIGHT = (1, 2)
 
@@ -66,6 +74,19 @@ class MachineProfile(BaseModel):
     node_name: str | None = None
     region_id: int | None = None
     region_name: str | None = None
+
+
+class Assignee(BaseModel):
+    """可选接单人（`tb_emp` 里的同区域运营人员，1-8 的分配输入）。
+
+    为什么不叫 Employee：这只是“可派人”的瘦投影（emp_id/姓名/区域），
+    而 `tb_emp` 还有手机号等敏感字段——读工具**不把用不上的个人信息带进内存**，
+    日志与留痕也就不会顺手把它们写出去（AGENTS §7.8 脱敏）。
+    """
+
+    emp_id: int
+    user_name: str
+    region_id: int
 
 
 class ChannelStockItem(BaseModel):
@@ -170,7 +191,12 @@ def _batched(items: Sequence[str], size: int) -> list[list[str]]:
 
 
 async def _fetch_all(
-    session: Any, sql: str, params: dict[str, Any], *, tables: Sequence[str]
+    session: Any,
+    sql: str,
+    params: dict[str, Any],
+    *,
+    tables: Sequence[str],
+    expanding: Sequence[str] = (),
 ) -> list[Any]:
     """执行只读查询：白名单校验 + 超时熔断 + 行数上限。
 
@@ -180,9 +206,13 @@ async def _fetch_all(
     for table in tables:
         assert_table_allowed(table)
     settings = get_settings()
+    statement = text(sql)
+    if expanding:
+        # text() 不会自动展开 IN 参数；expanding 可安全地产生多个绑定参数。
+        statement = statement.bindparams(*(bindparam(name, expanding=True) for name in expanding))
     try:
         result = await asyncio.wait_for(
-            session.execute(text(sql), params), timeout=settings.read_query_timeout_s
+            session.execute(statement, params), timeout=settings.read_query_timeout_s
         )
     except TimeoutError as exc:  # asyncio.TimeoutError 在 3.11 即内建 TimeoutError
         logger.warning(
@@ -253,6 +283,93 @@ async def list_operating_machines(
     return [MachineProfile(**dict(row)) for row in rows]
 
 
+async def list_machine_profiles(
+    session: Any, *, inner_codes: Sequence[str], limit: int | None = None
+) -> list[MachineProfile]:
+    """按设备编号批量取设备档案（1-8 接单人分配需要 `region_id`）。
+
+    与 `list_operating_machines` 的区别：这里**不筛 `vm_status`**——
+    区域映射是档案事实，不该因为设备此刻不在运营状态就查不到区域
+    （否则会把“该设备不能建单”误报成“没人可派”）。
+    """
+    codes = _normalize_inner_codes(inner_codes)
+    if not codes:
+        return []
+    settings = get_settings()
+    profiles: list[MachineProfile] = []
+    for batch in _batched(codes, settings.read_batch_size):
+        rows = await _fetch_all(
+            session,
+            """
+            select v.id as vm_id, v.inner_code, v.addr, v.vm_status,
+                   v.node_id, n.node_name, v.region_id, r.region_name
+            from tb_vending_machine v
+            left join tb_node n on n.id = v.node_id
+            left join tb_region r on r.id = v.region_id
+            where v.inner_code in :inner_codes
+            order by v.id
+            limit :limit
+            """,
+            {"inner_codes": tuple(batch), "limit": limit or settings.read_row_limit},
+            tables=("tb_vending_machine", "tb_node", "tb_region"),
+            expanding=("inner_codes",),
+        )
+        profiles.extend(MachineProfile(**dict(row)) for row in rows)
+    return profiles
+
+
+async def list_region_assignees(
+    session: Any, *, region_ids: Sequence[int]
+) -> dict[int, list[Assignee]]:
+    """按区域批量取**可选接单人**（`region_id` → 启用中的运营人员列表）。
+
+    为什么一次取多个区域而不是“一个设备一次查询”：06:00 分析要跨区域处理上百台设备，
+    逐台查人就是典型的 N+1（AGENTS §10 列表接口循环内查库是重点检查项）。
+
+    过滤条件三件套（缺一不可，与 `EmpController.businessList` 逐条对齐）：
+      - `region_id`：`TaskServiceImpl` 强校验 `emp.regionId == vm.regionId`；
+      - `role_code = 1002`：只有运营人员该接补货工单；
+      - `status = 1`：停用账号不能派单。
+
+    `order by region_id, id` 是**确定性保证**：负载相同时候选顺序稳定，分配结果可复现（可测试）。
+    完全无匹配的区域**不出现在返回字典里**，由调用方决定降级为「待指派」，而不是静默选一个错的人。
+    """
+    codes = [int(r) for r in region_ids if r is not None]
+    if not codes:
+        return {}
+    settings = get_settings()
+    grouped: dict[int, list[Assignee]] = {}
+    # 区域数很少（本机 4 个），但机器上可能上百个→同样分批，避免 IN 列表无上限
+    deduped = list(dict.fromkeys(codes))
+    step = max(1, settings.read_batch_size)
+    for start in range(0, len(deduped), step):
+        batch = deduped[start : start + step]
+        rows = await _fetch_all(
+            session,
+            """
+            select id as emp_id, user_name, region_id
+            from tb_emp
+            where region_id in :region_ids
+              and role_code = :role_code
+              and status = :status
+            order by region_id, id
+            limit :limit
+            """,
+            {
+                "region_ids": tuple(batch),
+                "role_code": ASSIGNEE_ROLE_CODE,
+                "status": EMP_STATUS_NORMAL,
+                "limit": settings.read_row_limit,
+            },
+            tables=("tb_emp",),
+            expanding=("region_ids",),
+        )
+        for row in rows:
+            assignee = Assignee(**dict(row))
+            grouped.setdefault(assignee.region_id, []).append(assignee)
+    return grouped
+
+
 async def list_channel_stock(
     session: Any, *, inner_codes: Sequence[str], limit: int | None = None
 ) -> list[ChannelStockItem]:
@@ -284,6 +401,7 @@ async def list_channel_stock(
                 "limit": limit or settings.read_row_limit,
             },
             tables=("tb_inventory", "tb_channel", "tb_vending_machine"),
+            expanding=("inner_codes",),
         )
         items.extend(ChannelStockItem(**dict(row)) for row in rows)
     return items
@@ -335,6 +453,7 @@ async def aggregate_channel_sales(
                 "limit": limit or settings.read_row_limit,
             },
             tables=("tb_order",),
+            expanding=("inner_codes",),
         )
         sales.extend(ChannelSales(**dict(row)) for row in rows)
     return sales
@@ -392,6 +511,7 @@ async def aggregate_channel_daily_sales(
                 "limit": limit or settings.read_row_limit,
             },
             tables=("tb_order",),
+            expanding=("inner_codes",),
         )
         daily.extend(ChannelDailySales(**dict(row)) for row in rows)
     return daily
@@ -432,6 +552,7 @@ async def list_inflight_tasks(
                 "limit": limit or settings.read_row_limit,
             },
             tables=("tb_task", "tb_task_details"),
+            expanding=("inner_codes", "statuses"),
         )
         merged: dict[int, InflightTask] = {}
         for row in rows:

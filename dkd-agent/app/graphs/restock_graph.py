@@ -37,7 +37,7 @@ resume 只给「决策」，计划明细与状态全部从 checkpoint 的 state 
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from datetime import date, datetime
 from typing import Any, Protocol
 
@@ -57,6 +57,7 @@ from app.graphs.restock_decisions import (
     parse_decisions,
     summarize_plan,
 )
+from app.graphs.restock_plan_store import OrderClaimConflictError
 from app.graphs.restock_state import (
     PLAN_STATUS_ORDERED,
     PLAN_STATUS_SUGGESTED,
@@ -64,7 +65,14 @@ from app.graphs.restock_state import (
     RestockState,
     empty_state,
 )
-from app.tools.read_tools import ChannelDailySales, ChannelStockItem, default_sales_window
+from app.tools.read_tools import (
+    ASSIGNEE_ROLE_CODE,
+    Assignee,
+    ChannelDailySales,
+    ChannelStockItem,
+    MachineProfile,
+    default_sales_window,
+)
 from app.tools.task_tools import CallbackError, CreatedTask, create_restock_task
 
 logger = logging.getLogger("dkd.agent.graphs.restock")
@@ -86,9 +94,9 @@ class RestockDeps(Protocol):
     async def resolve_assignee(self, plan: RestockPlan) -> tuple[int | None, str | None]:
         """选接单人（返回 `(emp_id, 姓名)`；无匹配返回 `(None, None)`）。
 
-        为什么把“选人”做成依赖而不是写死在图里：分配策略（区域匹配、负载均衡、
-        并发确认的幂等键）是排期 **1-8** 的交付物；图只需要一个稳定的接缝。
-        返回 None 时计划走 6-待指派，**绝不伪造接单人**（Java 侧会因区域不一致拒绝）。
+        生产实现见 `SqlRestockDeps.resolve_assignee`（1-8）：按设备区域匹配启用中的运营人员，
+        取当日负载最低者。返回 None 时计划走 6-待指派，**绝不伪造接单人**
+        （Java 侧会因区域不一致拒绝，比“待指派”更难排查）；测试替身也必须遵守这条契约。
         """
         ...
 
@@ -103,7 +111,14 @@ class RestockDeps(Protocol):
         task_code: str | None = None,
     ) -> None: ...
 
-    async def create_task(self, plan: RestockPlan, *, request_id: str) -> CreatedTask: ...
+    async def create_task(self, plan: RestockPlan, *, request_id: str) -> CreatedTask:
+        """回调 Java 建单（**必须幂等保护**，1-8）。
+
+        实现方责任：回调前先在 `agent_restock_plan` 上 CAS 认领该计划
+        （`restock_plan_store.claim_for_order`），抢不到就抛 `OrderClaimConflictError`；
+        回调失败要释放认领（否则计划会永远卡在 7-建单中）。详见 `SqlRestockDeps.create_task`。
+        """
+        ...
 
 
 class SqlRestockDeps:
@@ -123,6 +138,17 @@ class SqlRestockDeps:
 
             store = SqlPlanStore(session_factory)
         self._store = store
+        # 一轮分析内的缓存（每次 `load()` 重置）：
+        #   _machines         inner_code → 设备档案（接单人分配要 `region_id`）
+        #   _staff_by_region  region_id  → 候选接单人（一次批量取完）
+        #   _loads            emp_id     → 当日已占用计划数（1-8 的“负载”）
+        # 为什么要缓存：`analyze` 会对上百台设备逐个 `resolve_assignee`，
+        # 逐台查区域/查人就是 N+1（AGENTS §10 列表接口循环内查库是重点检查项）。
+        self._machines: dict[str, MachineProfile] = {}
+        self._staff_by_region: dict[int, list[Assignee]] | None = None
+        self._staff_regions: set[int] = set()
+        self._loads: dict[int, int] | None = None
+        self._load_date: date | None = None
 
     async def load(
         self, *, plan_date: date, limit: int, inner_codes: list[str] | None = None
@@ -130,15 +156,29 @@ class SqlRestockDeps:
         from app.db import get_sessionmaker
         from app.tools import read_tools
 
+        # 新一轮分析：丢掉上一轮的设备/员工/负载缓存。
+        # 不清的话，长驻进程（uvicorn）里会拿“上一次分析时的员工名单与负载”去派今天的单，
+        # 这类错误特别隐蔽：日志一切正常，只是人分错了。
+        self._machines = {}
+        self._staff_by_region = None
+        self._staff_regions = set()
+        self._loads = None
+        self._load_date = None
+
         factory = self._session_factory or get_sessionmaker()
         start, end = default_sales_window(days=max(self._settings.restock_weights), today=plan_date)
         async with factory() as session:
             if inner_codes:
                 # 只取指定设备：1-7 的「按新参数重算」没必要把全部设备读一遍
                 codes = list(inner_codes)
+                profiles = await read_tools.list_machine_profiles(session, inner_codes=codes)
             else:
                 machines = await read_tools.list_operating_machines(session, limit=limit)
+                profiles = list(machines)
                 codes = [m.inner_code for m in machines]
+            # 区域映射必须在同一轮里取好：接单人分配（1-8）的输入是 `region_id`，
+            # 而 `tb_inventory` 上没有区域列（只能从设备档案拿）
+            self._machines = {profile.inner_code: profile for profile in profiles}
             stock = await read_tools.list_channel_stock(session, inner_codes=codes)
             daily = await read_tools.aggregate_channel_daily_sales(
                 session, inner_codes=codes, start=start, end=end
@@ -146,14 +186,120 @@ class SqlRestockDeps:
         return stock, daily
 
     async def resolve_assignee(self, plan: RestockPlan) -> tuple[int | None, str | None]:
-        # TODO(dkd-agent 1-8, 2026-09-21): 按设备 region_id 匹配 tb_emp 选接单人
-        # （`TaskServiceImpl` 强校验 `emp.regionId == vm.regionId`），并做负载均衡与并发幂等。
-        # 在 1-8 落地前**必须先留空**：随便选一个人会被 Java 侧以“员工区域与设备区域不一致”拒绝，
-        # 比“待指派”更糟（运营会以为是系统故障）。
-        return None, None
+        """按设备区域匹配启用中的运营人员，取当日负载最低者（排期 1-8 的分配策略）。
+
+        返回 `(None, None)` 的三种情形都是**如实降级**，不是失败：
+        ① 设备没有区域档案；② 该区域没有启用中的运营人员（role_code=1002）；③ 候选人全被停用。
+        此时计划落 6-待指派，等运营人工派单。
+        绝不挑一个跨区域的人凑数——Java 侧会以“员工区域与设备区域不一致”拒绝，
+        运营看到的是“系统故障”，而“待指派”才是事实。
+
+        负载取「当日已占用该人的计划数」，并在本轮内**即时递增**：
+        否则同一轮的 9 台设备都会看到同一份“初始负载”，全压给同一个人（负载均衡变成摆设）。
+        """
+        from app.graphs.restock_assignee import pick_assignee
+
+        region_id = plan.region_id
+        if region_id is None:
+            profile = self._machines.get(plan.inner_code)
+            region_id = profile.region_id if profile else None
+        if region_id is None:
+            logger.warning("设备 %s 无区域档案，无法按区域派单 → 待指派", plan.inner_code)
+            return None, None
+
+        candidates = await self._candidates(int(region_id))
+        loads = await self._assignee_loads(date.fromisoformat(plan.plan_date))
+        picked = pick_assignee(candidates, loads=loads)
+        if picked is None:
+            logger.info(
+                "区域 %s 无可用运营人员（role_code=%s、启用中），设备 %s → 待指派",
+                region_id,
+                ASSIGNEE_ROLE_CODE,
+                plan.inner_code,
+            )
+            return None, None
+        loads[picked.emp_id] = loads.get(picked.emp_id, 0) + 1
+        logger.info(
+            "接单人分配 vm_id=%s inner_code=%s region=%s → emp_id=%s(%s) 本轮负载=%s",
+            plan.vm_id,
+            plan.inner_code,
+            region_id,
+            picked.emp_id,
+            picked.user_name,
+            loads[picked.emp_id],
+        )
+        return picked.emp_id, picked.user_name
+
+    async def _staff(self) -> dict[int, list[Assignee]]:
+        """候选接单人（按区域分组）：**本轮设备涉及的区域一次批量取完**。
+
+        为什么要缓存：`analyze` 会对上百台设备逐个 `resolve_assignee`，
+        逐台查人就是 N+1（AGENTS §10 列表接口循环内查库是重点检查项）。
+        """
+        if self._staff_by_region is None:
+            self._staff_by_region = {}
+            await self._load_staff([p.region_id for p in self._machines.values()])
+        return self._staff_by_region
+
+    async def _candidates(self, region_id: int) -> list[Assignee]:
+        """取某区域的候选接单人（不在已加载区域里则补查一次）。
+
+        为什么需要补查：1-7/1-8 的干预路径会读回带 `region_id` 的计划，
+        而该设备可能不在本轮的设备集合里（例如只重算一个点位）。
+        只补查**没查过的区域**，且查过就记下来，仍是每区域最多一次。
+        """
+        directory = await self._staff()
+        if region_id not in self._staff_regions:
+            await self._load_staff([region_id])
+        return directory.get(region_id, [])
+
+    async def _load_staff(self, region_ids: Iterable[int | None]) -> None:
+        """按区域补齐员工目录（只查尚未查过的区域，结果合并进缓存）。"""
+        pending = sorted({int(r) for r in region_ids if r is not None} - self._staff_regions)
+        if not pending:
+            return
+        from app.db import get_sessionmaker
+        from app.tools import read_tools
+
+        factory = self._session_factory or get_sessionmaker()
+        async with factory() as session:
+            found = await read_tools.list_region_assignees(session, region_ids=pending)
+        directory = self._staff_by_region if self._staff_by_region is not None else {}
+        for region_id in pending:
+            # 区域里没有人也要记下“已查过”，否则每次都会重复查（空结果不缓存是经典漏勺）
+            directory[region_id] = found.get(region_id, [])
+            self._staff_regions.add(region_id)
+        self._staff_by_region = directory
+
+    async def _assignee_loads(self, plan_date: date) -> dict[int, int]:
+        """当日各接单人的负载（一轮只查一次，之后在内存里累加）。"""
+        if self._loads is None or self._load_date != plan_date:
+            self._loads = dict(await self._store.count_open_by_assignee(plan_date))
+            self._load_date = plan_date
+        return self._loads
 
     async def save_plan(self, plan: RestockPlan) -> None:
-        await self._store.upsert_plan(plan, by="system")
+        """落库计划（1-6 的幂等 upsert），顺带补全区域/点位。
+
+        为什么在这里补而不是在节点里：`RestockPlan` 的区域只能从设备档案拿，
+        而档案缓存属于 deps（`load()` 已取好）。不补的话 `agent_restock_plan.region_id` 永远是
+        NULL——它是接单人分配的依据、也是 `idx_agent_restock_plan_region` 与 3-7 按区域审计的前提。
+        """
+        await self._store.upsert_plan(self._with_region(plan), by="system")
+
+    def _with_region(self, plan: RestockPlan) -> RestockPlan:
+        """把设备区域/点位补进计划（已有则不动，拿不到档案则如实保持 NULL）。"""
+        if plan.region_id is not None and plan.node_id is not None:
+            return plan
+        profile = self._machines.get(plan.inner_code)
+        if profile is None:
+            return plan
+        return plan.model_copy(
+            update={
+                "region_id": plan.region_id or profile.region_id,
+                "node_id": plan.node_id or profile.node_id,
+            }
+        )
 
     async def save_decision(
         self,
@@ -174,7 +320,36 @@ class SqlRestockDeps:
         )
 
     async def create_task(self, plan: RestockPlan, *, request_id: str) -> CreatedTask:
-        return await create_restock_task(plan, request_id=request_id)
+        """先 CAS 认领计划，再回调 Java；回调失败则释放认领（排期 1-8）。
+
+        为什么认领放在这里而不是节点里：图（1-6）与人工确认 API（1-7/1-8）**共用这一个写通道**
+        （`RestockService._execute` 也是调 `deps.create_task`），并发保护必须落在两条路径的公共处；
+        写进节点就会出现“定时任务有保护、人工确认没保护”这类半失灵。
+        """
+        from app.graphs.restock_plan_store import CLAIMABLE_STATUSES, OrderClaimConflictError
+
+        by = f"agent:{request_id}"[:64]
+        if plan.status not in CLAIMABLE_STATUSES:
+            # 状态机已经在 `apply_decision` 卡过一道；这里是第二道（防调用方绕过状态机直接建单）
+            raise OrderClaimConflictError(
+                f"计划当前状态 {plan.status} 不可建单（只允许 {CLAIMABLE_STATUSES}），请刷新后重试"
+            )
+        claimed = await self._store.claim_for_order(
+            plan.plan_date, plan.vm_id, expected_status=plan.status, by=by
+        )
+        if not claimed:
+            raise OrderClaimConflictError(
+                "该计划正在建单中或状态已被变更（可能由另一位运营同时操作），请刷新后重试"
+            )
+        try:
+            return await create_restock_task(plan, request_id=request_id)
+        except CallbackError:
+            # 释放占位：建单没成功，计划应回到原状态供重试（FIX-15 的“再点一次确认”路径）。
+            # 不释放会让该计划永远卡在 7-建单中，运营只能等人工改库——比建单失败本身更糟。
+            await self._store.release_order_claim(
+                plan.plan_date, plan.vm_id, revert_status=plan.status, by=by
+            )
+            raise
 
 
 def build_restock_graph(
@@ -356,9 +531,11 @@ def build_restock_graph(
             )
             try:
                 result = await deps.create_task(plan, request_id=state.get("request_id", ""))
-            except CallbackError as exc:
-                # 失败不改状态（模块 docstring §4）：原因交给 1-7 的“重试建单”
-                logger.warning("建单失败 vm_id=%s err=%s", plan.vm_id, exc)
+            except (CallbackError, OrderClaimConflictError) as exc:
+                # 失败不改状态（模块 docstring §4）：原因交给 1-7 的“重试建单”。
+                # 并发认领失败（1-8）也走这里：**不抛穿图**（AGENTS §6.3），而是作为
+                # 该设备的失败原因如实上报（运营看到“正在建单中”而不是整个图崩掉）。
+                logger.warning("建单未完成 vm_id=%s err=%s", plan.vm_id, exc)
                 failures.append({"vm_id": plan.vm_id, "stage": "create_task", "reason": str(exc)})
                 updated.append(plan.model_dump(mode="json"))
                 continue

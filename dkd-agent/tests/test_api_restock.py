@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime
 from typing import Any
 
@@ -16,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.graphs.restock_plan_store import PauseState
+from app.graphs.restock_plan_store import OrderClaimConflictError, PauseState
 from app.services.restock_service import (
     AdjustmentRequest,
     RestockService,
@@ -352,6 +353,77 @@ async def test_confirm_callback_failure_is_502_and_status_unchanged():
         await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
     assert excinfo.value.status_code == 502
     assert store.decisions == [], "建单失败不落库、不改状态（交 1-7 的重试建单）"
+
+
+# --------------------------------------------------------------------------------------
+# 并发确认（排期 1-8 验收项 ②/③）
+# --------------------------------------------------------------------------------------
+
+
+async def test_confirm_while_ordering_is_in_progress_is_409():
+    """读到 7-建单中（别人正在建单）时必须告知运营，而不是拼一把再建一张工单。"""
+    service, store, deps, _ = _service(rows=[_row(status=7)])
+
+    with pytest.raises(RestockServiceError) as excinfo:
+        await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+
+    assert excinfo.value.status_code == 409
+    assert "正在建单中" in str(excinfo.value)
+    assert deps.created == [] and store.decisions == [], "不得建单、不得改状态"
+
+
+async def test_claim_conflict_maps_to_409_not_502():
+    """认领冲突是 409（这次请求不该执行），不是 502（Java 那边坏了）——两者运维反应完全不同。"""
+    service, store, _, _ = _service(
+        deps=FakeDeps(
+            task_error=OrderClaimConflictError("该计划正在建单中或状态已被变更，请刷新后重试")
+        )
+    )
+
+    with pytest.raises(RestockServiceError) as excinfo:
+        await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+
+    assert excinfo.value.status_code == 409
+    assert "刷新" in str(excinfo.value)
+    assert store.decisions == [], "冲突失败不得把计划写成已建单"
+
+
+class CasDeps(FakeDeps):
+    """带 CAS 认领的假依赖：模拟 `SqlRestockDeps.create_task` 的排他语义。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.status = 1
+        self._lock = asyncio.Lock()
+
+    async def create_task(self, plan: Any, *, request_id: str) -> CreatedTask:
+        async with self._lock:
+            if self.status != plan.status:
+                raise OrderClaimConflictError(
+                    "该计划正在建单中或状态已被变更（可能由另一位运营同时操作），请刷新后重试"
+                )
+            self.status = 7
+        await asyncio.sleep(0.05)  # 撑开并发窗口，让第二个请求真的撞上占位
+        return await super().create_task(plan, request_id=request_id)
+
+
+async def test_two_concurrent_confirms_build_exactly_one_task():
+    """验收项 ③：两个运营同时点「确认建单」——只建一张工单，另一个拿到 409。"""
+    service, store, deps, _ = _service(deps=CasDeps())
+
+    results = await asyncio.gather(
+        service.confirm(5, plan_date=PLAN_DATE, user_id=7),
+        service.confirm(5, plan_date=PLAN_DATE, user_id=8),
+        return_exceptions=True,
+    )
+
+    ok = [r for r in results if isinstance(r, dict)]
+    rejected = [r for r in results if isinstance(r, RestockServiceError)]
+    assert len(ok) == 1, f"只能有一个成功：{results}"
+    assert len(rejected) == 1 and rejected[0].status_code == 409
+    assert ok[0]["status"] == 4 and ok[0]["task"]["taskId"] == 999
+    assert len(deps.created) == 1, "回调 Java 的次数必须是 1（否则就是重复建单）"
+    assert len(store.decisions) == 1, "只回写一次"
 
 
 # --------------------------------------------------------------------------------------

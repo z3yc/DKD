@@ -130,11 +130,17 @@ CREATE TABLE IF NOT EXISTS `agent_decision_log` (
 --        已进入 4-已建单 / 5-已复盘 的计划不得被重跑覆盖（应用侧校验）。
 --      - 运营重复点击「确认建单」→ 应用侧先判 status，仅 1/2 放行，避免撞 Java 侧防重异常。
 --      - 无可用接单人 → status=6，不调建单接口，进入人工处理队列。
+--      - **并发确认（1-8 实现）**：回调 Java 之前先把本行 CAS 成 7-建单中
+--        （`UPDATE ... SET status=7 WHERE vm_id=? AND plan_date=? AND del_flag='0' AND status=期望值`）；
+--        影响行数=1 的那个请求才去建单，=0 的直接返回“正在建单中”。
+--        因为建单是「先查后插」的非幂等动作，唯一键挡不住它（唯一键约束的是计划，不是工单）。
 --
 --    status 状态机：1-建议 ──┬─→ 2-已调整 ──┬─→ 4-已建单 ──→ 5-已复盘
 --                           │              │
 --                           └─→ 3-已跳过    └─→ 6-待指派（无匹配接单人，待人工处理）
 --    合法迁移：1→2/3/4/6，2→3/4/6，6→2/4，4→5（终态 3/5 不可再变更）
+--    建单占位：1/2/6 → 7-建单中（CAS 抢占，人工操作在此期间一律拒绝）→ 4-已建单
+--              建单失败时由同一持有者 CAS 释放回 1/2/6（不是用户决策，故不在迁移表内）
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `agent_restock_plan` (
   `id`              BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
@@ -146,7 +152,7 @@ CREATE TABLE IF NOT EXISTS `agent_restock_plan` (
   `items`           JSON                  DEFAULT NULL   COMMENT '补货明细数组：[{skuId,skuName,channelId,channelCode,currentQuantity,maxCapacity,suggestedQuantity,priority,estimatedDays,reason}]',
   `sku_count`       INT          NOT NULL DEFAULT 0      COMMENT '涉及货道数（列表页展示，避免解析 JSON）',
   `total_quantity`  INT          NOT NULL DEFAULT 0      COMMENT '建议补货总量',
-  `status`          TINYINT      NOT NULL DEFAULT 1      COMMENT '状态：1-建议 2-已调整 3-已跳过 4-已建单 5-已复盘 6-待指派',
+  `status`          TINYINT      NOT NULL DEFAULT 1      COMMENT '状态：1-建议 2-已调整 3-已跳过 4-已建单 5-已复盘 6-待指派 7-建单中',
   `adjust_reason`   VARCHAR(500)          DEFAULT NULL   COMMENT '人工调整/跳过原因（跳过时必填，方案 §1-7）',
   `adjusted_by`     BIGINT                DEFAULT NULL   COMMENT '最近一次人工干预的用户ID',
   `adjusted_time`   DATETIME              DEFAULT NULL   COMMENT '最近一次人工干预时间',
@@ -202,4 +208,16 @@ CREATE TABLE IF NOT EXISTS `agent_restock_plan` (
 --   代码侧同步见 app/graphs/restock_state.py::ALLOWED_TRANSITIONS 与
 --   app/graphs/restock_decisions.py::ACTION_RESTORE，以及
 --   docs/dkd-agent-restock-state-schema.md §5.3 的变更记录行。
+-- ============================================================================
+
+-- 2026-09-21（排期 1-8）：`agent_restock_plan.status` 新增取值 **7-建单中**（建单占位/乐观锁）。
+--   原因：确认建单是「先读计划 → 回调 Java → 回写状态」三步非幂等流程，两个并发确认会各建一张工单，
+--   而唯一键 (vm_id, plan_date) 约束的是**计划**、挡不住重复建单。因此把“谁在建单”写进本行状态：
+--   CAS（`WHERE ... AND status = 期望值`）抢到 7 的请求才回调 Java，抢不到的直接向运营返回 409。
+--   - 列/类型/索引/约束**均未变**（TINYINT 本就容得下 7），只变列 COMMENT 的取值说明；
+--   - 存量行不受影响（不会有人自动被置为 7）；
+--   - 迁移脚本（含回滚）：docs/ddl/agent_restock_plan_status_ordering.sql；
+--   - 代码侧同步：app/graphs/restock_state.py::PLAN_STATUS_ORDERING/ALLOWED_TRANSITIONS、
+--     app/graphs/restock_plan_store.py::claim_for_order/release_order_claim、
+--     docs/dkd-agent-restock-state-schema.md §5.3。
 -- ============================================================================

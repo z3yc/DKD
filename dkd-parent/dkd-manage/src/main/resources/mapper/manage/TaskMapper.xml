@@ -60,6 +60,20 @@
         </where>
     </select>
 
+    <!-- 建单防重：同设备 + 同工单类型 + 未完成工单（排期 1-8 / FIX-1）。
+         为什么不复用 selectTaskList：它的 task_status 是等值比较，查不了“1-待接单 + 2-进行中”两个状态。
+         LIMIT 1 足够：调用方只判断“有没有”，不需要把在途工单全取回来。 -->
+    <select id="selectInflightTaskList" resultMap="TaskResult">
+        <include refid="selectTaskVo"/>
+        where inner_code = #{innerCode}
+          and product_type_id = #{productTypeId}
+          and task_status in
+        <foreach item="status" collection="statuses" open="(" separator="," close=")">
+            #{status}
+        </foreach>
+        limit 1
+    </select>
+
     <select id="selectTaskByTaskId" parameterType="Long" resultMap="TaskResult">
         <include refid="selectTaskVo"/>
         where task_id = #{taskId}

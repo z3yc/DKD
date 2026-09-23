@@ -25,7 +25,12 @@
   “设备有未完成工单”这种 Java 侧防重异常，排期 1-8 验收项 ②）；
 - 终态（3-已跳过 / 5-已复盘）不可复活：`DecisionRejectedError("已跳过/已复盘为终态…")`。
   这是**有意的**约束——否则复盘口径会被改写（说好的跳过，几天后又被建单）；
-- 并发重复确认的**唯一性保证**（唯一键 + 乐观锁）属 1-8，本模块只保证单次决策的正确性。
+- 「建单中」（`PLAN_STATUS_ORDERING = 7`）拒绝一切人工操作（1-8 补）：该状态是
+  `agent_restock_plan` 上的**建单占位**，由 store 层的条件 UPDATE 抢得，抢不到的并发请求被拒为 409，
+  而不是产生两份工单；
+- 并发重复确认的**唯一性保证**（唯一键 + 乐观锁）在 1-8 落地：
+  `restock_plan_store.claim_for_order` / `release_order_claim` 的 CAS 才是排他位置，
+  本模块仍只保证**单次决策**的正确性（纯函数，不碰库、不持时钟）。
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from app.graphs.restock_state import (
     PLAN_STATUS_ADJUSTED,
     PLAN_STATUS_ORDERED,
+    PLAN_STATUS_ORDERING,
     PLAN_STATUS_REVIEWED,
     PLAN_STATUS_SKIPPED,
     PLAN_STATUS_SUGGESTED,
@@ -46,6 +52,7 @@ from app.graphs.restock_state import (
     RestockItem,
     RestockPlan,
     can_transition,
+    status_label,
 )
 
 logger = logging.getLogger("dkd.agent.graphs.restock_decisions")
@@ -126,6 +133,15 @@ class PlanDecision(BaseModel):
 
 def _reject(reason: str) -> DecisionRejectedError:
     return DecisionRejectedError(reason)
+
+
+def _reject_transition(plan: RestockPlan, what: str) -> DecisionRejectedError:
+    """状态不允许该操作时的统一文案。
+
+    为什么用中文标签而不是状态数字：这条消息是**直接给运营看的**（原型 V2 的 toast），
+    “当前状态 7 不允许跳过”对运营毫无意义，“当前状态「建单中」不允许跳过”才有指导性。
+    """
+    return _reject(f"当前状态「{status_label(plan.status)}」不允许{what}")
 
 
 def _require_reason(decision: PlanDecision, *, what: str) -> str:
@@ -211,7 +227,9 @@ def apply_decision(
     if decision.action == ACTION_RESTORE:
         reason = _require_reason(decision, what="恢复")
         if plan.status != PLAN_STATUS_SKIPPED:
-            raise _reject(f"只有「已跳过」的计划可以恢复，当前状态为 {plan.status}")
+            raise _reject(
+                f"只有「已跳过」的计划可以恢复，当前状态为「{status_label(plan.status)}」"
+            )
         if not can_transition(plan.status, PLAN_STATUS_SUGGESTED):
             raise _reject("状态机不允许从「已跳过」恢复")
         return (
@@ -229,6 +247,12 @@ def apply_decision(
     if plan.status == PLAN_STATUS_ORDERED and decision.action == ACTION_CONFIRM:
         return plan, RESULT_ALREADY_ORDERED, f"计划已建单（task_id={task_id}），无需重复确认"
 
+    # 2b) 建单占位中（排期 1-8）：另一个请求已经抢到这一行的建单权。
+    #     为什么不靠 can_transition 统一报错：它只能给出“当前状态 7 不允许…”这种无信息量的话，
+    #     而运营此时真正需要知道的是“有人正在建单，我该等一下再刷新”。
+    if plan.status == PLAN_STATUS_ORDERING:
+        raise _reject("该计划正在建单中（可能由另一位运营同时操作），请稍后刷新后重试")
+
     if decision.action == ACTION_CONFIRM:
         if plan.assignee_id is None:
             # 无接单人不能建单（Java 侧要求 emp.regionId == vm.regionId）；
@@ -241,19 +265,19 @@ def apply_decision(
             )
             return new_plan, RESULT_UNASSIGNED, "未匹配到同区域接单人，已置为「待指派」"
         if not can_transition(plan.status, PLAN_STATUS_ORDERED):
-            raise _reject(f"当前状态 {plan.status} 不允许建单")
+            raise _reject_transition(plan, "建单")
         return plan, RESULT_PENDING_ORDER, "已确认，正在创建补货工单"
 
     if decision.action == ACTION_ADJUST:
         reason = _require_reason(decision, what="调整")
         if not can_transition(plan.status, PLAN_STATUS_ADJUSTED):
-            raise _reject(f"当前状态 {plan.status} 不允许调整")
+            raise _reject_transition(plan, "调整")
         return apply_adjust(plan, decision, reason=reason), RESULT_ADJUSTED, f"已调整：{reason}"
 
     if decision.action == ACTION_SKIP:
         reason = _require_reason(decision, what="跳过")
         if not can_transition(plan.status, PLAN_STATUS_SKIPPED):
-            raise _reject(f"当前状态 {plan.status} 不允许跳过")
+            raise _reject_transition(plan, "跳过")
         return (
             plan.model_copy(update={"status": PLAN_STATUS_SKIPPED}),
             RESULT_SKIPPED,
@@ -264,7 +288,7 @@ def apply_decision(
         if not decision.assignee_id:
             raise _reject("指派操作必须提供接单人")
         if not can_transition(plan.status, PLAN_STATUS_ADJUSTED):
-            raise _reject(f"当前状态 {plan.status} 不允许指派")
+            raise _reject_transition(plan, "指派")
         return (
             plan.model_copy(
                 update={

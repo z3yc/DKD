@@ -14,7 +14,9 @@ from pydantic import ValidationError
 from app.graphs.restock_state import (
     ALLOWED_TRANSITIONS,
     FROZEN_FIELDS,
+    PLAN_STATUS_ADJUSTED,
     PLAN_STATUS_ORDERED,
+    PLAN_STATUS_ORDERING,
     PLAN_STATUS_REVIEWED,
     PLAN_STATUS_SKIPPED,
     PLAN_STATUS_SUGGESTED,
@@ -208,5 +210,25 @@ def test_status_codes_match_ddl_comment():
 
     ddl = Path(__file__).resolve().parents[2] / "docs" / "ddl" / "agent_tables.sql"
     text = ddl.read_text(encoding="utf-8")
-    assert "1-建议 2-已调整 3-已跳过 4-已建单 5-已复盘 6-待指派" in text
-    assert sorted(ALLOWED_TRANSITIONS) == [1, 2, 3, 4, 5, 6]
+    assert "1-建议 2-已调整 3-已跳过 4-已建单 5-已复盘 6-待指派 7-建单中" in text
+    assert sorted(ALLOWED_TRANSITIONS) == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_ordering_status_is_a_claim_not_a_business_status():
+    """7-建单中（排期 1-8）：只能通往 4-已建单，不得成为人工操作的入口。
+
+    这条约束是并发保护的前提：能人工操作“建单中”的计划，就能在回调进行中改掉数量/跳过，
+    而回调成功后会无条件把状态写成 4-已建单——工单与计划不一致且无人知晓。
+    """
+    assert ALLOWED_TRANSITIONS[PLAN_STATUS_ORDERING] == frozenset({PLAN_STATUS_ORDERED})
+    for manual_target in (
+        PLAN_STATUS_SUGGESTED,
+        PLAN_STATUS_ADJUSTED,
+        PLAN_STATUS_SKIPPED,
+        PLAN_STATUS_UNASSIGNED,
+        PLAN_STATUS_REVIEWED,
+    ):
+        assert not can_transition(PLAN_STATUS_ORDERING, manual_target)
+    # 可被认领的三个状态都必须通往占位态（否则并发保护写不进去）
+    for claimable in (PLAN_STATUS_SUGGESTED, PLAN_STATUS_ADJUSTED, PLAN_STATUS_UNASSIGNED):
+        assert can_transition(claimable, PLAN_STATUS_ORDERING)

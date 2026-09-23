@@ -7,6 +7,7 @@ import java.util.List;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -32,6 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -52,6 +54,10 @@ import static org.mockito.Mockito.when;
 @MockitoSettings(strictness = Strictness.LENIENT)
 class AgentTaskCreateServiceTest
 {
+    /** 未完成工单状态集合（排期 1-8 / FIX-1：1-待接单 + 2-进行中） */
+    private static final List<Long> INFLIGHT_STATUSES =
+            Arrays.asList(DkdContants.TASK_STATUS_CREATE, DkdContants.TASK_STATUS_PROGRESS);
+
     @Mock
     private TaskMapper taskMapper;
 
@@ -113,7 +119,8 @@ class AgentTaskCreateServiceTest
     void 建单成功时回传工单号且字段按档案填充()
     {
         when(vendinngService.selectVendingMachineByInnerCode("A1000001")).thenReturn(runningVm(3L));
-        when(taskMapper.selectTaskList(any(Task.class))).thenReturn(new ArrayList<Task>());
+        when(taskMapper.selectInflightTaskList(anyString(), any(Long.class), any(List.class)))
+                .thenReturn(new ArrayList<Task>());
         when(empService.selectEmpById(2L)).thenReturn(empOfRegion(3L));
         when(redisTemplate.hasKey(anyString())).thenReturn(false);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
@@ -140,7 +147,8 @@ class AgentTaskCreateServiceTest
     void 原签名入口保持返回影响行数()
     {
         when(vendinngService.selectVendingMachineByInnerCode("A1000001")).thenReturn(runningVm(3L));
-        when(taskMapper.selectTaskList(any(Task.class))).thenReturn(new ArrayList<Task>());
+        when(taskMapper.selectInflightTaskList(anyString(), any(Long.class), any(List.class)))
+                .thenReturn(new ArrayList<Task>());
         when(empService.selectEmpById(2L)).thenReturn(empOfRegion(3L));
         when(redisTemplate.hasKey(anyString())).thenReturn(true);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
@@ -154,7 +162,7 @@ class AgentTaskCreateServiceTest
     void 设备有未完成工单时拒绝且不落库()
     {
         when(vendinngService.selectVendingMachineByInnerCode("A1000001")).thenReturn(runningVm(3L));
-        when(taskMapper.selectTaskList(any(Task.class)))
+        when(taskMapper.selectInflightTaskList(anyString(), any(Long.class), any(List.class)))
                 .thenReturn(new ArrayList<Task>(Arrays.asList(new Task())));
 
         assertThatThrownBy(() -> taskService.insertTaskDtoReturningTask(supplyTaskDto()))
@@ -163,11 +171,42 @@ class AgentTaskCreateServiceTest
         verify(taskMapper, never()).insertTask(any(Task.class));
     }
 
+    /**
+     * FIX-1 防回归（排期 1-8）：**待接单（status=1）的工单也算未完成**。
+     *
+     * <p>原先防重固定查 {@code task_status = 2}（进行中），而智能体刚建好的工单是
+     * {@code status = 1}（待接单）——最需要防的那一类恰好查不到，重复建单会直接污染业务事实。
+     * 本用例把两个状态都钉住：不仅断言“调用了哪个方法”，还断言**传入的状态集合**，
+     * 因为只改方法名而漏传 status=1 会得到完全一样的外部行为（又变回漏防）。
+     */
+    @Test
+    void 待接单的工单也必须算未完成_FIX1()
+    {
+        when(vendinngService.selectVendingMachineByInnerCode("A1000001")).thenReturn(runningVm(3L));
+        // 库里已有一张 status=1（待接单）的补货工单
+        Task pending = new Task();
+        pending.setTaskStatus(DkdContants.TASK_STATUS_CREATE);
+        when(taskMapper.selectInflightTaskList(anyString(), any(Long.class), any(List.class)))
+                .thenReturn(new ArrayList<Task>(Arrays.asList(pending)));
+
+        assertThatThrownBy(() -> taskService.insertTaskDtoReturningTask(supplyTaskDto()))
+                .isInstanceOf(ServiceException.class)
+                .hasMessage("设备有未完成工单，请勿重复创建工单");
+        verify(taskMapper, never()).insertTask(any(Task.class));
+
+        // 断言查询时确实把 1-待接单 与 2-进行中 都算作“未完成”
+        ArgumentCaptor<List<Long>> captor = ArgumentCaptor.forClass(List.class);
+        verify(taskMapper).selectInflightTaskList(eq("A1000001"), eq(2L), captor.capture());
+        assertThat(captor.getValue()).containsExactlyInAnyOrder(
+                DkdContants.TASK_STATUS_CREATE, DkdContants.TASK_STATUS_PROGRESS);
+    }
+
     @Test
     void 员工区域与设备不一致时拒绝且不落库()
     {
         when(vendinngService.selectVendingMachineByInnerCode("A1000001")).thenReturn(runningVm(3L));
-        when(taskMapper.selectTaskList(any(Task.class))).thenReturn(new ArrayList<Task>());
+        when(taskMapper.selectInflightTaskList(anyString(), any(Long.class), any(List.class)))
+                .thenReturn(new ArrayList<Task>());
         when(empService.selectEmpById(2L)).thenReturn(empOfRegion(9L));
 
         assertThatThrownBy(() -> taskService.insertTaskDtoReturningTask(supplyTaskDto()))

@@ -565,3 +565,32 @@ LangGraph checkpointer，当前用 SQLite（单机形态匹配、零新增基础
 14. **可观测字段从执行路径推导，不硬编码**（`mode`/`model`/`upstream`）——失真的方式恰好是“看起来正常”。
 15. **“构建/测试通过”要看数字**（`Tests run`、覆盖率、断言数）：surefire 2.12.4 会静默跳过 JUnit5；被跳过的“绿”比红灯危险。
 16. **把一次性验证沉淀成资产**：本次把“16 项网关冒烟”入库为 `docs/scripts/g1-gateway-smoke.sh`，把真实 SSE 字节流做成分帧夹具——下次回归只跑一条命令。
+
+
+## 2026-09-23 任务 1-8 开发复盘（未验收）
+
+### 本轮改动与边界
+
+- 接单人按设备区域匹配运营人员，批量读取员工及当日计划负载，负载/员工 ID 确定性排序；Java 负责业务写入，Python 不更新任何 tb_* 事实表。
+- 同一计划建单先通过 agent_restock_plan.status: 1/2/6 → 7 条件更新抢占，只有影响行数为 1 才允许回调 Java；拒绝非法 claim/release 状态，避免将 7 锁状态或终态错误恢复。
+- Java FIX-1 扩大在途工单防重状态范围，Agent 层 CAS 与 Java 业务校验分层防重复；此处不等同全局业务唯一键，仍需验证并发边界。
+- 只读工具的列表参数改用 SQLAlchemy expanding bind，继续保持表白名单、分批、时间范围、LIMIT 和超时保护。
+
+### 关键故障模式：状态 7 的崩溃窗口
+
+1. Agent CAS 成功（status=7）后调用 Java；
+2. Java 已提交工单，但 Python 在写回 status=4 前崩溃/断连；
+3. 自动把 7 释放回 1/2/6 会允许再次建单，可能产生重复工单；长期留 7 又会阻断正常重试。
+
+因此：**回调结果不确定时禁止自动释放占位**。值班人员须先用设备/计划日及 Java 工单查询核实是否已建单；若已建单，将计划与工单号人工对账后修复 Agent 计划状态；确认 Java 未建单后，才通过受控运维流程释放占位并记录操作人、时间、证据。需继续评估租约/超时回收协议和 Java 侧幂等键；在具备原子对账前，本方案只能算风险缓解，不是完整崩溃恢复。
+
+### 本轮验证结果与阻塞
+
+- Python 3.11.13 隔离环境全量测试：`pytest -p no:cacheprovider` → **247 passed, 10 deselected**。运行时发现系统默认 TEMP 和 pytest 缓存目录权限不足；将 TEMP/TMP 指向仓库隔离临时目录并禁用缓存插件后，完整测试通过。现有损坏 `.venv` 未触碰。\n- 本轮涉及的 4 个 Python 文件 `ruff check` 通过，`ruff format --check .` → **54 files already formatted**。全量 `ruff check .` 仍失败于本轮范围外既有 `app/audit.py:59`（UP038，`isinstance(value, (list, tuple))`）；未借机改动旁支。\n- SQL expanding bind 回归测试第一次运行发现设备库存查询漏加 expanding 声明、档案查询误挂无关 bind、测试 fake 未记录 statement 且 SQL 形状断言过时；逐项修正后 read_tools 测试及全量测试通过。\n- Java 定向命令 `mvn -pl dkd-admin -am "-Dtest=AgentTaskCreateServiceTest" "-Dsurefire.failIfNoSpecifiedTests=false" test -q` → **退出码 0**。首次沙箱运行因外部 Maven 缓存/依赖不可访问失败，经授权后重跑通过。
+- 本机 python --version 为 **3.8.0**，项目要求 Python 3.11；py -0p 未发现已注册 Python，故未运行 pytest。按协作边界不进入、不删除、不重建 .venv，避免破坏环境及其中数据。需提供/安装合规解释器后再跑完整测试。
+- 真实 MySQL/10 台跨区域设备和并发确认本轮未执行；因此不把单元测试或静态检查冒充真实验收。Maven 测试本轮也未重跑；此前记录的 Surefire 依赖解析阻塞仍需在网络/依赖恢复后验证。
+- FIX-2 决策审计缺口仍未闭环：人工调整/跳过/恢复等写操作应独立补 agent_decision_log，旁路失败告警且不回滚业务写入；当前不声称已满足全量决策留痕。
+
+### 面试表达（诚实边界）
+
+可以讲“用数据库 CAS 保护跨进程建单入口、Java 防重作为业务事实最后防线、业务表读写分离”，但应同时说明状态 7 存在“Java 成功、Agent 回写失败”的崩溃窗口，现需人工对账；未完成 10 台真实验收与 Maven/Python 全量门禁前，不说“生产验证通过”或“彻底幂等”。

@@ -48,6 +48,7 @@ class FakeSession:
         self, rows_by_call: list[list[dict[str, Any]]] | None = None, delay: float = 0.0
     ) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.statements: list[Any] = []
         self._rows_by_call = rows_by_call or []
         self._delay = delay
 
@@ -55,6 +56,7 @@ class FakeSession:
         if self._delay:
             await asyncio.sleep(self._delay)
         self.calls.append((str(stmt), dict(params)))
+        self.statements.append(stmt)
         index = len(self.calls) - 1
         rows = self._rows_by_call[index] if index < len(self._rows_by_call) else []
         return FakeResult(rows)
@@ -159,7 +161,9 @@ async def test_inventory_and_task_queries_keep_limit_and_join_keys():
     await read_tools.list_inflight_tasks(session2, inner_codes=["A1"])
     task_sql = session2.calls[0][0].lower()
     assert "left join tb_task_details d on d.task_id = t.task_id" in task_sql
-    assert "t.task_status in :statuses" in task_sql
+    assert "t.task_status in (__[postcompile_statuses])" in task_sql
+    assert session2.statements[0]._bindparams["inner_codes"].expanding is True
+    assert session2.statements[0]._bindparams["statuses"].expanding is True
     assert session2.calls[0][1]["statuses"] == (1, 2), "在途 = 待接单 + 进行中"
 
 
@@ -295,6 +299,10 @@ async def test_every_tool_only_touches_whitelisted_tables():
     used = _tables_in(session.sql_text)
     assert used, "至少要解析出表名，否则这个元测试是空转"
     assert used <= whitelist, f"工具访问了白名单外的表：{used - whitelist}"
+    for statement in session.statements:
+        for name in ("inner_codes", "region_ids", "statuses"):
+            if name in statement._bindparams:
+                assert statement._bindparams[name].expanding is True
 
 
 async def test_empty_and_invalid_input_are_rejected():
@@ -394,3 +402,109 @@ def test_default_sales_window_is_half_open():
     assert start == datetime(2026, 9, 14) and end == datetime(2026, 9, 21), (
         "半开区间 [today-7, today)"
     )
+
+
+# --------------------------------------------------------------------------------------
+# 1-8：接单人分配的两条查询（设备区域 + 同区域运营人员）
+# --------------------------------------------------------------------------------------
+
+
+async def test_list_machine_profiles_uses_expanding_bound_for_in_values():
+    session = FakeSession()
+    await read_tools.list_machine_profiles(session, inner_codes=["A1", "A2"])
+    statement = session.statements[0]
+    assert statement._bindparams["inner_codes"].expanding is True
+
+
+async def test_list_machine_profiles_does_not_filter_vm_status():
+    """回归护栏：区域是**档案事实**，不能因为设备此刻不在运营状态就查不到区域。
+
+    若这里筛了 vm_status=1，一台停用设备会被判成“没有区域”→“找不到接单人”，
+    于是运营看到“待指派”，而真实原因完全不同（计划本就不该为停用设备生成）。
+    """
+    rows = [
+        {
+            "vm_id": 80,
+            "inner_code": "A1",
+            "addr": "北京",
+            "vm_status": 3,
+            "node_id": 5,
+            "node_name": "五道口",
+            "region_id": 3,
+            "region_name": "华北",
+        }
+    ]
+    session = FakeSession(rows_by_call=[rows])
+
+    profiles = await read_tools.list_machine_profiles(session, inner_codes=["A1"])
+
+    assert profiles[0].region_id == 3
+    sql = session.sql_text.lower()
+    # 只选列不筛条件：查询里不得出现 `vm_status =` / `vm_status in` 这类谓词
+    assert "vm_status =" not in sql and "vm_status in" not in sql, (
+        "不得筛设备状态（区域是档案事实）"
+    )
+    assert "where v.inner_code in (__[postcompile_inner_codes])" in sql
+    assert _tables_in(sql) == {"tb_vending_machine", "tb_node", "tb_region"}
+
+
+async def test_list_machine_profiles_batches_and_normalizes_codes():
+    session = FakeSession()
+    await read_tools.list_machine_profiles(session, inner_codes=[" A1 ", "A1", "", "A2"])
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["inner_codes"] == ("A1", "A2"), "去重去空白后一次批量取"
+
+
+async def test_list_region_assignees_filters_role_and_status():
+    """三个过滤条件缺一不可（与 `EmpController.businessList` 逐条对齐）。"""
+    rows = [
+        {"emp_id": 6, "user_name": "周晨", "region_id": 1},
+        {"emp_id": 7, "user_name": "柯涵", "region_id": 1},
+        {"emp_id": 2, "user_name": "李四", "region_id": 2},
+    ]
+    session = FakeSession(rows_by_call=[rows])
+
+    grouped = await read_tools.list_region_assignees(session, region_ids=[1, 2])
+
+    assert [a.emp_id for a in grouped[1]] == [6, 7]
+    assert [a.emp_id for a in grouped[2]] == [2]
+    sql, params = session.calls[0]
+    assert "role_code = :role_code" in sql and params["role_code"] == "1002", (
+        "必须只取运营人员（1003 是维修，派错队列）"
+    )
+    assert "status = :status" in sql and params["status"] == 1, "停用员工不能派单"
+    assert "order by region_id, id" in sql.lower().replace("\n", " "), "确定性顺序"
+    assert _tables_in(sql) == {"tb_emp"}
+
+
+async def test_list_region_assignees_empty_input_does_not_query():
+    session = FakeSession()
+    assert await read_tools.list_region_assignees(session, region_ids=[]) == {}
+    assert session.calls == [], "空入参不得发出无 WHERE 的全表查询"
+
+
+async def test_list_region_assignees_batches_by_read_batch_size(monkeypatch):
+    monkeypatch.setenv("DKD_AGENT_READ_BATCH_SIZE", "2")
+    get_settings.cache_clear()
+    try:
+        session = FakeSession()
+        await read_tools.list_region_assignees(session, region_ids=[1, 2, 3, 1])
+        assert [call[1]["region_ids"] for call in session.calls] == [(1, 2), (3,)]
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_list_region_assignees_skips_unknown_region_without_error():
+    """区域没人 → 返回字典里没有该键（由调用方降级为「待指派」），不是抛异常。"""
+    session = FakeSession(rows_by_call=[[{"emp_id": 6, "user_name": "周晨", "region_id": 1}]])
+    grouped = await read_tools.list_region_assignees(session, region_ids=[1, 99])
+    assert grouped.get(99) is None
+
+
+async def test_assignee_tables_are_readable_but_not_writable():
+    """tb_emp 是**只读**白名单表：读得到、写不了（红线 §7.3）。"""
+    from app.db import assert_table_allowed
+
+    assert_table_allowed("tb_emp")
+    with pytest.raises(TableNotAllowedError, match="业务表"):
+        assert_table_allowed("tb_emp", writable=True)

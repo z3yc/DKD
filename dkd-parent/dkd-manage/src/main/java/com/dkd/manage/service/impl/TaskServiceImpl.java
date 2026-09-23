@@ -1,6 +1,7 @@
 package com.dkd.manage.service.impl;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -175,17 +176,18 @@ public class TaskServiceImpl implements ITaskService
         }
         //校验售货机状态与工单类型是否一致
         checkCreateTask(vm.getVmStatus(),taskDto.getProductTypeId());
-        //检查设备是否有未完成的工单
-       //创建对象，并设置设备编号、工单类型、创建人、创建时间
-        Task taskParam = new Task();
-        taskParam.setInnerCode(taskDto.getInnerCode());
-        taskParam.setProductTypeId(taskDto.getProductTypeId());
-        taskParam.setTaskStatus(DkdContants.TASK_STATUS_PROGRESS);
-        // 注意：这里是“先查后插”，**并发下可能双建单**（表上无 (inner_code, product_type_id, status)
-        // 唯一索引）。排期 1-8 在 Agent 侧用计划状态机 + 幂等键兜住并发确认；
-        // 本方法保持原语义不动（避免影响既有调用方与前端行为）。
-        //查询符合条件的工单
-        List<Task> taskList = taskMapper.selectTaskList(taskParam);
+
+        // 检查设备是否有未完成的工单（防重）
+        // 排期 1-8 / FIX-1 修正：原先固定查 TASK_STATUS_PROGRESS(2-进行中)，
+        // 而刚建好的工单是 TASK_STATUS_CREATE(1-待接单)——最需要防的那一类反而查不到，
+        // 于是“先查后插”只在“已有人接单”时生效（Agent 回调建单时几乎总是 status=1）。
+        // 现改为查「未完成 = 1-待接单 + 2-进行中」，与异常文案“设备有未完成工单”一致。
+        // 注意：这里仍是先查后插，**并发窗口依旧存在**（表上无 (inner_code, product_type_id, status)
+        // 唯一索引），需要强一致时由调用方在自有表上做 CAS/幂等键（Agent 侧见排期 1-8）。
+        List<Task> taskList = taskMapper.selectInflightTaskList(
+                taskDto.getInnerCode(),
+                taskDto.getProductTypeId(),
+                Arrays.asList(DkdContants.TASK_STATUS_CREATE, DkdContants.TASK_STATUS_PROGRESS));
         //如果有未完成工单，抛出异常
         if(taskList != null && taskList.size() > 0){
             throw new ServiceException("设备有未完成工单，请勿重复创建工单");

@@ -34,6 +34,12 @@ PLAN_STATUS_SKIPPED = 3
 PLAN_STATUS_ORDERED = 4
 PLAN_STATUS_REVIEWED = 5
 PLAN_STATUS_UNASSIGNED = 6
+# 7-建单中：**建单占位状态**（排期 1-8 的 DB 级乐观锁载体，不是给人看的业务状态）。
+# 为什么需要一个占位状态：确认建单是「先查后插」的非幂等动作，两个并发确认会各建一张工单。
+# 业务事实唯一所有者是 Java，Agent 侧唯一能原子化的位置就是 `agent_restock_plan` 这一行——
+# 先把该行从 1/2/6 用条件 UPDATE（CAS）抢成 7，抢不到的那个请求直接 409，
+# 建单成功落 4、失败再 CAS 回退，从而在「跨进程/跨副本」下也只有一个请求能回调 Java。
+PLAN_STATUS_ORDERING = 7
 
 # 工单类型/创建类型：与 DkdContants.TASK_TYPE_SUPPLY / 现有建单调用保持一致
 TASK_TYPE_SUPPLY = 2
@@ -42,12 +48,30 @@ CREATE_TYPE_SYSTEM = 1
 # 状态机合法迁移：键=当前状态，值=允许迁移到的状态集合
 ALLOWED_TRANSITIONS: dict[int, frozenset[int]] = {
     PLAN_STATUS_SUGGESTED: frozenset(
-        {PLAN_STATUS_ADJUSTED, PLAN_STATUS_SKIPPED, PLAN_STATUS_ORDERED, PLAN_STATUS_UNASSIGNED}
+        {
+            PLAN_STATUS_ADJUSTED,
+            PLAN_STATUS_SKIPPED,
+            PLAN_STATUS_ORDERED,
+            PLAN_STATUS_UNASSIGNED,
+            PLAN_STATUS_ORDERING,
+        }
     ),
     PLAN_STATUS_ADJUSTED: frozenset(
-        {PLAN_STATUS_SKIPPED, PLAN_STATUS_ORDERED, PLAN_STATUS_UNASSIGNED}
+        {
+            PLAN_STATUS_SKIPPED,
+            PLAN_STATUS_ORDERED,
+            PLAN_STATUS_UNASSIGNED,
+            PLAN_STATUS_ORDERING,
+        }
     ),
-    PLAN_STATUS_UNASSIGNED: frozenset({PLAN_STATUS_ADJUSTED, PLAN_STATUS_ORDERED}),
+    PLAN_STATUS_UNASSIGNED: frozenset(
+        {PLAN_STATUS_ADJUSTED, PLAN_STATUS_ORDERED, PLAN_STATUS_ORDERING}
+    ),
+    # 占位状态只能落 4-已建单（建单成功）。
+    # 失败回退（7→1/2/6）**故意不在此表内**：那是失败补偿写回，不是用户决策，
+    # 由 `restock_plan_store.release_order_claim` 的条件 UPDATE 排他地完成
+    # （只有持有占位的那个请求能释放）；放进来会让「建单中」的计划被人工调整/跳过。
+    PLAN_STATUS_ORDERING: frozenset({PLAN_STATUS_ORDERED}),
     PLAN_STATUS_ORDERED: frozenset({PLAN_STATUS_REVIEWED}),
     # 3-已跳过 → 1-建议：**仅**由显式「恢复建议」动作触发（原型 V2 的按钮），
     # 且必须带原因、只允许当天（跨日改写会污染 3-6 的复盘口径，故由服务层加时钟校验）。
@@ -60,8 +84,29 @@ ALLOWED_TRANSITIONS: dict[int, frozenset[int]] = {
 
 
 def can_transition(current: int, target: int) -> bool:
-    """状态机卡口：阻止「已建单/已复盘」被重复确认或回退（幂等的应用层防线）。"""
+    """状态机卡口：阻止「已建单/已复盘」被重复确认或回退（幂等的应用层防线）。
+
+    注意它防不住并发：两个进程各自读取同一行（都是 1-建议）都会通过卡口。
+    并发唯一性由 `docs/ddl/agent_tables.sql` 的唯一键 + 1-8 的条件 UPDATE（`status=7` 占位）保证。
+    """
     return target in ALLOWED_TRANSITIONS.get(current, frozenset())
+
+
+# 状态 → 中文标签（拒绝文案与前端状态标签共用一处，避免三端各写一份映射）
+STATUS_LABELS: dict[int, str] = {
+    PLAN_STATUS_SUGGESTED: "建议",
+    PLAN_STATUS_ADJUSTED: "已调整",
+    PLAN_STATUS_SKIPPED: "已跳过",
+    PLAN_STATUS_ORDERED: "已建单",
+    PLAN_STATUS_REVIEWED: "已复盘",
+    PLAN_STATUS_UNASSIGNED: "待指派",
+    PLAN_STATUS_ORDERING: "建单中",
+}
+
+
+def status_label(status: int) -> str:
+    """取状态中文名（未知状态如实回显数字，而不是编一个像样的名字）。"""
+    return STATUS_LABELS.get(status, str(status))
 
 
 class RestockItem(BaseModel):
