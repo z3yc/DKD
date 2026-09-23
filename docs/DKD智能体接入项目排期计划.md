@@ -207,9 +207,10 @@
 
 ## 七、执行进度（滚动更新）
 
-> 更新于 **2026-09-21**（Phase 0 全部收官 + Phase 1 执行至 **1-7**）。
+> 更新于 **2026-09-21**（Phase 0 全部收官 + Phase 1 执行至 **1-7**，并已合并入 `main`/`develop` 且推送至 `origin`）。
 > 状态图例：✅ 已完成并验证 / 🔄 进行中 / ⏳ 待办 / ⛔ 阻塞。
-> **Phase 1 剩余任务逐条状态见下方 Phase 1 表；其中“待修/前置”类问题统一登记在 §八。**
+> **Phase 1 剩余任务逐条状态见下方 Phase 1 表；其中“待修/前置”类问题统一登记在 §八；
+> 分支/合并/推送的交付状态见“交付与分支状态”。**
 
 ### Phase 0（W1~W3，09-21 ~ 10-09）
 
@@ -236,12 +237,13 @@
 | 项目 | 结果 |
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
-| `uv run ruff format --check .` | 29 files already formatted |
+| `uv run ruff format --check .` | 51 files already formatted |
 | `uv run pytest` | **203 passed**（5 live 用例默认 deselect），覆盖率 **93.95%**（要求 ≥70%）；`-m live` 另 4 项真库抽样通过 |
 | `mvn -pl dkd-admin -am test` | **Tests run: 47, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8 / **TaskCreate 5**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142） |
+| 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**22/22 PASS**）；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
 
 ### 本轮（0-6 / 0-7 / 0-8 / 0-11 / 0-14c）详细记录
 
@@ -339,6 +341,23 @@
 ③ **`tb_inventory` 与 `tb_channel` 的 `sku_id`/容量实测 3/3 不一致** → 读工具如实双返并标记 `data_consistent=false`，需业务确认权威源；
 ④ 销量口径固定 `status=2`（出货成功，`ReportServiceImpl.java:28`），已做成配置项。
 
+### 交付与分支状态（合并 / 推送记录）
+
+| 时间 | 交付批次 | 分支动作 | 提交 | 远端状态 |
+| --- | --- | --- | --- | --- |
+| 2026-09-21 | Phase 0 集成底座（0-1~0-15） | `feature/agent-gateway` → `main` | `e1f7604`（merge commit） | `origin/main`、`origin/develop` 同步 |
+| 2026-09-21 | **Phase 1 补货主体（1-1~1-7）+ 排期 V2.1** | `feature/agent-gateway-java` → `main`（`--no-ff`），`develop` 同步 | `9b8f9ae`（merge commit） | **已推送**：`e1f7604..9b8f9ae`（`main`/`develop`）；`feature/agent-gateway-java` 已推送为远端新分支（`527eae6`） |
+
+约定（`AGENTS.md §5.1`）：
+1. 新特性从 `develop` 切 `feature/<模块>-<功能简述>`；**`main`/`develop` 的推送与合并需项目负责人明确批准**（本轮为负责人指令后执行）；
+2. 合并前本地门禁必须全绿——本轮合并前实测：`ruff` 全过 / `pytest` **203 passed 93.95%** / `mvn -pl dkd-admin -am test` **47 passed** / `BUILD SUCCESS`；
+3. 合并后校验：合并提交树与特性分支**逐字一致**（`git diff --stat` 为空），无冲突、无额外改动；
+4. 本批次对 Java 业务代码的改动面：仅 `dkd-manage` 回调回传 `taskId/taskCode`（1-3 必需，+5 个单测），**未触碰既有业务逻辑**。
+
+> ⚠️ 环境注意（本轮实测，见 §八 FIX-18）：本机推送依赖代理 `http://127.0.0.1:7897`；
+> 该节点对 `github.com:443` 的路由曾失效（CONNECT 隧道成功但 TLS 握手无响应），
+> 切换节点后恢复。复现与判定方法记录在 §八。
+
 ### Phase 2 / 3 / 4（未开工）
 
 | 阶段 | 起始条件（门禁） | 当前状态 |
@@ -374,7 +393,7 @@
 
 > 只在「有证据 + 有归属任务 + 有验收方式」时才登记；关闭时必须写清证据（AGENTS §9.3 不隐瞒）。
 > 图例：🔴 阻塞/红线相关 · 🟡 影响验收或体验 · 🔵 技术债/观测性。归属列写的是**落地任务号**。
-> 更新于 2026-09-21（Phase 1 执行至 1-7 后回写）。
+> 更新于 2026-09-21（Phase 1 执行至 1-7 并合并推送后回写）。共 **18 条**：已关闭 2 条（FIX-8/9），待修 16 条。
 
 | # | 等级 | 问题 | 证据（file:line / 实测） | 影响 | 归属 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -395,6 +414,7 @@
 | FIX-15 | 🔵 | **回调失败后的“重试建单”只有隐式路径**：建单失败时计划状态不变，运营需**再次点「确认」**重试（服务层已如此实现，但未在接口文档/前端提示中写明） | `restock_service._execute`（失败不落库、状态不变）+ `restock_graph.create_tasks` 同类取舍 | 运营可能以为“点了没反应”；接口文档缺一句说明 | 1-10 前端提示 + 4-1 接口文档 | 待补文档 |
 | FIX-16 | 🔵 | **`@RateLimiter` 的 Redis 依赖 fail-closed 未演练**：Redis 不可用时回调用例会全拒 | 0-15 记录（“属预期行为，未做演练”） | 上线后 Redis 抖动可能表现为“Agent 建单全失败” | 3-9 压测与故障演练 | 待演练 |
 | FIX-17 | 🟡 | **M1 遗留：真 LLM 全链的 `agent.enabled=false` 一键降级已验，但“Python 侧 LLM 密钥缺失→降级到规则增强版”的自动降级未验**（目前是校准开关手动关闭） | `restock_calibration.calibrate_plan` 捕获异常降级（单测覆盖）；真实密钥失效场景未演练 | 密钥过期时行为可预期（降级）但未实测 | 3-9 故障演练 | 待演练 |
+| FIX-18 | 🔵 | **代码交付通道依赖本机代理节点**：`github.com` 经代理偶发不可达（`CONNECT` 隧道返回 200 但 TLS 握手无响应），导致 `git push` 报 `TLS connect error: error:00000000:lib(0)::reason(0)` | 本轮实测：`curl -x http://127.0.0.1:7897 https://api.github.com` → **200**（代理本身可用），而 `https://github.com/` → **000**；重试 3 次 + 强制 `http.version=HTTP/1.1` 均失败；直连 000；`127.0.0.1:1080` 无服务；`ssh -T git@github.com` 可达但本机无 SSH 私钥 | 交付被阻塞（本轮靠切换节点恢复）；上线期的回滚/热修可能同样被卡 | 环境/运维（非代码）；建议登记备用通道（SSH key 或第二代理节点） | 待环境侧处理 |
 
 ---
 
@@ -402,6 +422,8 @@
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.1）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。*
 
-*版本：**V2.1（2026-09-21，Phase 1 执行至 1-7 后回写）**。本次变更：① 新增 **§八 待修复与技术债清单**（17 条，含证据与归属任务）；② §七 Phase 1 进度细化为逐条（1-8~1-14 + 建议新增 1-7b）；③ 在 1-8/1-9/1-12 的完成标准里写入「接手要点」与前置 FIX 项。**本次仅补充排期文档章节与进度，未改动方案口径，故方案保持 V1.1**；若后续 §八 中的 FIX-1/FIX-3 涉及 Java 业务口径变更落地，需同步升版方案并互相引用。*
+*版本：**V2.2（2026-09-21，Phase 1 的 1-1~1-7 合并推送后回写）**。本次变更：① 新增 §七「交付与分支状态（合并/推送记录）」小节（含提交号、门禁证据、合并校验与 Java 改动面）；② §八 新增 **FIX-18**（交付通道依赖代理节点）；③ 刷新质量门禁现状（`ruff format --check` 51 文件、补 Phase 1 的 4 个端到端脚本）。*
+
+*上一版 **V2.1**：① 新增 §八 待修复与技术债清单（17 条，含证据与归属任务）；② §七 Phase 1 进度细化为逐条（1-8~1-14 + 建议新增 1-7b）；③ 在 1-8/1-9/1-12 的完成标准里写入「接手要点」与前置 FIX 项。**补充排期章节与进度不改变方案口径，故方案保持 V1.1**；若 §八 中的 FIX-1/FIX-3 涉及 Java 业务口径变更落地，需同步升版方案并互相引用。*
 
 ---
