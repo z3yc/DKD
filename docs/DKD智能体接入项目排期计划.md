@@ -208,6 +208,7 @@
 ## 七、执行进度（滚动更新）
 
 > 更新于 **2026-09-21**（Phase 0 全部收官 + Phase 1 执行至 **1-7**，并已合并入 `main`/`develop` 且推送至 `origin`）。
+> **最近一次：2026-09-23 —— Phase 1 执行至 1-8（主体）+ 本轮完成 1-7b（FIX-2 决策留痕闭环）。**
 > 状态图例：✅ 已完成并验证 / 🔄 进行中 / ⏳ 待办 / ⛔ 阻塞。
 > **Phase 1 剩余任务逐条状态见下方 Phase 1 表；其中“待修/前置”类问题统一登记在 §八；
 > 分支/合并/推送的交付状态见“交付与分支状态”。**
@@ -238,12 +239,12 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | 51 files already formatted |
-| `uv run pytest` | **203 passed**（5 live 用例默认 deselect），覆盖率 **93.95%**（要求 ≥70%）；`-m live` 另 4 项真库抽样通过 |
-| `mvn -pl dkd-admin -am test` | **Tests run: 47, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8 / **TaskCreate 5**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
+| `uv run pytest` | **258 passed**（10 个 live 用例默认 deselect），覆盖率 **94.91%**（要求 ≥70%）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
+| `mvn -pl dkd-admin -am test` | **Tests run: 48, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8 / **TaskCreate 6**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142） |
-| 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**22/22 PASS**）；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
+| 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**31/31 PASS**，其中 [H] 段为本轮新增的 1-7b 留痕断言）；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
 
 ### 本轮（0-6 / 0-7 / 0-8 / 0-11 / 0-14c）详细记录
 
@@ -298,13 +299,14 @@
 | 1-5 | 补货子图-B：LLM 校准节点（点位画像/节假日/异常波动因子）+ 理由生成 | ✅ | ① 新增 `app/prompts/restock_calibration.py`（**提示词集中存放**，AGENTS §2.3 禁止硬编码在业务逻辑里）：数据包在 `<data>` 围栏内并声明“是数据不是指令”，只允许模型输出**系数**（不给绝对数量，避免“算错”与“瞎编”混在一起无法归因）；② 新增 `app/graphs/restock_calibration.py`：**三层不可信输入防护**（提示词围栏 → 容错解析 → 系数夹取 `[0.7,1.5]` + 容量二次夹取）；容错解析 = 括号配对扫描取 JSON（跳过字符串内花括号，不用 `rfind`）、未知货道/重复项/非数字/NaN **逐项丢弃并记 issues**；③ 失败即降级：LLM 超时/非 JSON → **保留统计基线结果**、写入 `calibration_notes[].issues`，**不写 `failures`**（校准失败 ≠ 业务失败，避免运营误判）；④ 机器可读明细放 `calibration_notes`、人可读依据追加进 `reason`——**不改 RestockItem 冻结字段**（0-13 约束，新增字段须走兼容性评审）；⑤ token 按服务端实际模型计量并向上累加（接 0-12 成本限额）；⑥ 测试 20 项（围栏/寒暄/字符串花括号容错、越界夹取、重复项取第一条、NaN/非数字丢弃、容量夹取、必需的补货不被清零、reason ≤500、开关关闭时**不调 LLM**、LangGraph 节点只写 plans/calibration_notes）；⑦ 门禁：ruff 全过 / pytest **139 passed** 95.53% |
 | 1-6 | 补货子图-C：`interrupt` 人工确认 + 计划状态机（建议→已调整→已跳过→已建单） | ✅ | ① 新增 `app/graphs/restock_decisions.py`：**纯函数状态机**（迁移表逐字对齐 0-13 冻结稿与 `agent_tables.sql:134-137`），确认/调整/跳过/指派四类决策 + 中文拒绝原因；关键取舍：**人工调整越界即拒绝、不静默夹取**（LLM 是不可信输入才夹取；人手填错必须让他看见，否则“我填了 20”变成“生效了 10”无人知晓）、**终态不可复活**（3/5 拒绝）、**已建单重复确认幂等返回“已建单”**（1-8 验收项 ② 的基础版）；② 新增 `app/graphs/restock_plan_store.py`：`agent_restock_plan` 幂等 upsert（`on duplicate key update` + `if(status in (1,2), ...)` 落实 DDL 注释“已建单/已复盘不得被重跑覆盖”）+ 决策回写（`adjust_reason/adjusted_by/adjusted_time/task_id`）+ 软删过滤查询；items 落库键名与 DDL 注释一致用 **camelCase**，并提供 `plan_from_row` 可逆还原；③ 新增 `app/graphs/restock_graph.py`：`analyze → calibrate → await_confirmation ⏸ → apply_decisions → create_tasks`；**取数与基线合并在一个节点**（否则“逐日销量原始行”要跨节点传递，就得给 0-13 冻结 state 加字段）；**中断节点零副作用**（interrupt 恢复会重跑该节点）；建单失败**不回滚状态**（改回“建议”会让运营以为没点过而重复点）；④ 接单人做成依赖接缝 `deps.resolve_assignee()`，生产实现**暂返回 (None, None)** 走 6-待指派，绝不伪造接单人（真实策略属 1-8）；⑤ 测试 +33：状态机 19 项 + 图 9 项（含**关 store→重开→重编译图的跨重启恢复**，并断言 analyze 未重跑）+ 存储 7 项（upsert 覆盖条件/软删过滤/无 DELETE/仅 `agent_*` 表/camelCase 可逆） |
 | 1-7 | 人工干预 API：调整（数量/原因/预测窗口/服务水平）、跳过（必填原因）、恢复、暂停/恢复计划 | ✅ | ① 新增 `app/api/restock.py`（路由 `/agent/restock/**`）：清单读取 + `confirm/adjust/skip/restore` + `pause/resume`，全部 RuoYi 信封；**写操作强制要求网关注入的 `X-Agent-User`**（无身份 401），本地直连绕过网关也写不进去；② 新增 `app/services/restock_service.py`（业务层与 HTTP 分离）；③ **「高级：修正预测参数」真做重算**（不是让运营口算）：`compute_baseline` 开放 `window_days/service_level/coverage_days` 覆盖，重算数据源与 06:00 分析**完全同源**并列明「人工指定参数」进依据；人工输入越界**拒绝不夹取**（服务水平须在 [0.5,0.99]）；④ 状态机补 **`restore`（原型 V2「恢复建议」）**：3-已跳过 → 1-建议，必填原因 + **仅限当天**（跨日改写会污染 3-6 复盘口径）；5-已复盘仍为终态；⑤ 暂停/恢复自动分析落地 **新表 `agent_restock_pause`**（单行 UPSERT + 授权脚本 + 回滚；`del_flag=0` 复活；用 `coalesce` 保留“谁暂停的”以便审计）；⑥ 测试 +29：服务层（原因必填/重算口径/当日恢复/幂等确认/建单失败 502 不改状态/暂停留痕）+ API 层（401 无身份、400 日期、409 状态机拒绝、422 空原因、信封结构、503 未初始化）+ 基线覆盖参数（3 项）+ 存储复活回归 |
-| 1-8 | 接单人分配策略与幂等防护 | 🟡 主体已实现，验收待环境 | Python 已落地区域匹配、批量查人/负载、并发 CAS（状态 7）、非法恢复状态拒绝；Java FIX-1 已扩展防重状态；回归用例新增。仍需 Python 3.11 pytest、Maven 回归及 10 台跨区域真数据/并发验收。状态 7 在回调结果不确定时禁止自动释放，按复盘文档人工对账。
+| 1-7b | 人工干预补写 `agent_decision_log` 留痕（**FIX-2**） | ✅ | 0.5d。**AGENTS §6.3「每次写操作决策必须留痕」已闭环**：`app/services/restock_service.py` 的 `_audit()` + 可注入留痕写入器。① 覆盖 **六类动作**（confirm/adjust/skip/restore/pause/resume），`scene=2`、`trigger_type=3`、`target_type=plan|restock_pause`；② **四条终态路径都留痕**：成功 / 幂等（`already_ordered`）/ 状态机拒绝与并发冲突（`result=3`+原文 `error_msg`）/ 建单失败（`result=2`）——只记成功的留痕等于把失败藏起来；③ **不写 `llm_output`**（人工操作不得伪装成模型建议；顺带修掉 `JSON` 列把 `None` 存成 JSON `null` 的问题，改为 SQL NULL）；④ `X-Request-Id` 贯穿到留痕（confirm 回调也从合成 id 改为网关 rid）；⑤ 审计故障只 WARN 不阻断业务（假写入器抛 `RuntimeError` 的回归用例）。**证据**：真库 `verify-1-7-restock-api.py` **[H] 段 31/31 PASS**（含 request_id 命中、拒绝原因原样保存、`llm_output IS NULL`）；单测 11 项（含真 SQLite 落库用例） |
+| 1-8 | 接单人分配策略与幂等防护 | 🟡 主体已实现，验收待环境 | Python 已落地区域匹配、批量查人/负载、并发 CAS（状态 7）、非法恢复状态拒绝；Java FIX-1 已扩展防重状态（`TaskServiceImpl:180-190` 改为查 1-待接单+2-进行中）；回归用例新增。仍需 Python 3.11 pytest、Maven 回归及 10 台跨区域真数据/并发验收（本轮已复跑门禁全绿，见上「质量门禁现状」）。状态 7 在回调结果不确定时禁止自动释放，按复盘文档人工对账。
 | 1-9 | dkd-quartz 06:00 定时任务 | ⏳ | 需同时新增 `POST /agents/restock/analyze`（服务间密钥）并消费 **FIX-10** 的暂停开关，否则「暂停自动分析」无消费方 |
 | 1-10 / 1-11 | 前端补货工作台 + 调整/跳过弹窗与暂停横幅 | ⏳ | 原型对齐是 M2 验收项；**FIX-12**（真浏览器视觉验证）、**FIX-15**（建单失败重试的提示文案）一并在此处理 |
 | 1-12 | 联调 + 数据核对 | ⏳ | 前置：**FIX-3**（报表参数绑定）/ **FIX-4**（索引 DDL）/ **FIX-5**（档案权威源） |
 | 1-13 | M2 验收（≥10 台真实设备全闭环） | ⏳ | 前置：**FIX-6**（生产/测试库数据导出）+ dkd-app 测试环境与账号 |
 | 1-14 | 规则版并行对比启动 | ⏳ | 依赖 1-13；对比看板数据源见 §八 FIX-6 的历史人工补货量 |
-| 1-7b（建议新增） | 人工干预补写 `agent_decision_log` 留痕 | ⏳ | 0.5d。**FIX-2**：AGENTS §6.3 要求每次写操作决策留痕，当前只落在 `agent_restock_plan` 审计列；3-7 审计页前置 |
+| 1-7b（原建议新增） | 人工干预补写 `agent_decision_log` 留痕 | ✅ 本轮完成 | 见上表 1-7b 行（0.5d，**FIX-2 已关闭**） |
 
 **1-3 关键设计取舍（为什么这么做）**：
 - **传输层不重试**：回调超时/网络抖动时重试可能造成重复建单（Java 防重只查 `task_status=2`，而新建工单是 `status=1`，**防重查不到刚建的工单**）——因此失败如实上报，重试决策交给 1-6/1-8 的计划状态机；
@@ -393,12 +395,12 @@
 
 > 只在「有证据 + 有归属任务 + 有验收方式」时才登记；关闭时必须写清证据（AGENTS §9.3 不隐瞒）。
 > 图例：🔴 阻塞/红线相关 · 🟡 影响验收或体验 · 🔵 技术债/观测性。归属列写的是**落地任务号**。
-> 更新于 2026-09-21（Phase 1 执行至 1-7 并合并推送后回写）。共 **18 条**：已关闭 2 条（FIX-8/9），待修 16 条。
+> 更新于 2026-09-23（Phase 1 执行至 1-8 主体 + 1-7b/FIX-2 关闭后回写）。共 **18 条**：已关闭 3 条（FIX-2/8/9），待修 15 条。
 
 | # | 等级 | 问题 | 证据（file:line / 实测） | 影响 | 归属 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- |
-| FIX-1 | 🔴 | **Java 工单防重只查 `task_status=2`**，而新建工单是 `status=1`（`TASK_STATUS_CREATE`）→ 刚建的工单不在防重范围内，"先查后插"并发下可能双建单 | `TaskServiceImpl.java:181-186`（`taskParam.setTaskStatus(TASK_STATUS_PROGRESS)`）+ `DkdContants.java:31/35`；1-3 实测 task 572 为 `status=1` | 重复建单（业务事实被污染）；Agent 侧 1-8 幂等只能兜住“同一计划”，兜不住其它入口 | **1-8**（应用层幂等键）+ Java 侧（防重查询纳入 status 1/2 或加唯一约束） | 待修 |
-| FIX-2 | 🟡 | **人工干预未写 `agent_decision_log`**：1-6/1-7 的确认/调整/跳过/恢复只落在 `agent_restock_plan` 的审计列（`adjust_reason/adjusted_by/adjusted_time`）+ 应用日志 | `app/services/restock_service.py::_execute`（写 store，未写 decision_log）；对比 `app/api/chat.py::_record_turn` 有写 | AGENTS §6.3「每次写操作决策必须留痕」未完全满足；3-7 审计页只能看到计划行、看不到完整决策上下文（输入上下文/置信度） | **3-7 前置小任务**（建议编号 1-7b，0.5d：干预时补 `record_decision(..., action="restock.adjust/skip/restore/confirm")`） | 待修 |
+| FIX-1 | 🔴 | **Java 工单防重只查 `task_status=2`**，而新建工单是 `status=1`（`TASK_STATUS_CREATE`）→ 刚建的工单不在防重范围内，"先查后插"并发下可能双建单 | `TaskServiceImpl.java:181-186`（`taskParam.setTaskStatus(TASK_STATUS_PROGRESS)`）+ `DkdContants.java:31/35`；1-3 实测 task 572 为 `status=1` | 重复建单（业务事实被污染）；Agent 侧 1-8 幂等只能兜住“同一计划”，兜不住其它入口 | **1-8**（应用层幂等键）+ Java 侧（防重查询纳入 status 1/2 或加唯一约束） | 🟡 **Java 侧已修**：`TaskServiceImpl:180-190` 改查「1-待接单 + 2-进行中」（与异常文案一致）；**并发窗口仍在**（表上无 `(inner_code, product_type_id, status)` 唯一索引），强一致仍靠 Agent 侧 CAS；10 台跨区域真机验收待环境（FIX-6） |
+| FIX-2 | 🟡 | **人工干预未写 `agent_decision_log`**：1-6/1-7 的确认/调整/跳过/恢复只落在 `agent_restock_plan` 的审计列（`adjust_reason/adjusted_by/adjusted_time`）+ 应用日志 | `app/services/restock_service.py::_execute`（写 store，未写 decision_log）；对比 `app/api/chat.py::_record_turn` 有写 | AGENTS §6.3「每次写操作决策必须留痕」未完全满足；3-7 审计页只能看到计划行、看不到完整决策上下文（输入上下文/置信度） | **1-7b（本轮）** | **✅ 本轮已修**：六类动作 + 四条终态路径全部留痕，`llm_output` 恒为 NULL，request_id 贯穿；真库 `verify-1-7-restock-api.py [H]` **31/31 PASS**。**遗留取舍（已显式登记）**：① 参数校验类拒绝（400，如原因留空/服务水平越界）不留痕（未触碰业务状态，请求在访问日志中）；② `confidence` 人工干预恒为 NULL（人工作业不产生置信度，不伪造） |
 | FIX-3 | 🟡 | **Java 报表 SQL 丢参数绑定**：`sumRevenueByStatusAndDateRange` / `countOrdersByStatusAndDateRange` 只写 `where status >= 1`，未绑定 `#{status}`/时间窗 | `ReportMapper.xml:122-130`（接口声明了三个 `@Param`，`ReportMapper.java:27-33`） | 「AI 报表分析」营收/订单数与所选时间窗无关；Agent 若以其为对账基准会永远对不上 | Java 侧（业务口径变更，不由 Agent 顺手改）；**1-12 对账前置** | 待修（已升级为 1-12 前置） |
 | FIX-4 | 🟡 | **`tb_order` 缺 `(inner_code, create_time)` 索引**（`tb_task` 缺 `(inner_code, task_status, product_type_id)`） | `docs/ddl/business_tables_survey.md` §2.2 实测：无索引预估扫描 199,430 行；有索引 + 范围比较仅 2 行 | 数据量上来后 30 天聚合全表扫描，与业务抢同一主库（无只读从库） | Java/DBA 评审后执行 `docs/ddl/add_index_tb_order_and_tb_task.sql`（附回滚）；**1-12 前置** | 待评审执行 |
 | FIX-5 | 🟡 | **`tb_inventory` 与 `tb_channel` 档案不一致（实测 3/3）**：`sku_id` 与容量两侧全不一致 | `docs/ddl/business_tables_survey.md` §三-3；读工具已如实双返并标记 `data_consistent=false` | 容量取哪边直接决定建议量；静默选边会导致系统性多补/少补 | 业务确认权威源（建议 `tb_channel` 为货道档案权威）+ 数据修复任务；**1-12 前置** | 待业务决策 |
@@ -422,12 +424,25 @@
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.1）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。*
 
-*版本：**V2.4（2026-09-23，任务 1-8 实现与验证记录更新）**。本次变更：① 任务 1-8 接手要点按当前实现更新；② 补记 Python 3.11 全量测试、Ruff 门禁和 Java 定向测试的实际结果及阻塞。*
+*版本：**V2.5（2026-09-23，任务 1-7b / FIX-2 决策留痕闭环）**。本次变更：① §七 Phase 1 表新增 1-7b 完成行（证据 + 五条设计取舍），1-8 行补 Java FIX-1 修正位置；② §八 FIX-2 关闭、FIX-1 降级为「Java 侧已修（待真机验收）」，标题计数改为「已关闭 3 / 待修 15」；③ 质量门禁更新为实测值（pytest 258 passed / 94.91%、mvn 48 passed、verify-1-7 31/31）。**不改变方案口径，故方案保持 V1.1**（留痕义务本就是 AGENTS §6.3 的既有要求，本轮是补齐落地，不是新增约定）。*
+
+*上一版 **V2.4（2026-09-23，任务 1-8 实现与验证记录更新）**：① 任务 1-8 接手要点按当前实现更新；② 补记 Python 3.11 全量测试、Ruff 门禁和 Java 定向测试的实际结果及阻塞。*
 
 *上一版 **V2.1**：① 新增 §八 待修复与技术债清单（17 条，含证据与归属任务）；② §七 Phase 1 进度细化为逐条（1-8~1-14 + 建议新增 1-7b）；③ 在 1-8/1-9/1-12 的完成标准里写入「接手要点」与前置 FIX 项。**补充排期章节与进度不改变方案口径，故方案保持 V1.1**；若 §八 中的 FIX-1/FIX-3 涉及 Java 业务口径变更落地，需同步升版方案并互相引用。*
 
 ---
 
+
+### 2026-09-23 开发进度补记（V2.5 · 1-7b / FIX-2 决策留痕）
+
+- **交付内容**：`app/services/restock_service.py` 新增 `_audit()`（可注入留痕写入器）+ 六类动作留痕；`app/audit.py` 的 JSON 列改 `none_as_null=True`（`llm_output` 缺省落 SQL NULL 而非 JSON `null`）；`tests/conftest.py` 兜底关闭留痕写库（防止单测误连 MySQL）；`docs/scripts/verify-1-7-restock-api.py` 新增 [H] 段（9 项留痕断言）。
+- **仅有的生产行为变化**：① 干预写 `agent_decision_log`；② confirm 回调的 `X-Request-Id` 从合成值 `restock-confirm-<id>` 改为网关 rid（无网关时回退到原合成值）；③ JSON 列的 `None` 语义改为 SQL NULL。业务状态机与建单链路**一行未改**。
+- **验证（全部实跑）**：`ruff check` / `ruff format --check` 全过（55 文件）；`pytest` **258 passed / 10 deselected**、覆盖率 **94.91%**（本轮 +11 项，其中 1 项是 SQLite 真落库用例）；`mvn -pl dkd-admin -am test` **48 passed / BUILD SUCCESS**（Java 未改动，作为回归基线）；真库 `verify-1-7-restock-api.py` **31/31 PASS**（此前 22 项全保留，无回归）。
+- **本轮新发现并已修的两个真问题**：
+  1. **单测写进了本机 MySQL**：未注入假写入器时，服务层默认写入器会真的连库（首轮 `pytest` 失败用例仍向 `agent_decision_log` 写入了 2 行真数据，id 28/29）。修法：写入器依赖注入 + conftest 兜底关闭留痕；这正是 AGENTS §8「测试不得连外部依赖」的实例缺口。
+  2. **「没有 LLM 输出」在库里是 JSON `null` 而不是 SQL NULL**（SQLAlchemy JSON 列默认把 `None` 序列化为文本 `null`）→ `IS NULL` 查不到、`json_extract` 返回字符串 'null'，与 DDL 的 `DEFAULT NULL` 声明不符。修法：`none_as_null=True`。
+- **遗留（不隐瞒）**：① 参数校验类拒绝（400）不留痕（已显式登记在 FIX-2 行）；② `confidence` 恒为 NULL（人工作业不产生置信度）；③ 留痕行**不随验收清理**（审计证据保留，见脚本 [H] 段说明）；④ 3-7 审计页仍待开工（本轮只保证数据齐备）。
+- **下一步（按风险排序）**：1-9（`POST /agents/restock/analyze` + 消费 `agent_restock_pause` 开关 + quartz 告警）→ 1-10/1-11 前端工作台 → FIX-6（真实库数据导出，1-4/1-13 前置）/ FIX-4（索引 DDL 评审）/ FIX-5（容量权威源）。
 
 ### 2026-09-23 开发进度补记（V2.4）
 
