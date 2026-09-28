@@ -184,6 +184,7 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 - **禁止捕获后静默吞掉**（catch 空块直接吞异常是最严重的违规之一）；
 - 事务：Service 写方法加 `@Transactional`；跨表写必须在同一事务内（参照 `TaskServiceImpl.insertTaskDto`：工单+明细+库存一次入库）；
 - 日志：用 `private static final Logger log = LoggerFactory.getLogger(Xxx.class)`；WARN 及以上必须带上下文（关键参数或 `e` 堆栈）；现有 `AiServiceImpl` 的"打印请求/响应排查报错"是调试期产物，**日志中禁止输出完整 LLM 请求体（可能含用户数据与密钥）**，正式规范只记 model/duration/状态码/token 数。
+- **已知陷阱（2026-09-28 实测，排期 1-9）**：Java→Python 的**带请求体**调用若上游返回 401/407，JDK `HttpURLConnection` 抛 `HttpRetryException`（`cannot retry due to server authentication, in streaming mode`），Spring 包成 `ResourceAccessException` → 会被误归因成"服务不可达"。已在 `AgentUpstreamClient` 特判为**按状态码透传**；新增任何直连 Python 的 HTTP 客户端时不得重现该误判（鉴权失败与链路故障的处理路径完全不同）。
 
 ### 6.2 dkd-vue
 
@@ -200,6 +201,12 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 
 - 请求入口生成 `request_id` 贯穿 网关→Python→工具→回调 全链路；
 - 定时任务（dkd-quartz → Agent 分析）失败必须有告警，不允许"半夜悄悄失败"。
+
+**Agent 定时任务四条约定（2026-09-28 定稿，排期 1-9；与上面同目的：告警要可信）**：
+1. **开关关闭与被暂停都不算失败**：`agent.enabled=false` 或补货暂停开关（`agent_restock_pause`）为暂停时，任务记 WARN/INFO 后正常返回。把"按计划停用/运营主动暂停"报成任务失败，会让团队对告警脱敏（真故障反而没人看）。
+2. **被暂停不是错误返回**：Python 侧返回 `HTTP 200 + data.status=skipped`，Java 侧不重试、不告警。
+3. **4xx 不重试，5xx 与传输失败才重试**：密钥/路径/参数类错误重试不会变好，只会把日志刷满；重试次数与退避走配置（`agent.analyzeRetryMax` / `agent.analyzeRetryBackoffMs`），不写死在代码里。
+4. **最终失败必须抛异常**（不要只 `log.error`）：RuoYi 的 `AbstractQuartzJob` 据此把失败写入 `sys_job_log`（`status=1` + `exception_info`），这是"失败可被发现"的落地方式；消息里要写清**实际尝试次数**与 `request_id`（便于与 Python 侧日志对照），且不得把上游完整响应体写进日志。
 
 ---
 
@@ -312,4 +319,4 @@ scope 建议：`manage` / `system` / `common` / `app` / `vue` / `agent` / `ai` /
 
 ---
 
-*版本：V1.1（2026-09-21）。本次回写（§9.4）：① 修正业务表前缀为 `tb_`（§1 约束 5、§2.4，原描述“业务表无前缀”与实际不符）；② 新增§1 约束 5「基础设施实测边界」（Redis 3.2.100 不可作 checkpointer/Stream、单主库无从库、存量 DDL 未入库）；③ §7.1 更新密钥现状为“已占位符化但未提交 + Git 历史含密钥需轮换清理”；④ §4.3 新增排期/方案同步义务。本文档随项目推进持续修订：AI 协作中发现的规范缺口按 §9.4 回写；dkd-agent 建成后在 §2.3/§6.3 补充实例。**2026-09-23 二次回写（§9.4）**：§8 dkd-agent 行补「测试不许真连数据库通道」的纪律——1-7b 开发中实测到「未注入假写入器的失败用例仍向本机 `agent_decision_log` 写入了 2 行」；§1 约束 5 补「本机已有 PG 17 服务，但未纳入本期架构」的实测边界（评审稿 `docs/dkd-agent-postgres-selection-review.md`）。*
+*版本：V1.1（2026-09-21）。本次回写（§9.4）：① 修正业务表前缀为 `tb_`（§1 约束 5、§2.4，原描述“业务表无前缀”与实际不符）；② 新增§1 约束 5「基础设施实测边界」（Redis 3.2.100 不可作 checkpointer/Stream、单主库无从库、存量 DDL 未入库）；③ §7.1 更新密钥现状为“已占位符化但未提交 + Git 历史含密钥需轮换清理”；④ §4.3 新增排期/方案同步义务。本文档随项目推进持续修订：AI 协作中发现的规范缺口按 §9.4 回写；dkd-agent 建成后在 §2.3/§6.3 补充实例。**2026-09-23 二次回写（§9.4）**：§8 dkd-agent 行补「测试不许真连数据库通道」的纪律——1-7b 开发中实测到「未注入假写入器的失败用例仍向本机 `agent_decision_log` 写入了 2 行」；§1 约束 5 补「本机已有 PG 17 服务，但未纳入本期架构」的实测边界（评审稿 `docs/dkd-agent-postgres-selection-review.md`）。**2026-09-28 三次回写（§9.4）**：§6.1 补 Java→Python 带体请求 401 误判陷阱（实测，已修）；§6.4 新增「Agent 定时任务四条约定」（排期 1-9 定稿，防“告警不可信/重试无效/失败静默”）——两条均来自本轮实际踩到的坑，不是纸面规则。*

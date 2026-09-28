@@ -207,8 +207,8 @@
 
 ## 七、执行进度（滚动更新）
 
-> 更新于 **2026-09-21**（Phase 0 全部收官 + Phase 1 执行至 **1-7**，并已合并入 `main`/`develop` 且推送至 `origin`）。
-> **最近一次：2026-09-23 —— Phase 1 执行至 1-8（主体）+ 本轮完成 1-7b（FIX-2 决策留痕闭环）。**
+> 更新于 **2026-09-28**（Phase 1 执行至 **1-9**，1-9 定时分析闭环 + 发现并修掉 Java 侧 401 误判）。
+> **最近一次：2026-09-28 —— 本轮完成 1-9（`POST /agents/restock/analyze` + 暂停开关消费 + dkd-quartz `agentTask.restockAnalyze` + 注册 SQL）与 FIX-19（JDK 流式请求 401 被误报为不可达）。**
 > 状态图例：✅ 已完成并验证 / 🔄 进行中 / ⏳ 待办 / ⛔ 阻塞。
 > **Phase 1 剩余任务逐条状态见下方 Phase 1 表；其中“待修/前置”类问题统一登记在 §八；
 > 分支/合并/推送的交付状态见“交付与分支状态”。**
@@ -238,13 +238,13 @@
 | 项目 | 结果 |
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
-| `uv run ruff format --check .` | 51 files already formatted |
-| `uv run pytest` | **258 passed**（10 个 live 用例默认 deselect），覆盖率 **94.91%**（要求 ≥70%）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
-| `mvn -pl dkd-admin -am test` | **Tests run: 48, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 8 / **TaskCreate 6**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
+| `uv run ruff format --check .` | **59 files already formatted** |
+| `uv run pytest` | **276 passed**（10 个 live 用例默认 deselect），覆盖率 **95.11%**（要求 ≥70%）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
+| `mvn -pl dkd-admin -am test` | **Tests run: 60, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient **10** / TaskCreate 6 / **AgentTask 10**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142） |
-| 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**31/31 PASS**，其中 [H] 段为本轮新增的 1-7b 留痕断言）；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
+| 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**31/31 PASS**，其中 [H] 段为 1-7b 的留痕断言）；**`docs/scripts/verify-1-9-analyze.py`（本轮新增，真 MySQL + 真实 FastAPI，20/20 PASS：鉴权 3 项 / 暂停开关 3 项 / 正常触发 3 项 / 重入安全 2 项 / 留痕 9 项）**；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
 
 ### 本轮（0-6 / 0-7 / 0-8 / 0-11 / 0-14c）详细记录
 
@@ -301,7 +301,7 @@
 | 1-7 | 人工干预 API：调整（数量/原因/预测窗口/服务水平）、跳过（必填原因）、恢复、暂停/恢复计划 | ✅ | ① 新增 `app/api/restock.py`（路由 `/agent/restock/**`）：清单读取 + `confirm/adjust/skip/restore` + `pause/resume`，全部 RuoYi 信封；**写操作强制要求网关注入的 `X-Agent-User`**（无身份 401），本地直连绕过网关也写不进去；② 新增 `app/services/restock_service.py`（业务层与 HTTP 分离）；③ **「高级：修正预测参数」真做重算**（不是让运营口算）：`compute_baseline` 开放 `window_days/service_level/coverage_days` 覆盖，重算数据源与 06:00 分析**完全同源**并列明「人工指定参数」进依据；人工输入越界**拒绝不夹取**（服务水平须在 [0.5,0.99]）；④ 状态机补 **`restore`（原型 V2「恢复建议」）**：3-已跳过 → 1-建议，必填原因 + **仅限当天**（跨日改写会污染 3-6 复盘口径）；5-已复盘仍为终态；⑤ 暂停/恢复自动分析落地 **新表 `agent_restock_pause`**（单行 UPSERT + 授权脚本 + 回滚；`del_flag=0` 复活；用 `coalesce` 保留“谁暂停的”以便审计）；⑥ 测试 +29：服务层（原因必填/重算口径/当日恢复/幂等确认/建单失败 502 不改状态/暂停留痕）+ API 层（401 无身份、400 日期、409 状态机拒绝、422 空原因、信封结构、503 未初始化）+ 基线覆盖参数（3 项）+ 存储复活回归 |
 | 1-7b | 人工干预补写 `agent_decision_log` 留痕（**FIX-2**） | ✅ | 0.5d。**AGENTS §6.3「每次写操作决策必须留痕」已闭环**：`app/services/restock_service.py` 的 `_audit()` + 可注入留痕写入器。① 覆盖 **六类动作**（confirm/adjust/skip/restore/pause/resume），`scene=2`、`trigger_type=3`、`target_type=plan|restock_pause`；② **四条终态路径都留痕**：成功 / 幂等（`already_ordered`）/ 状态机拒绝与并发冲突（`result=3`+原文 `error_msg`）/ 建单失败（`result=2`）——只记成功的留痕等于把失败藏起来；③ **不写 `llm_output`**（人工操作不得伪装成模型建议；顺带修掉 `JSON` 列把 `None` 存成 JSON `null` 的问题，改为 SQL NULL）；④ `X-Request-Id` 贯穿到留痕（confirm 回调也从合成 id 改为网关 rid）；⑤ 审计故障只 WARN 不阻断业务（假写入器抛 `RuntimeError` 的回归用例）。**证据**：真库 `verify-1-7-restock-api.py` **[H] 段 31/31 PASS**（含 request_id 命中、拒绝原因原样保存、`llm_output IS NULL`）；单测 11 项（含真 SQLite 落库用例） |
 | 1-8 | 接单人分配策略与幂等防护 | 🟡 主体已实现，验收待环境 | Python 已落地区域匹配、批量查人/负载、并发 CAS（状态 7）、非法恢复状态拒绝；Java FIX-1 已扩展防重状态（`TaskServiceImpl:180-190` 改为查 1-待接单+2-进行中）；回归用例新增。仍需 Python 3.11 pytest、Maven 回归及 10 台跨区域真数据/并发验收（本轮已复跑门禁全绿，见上「质量门禁现状」）。状态 7 在回调结果不确定时禁止自动释放，按复盘文档人工对账。
-| 1-9 | dkd-quartz 06:00 定时任务 | ⏳ | 需同时新增 `POST /agents/restock/analyze`（服务间密钥）并消费 **FIX-10** 的暂停开关，否则「暂停自动分析」无消费方 |
+| 1-9 | dkd-quartz 06:00 定时任务（`agentTask.restockAnalyze`） | ✅ | ① **Python**：新增 `app/api/ops.py::restock_analyze`（`POST /agents/restock/analyze`，服务间密钥路由级依赖）+ `app/services/restock_analyzer.py`（**FIX-10 的消费方**：暂停时直接 skipped、不建图不读业务库；threadId=`restock-<planDate>`；成败都写 `agent_decision_log`，trigger_type=2/user_id=NULL/llm_output=NULL）+ `app/services/decision_audit.py`（留痕纪律抽成一份，1-7b 与 1-9 共用，避免“其中一条把异常吞了”漂移）；② **Java**：新增 `dkd-quartz/.../task/AgentTask.java`——开关关闭/被暂停**不算失败**、4xx 不重试、5xx 重试（`agent.analyzeRetryMax` 默认 2 + 线性退避）、最终失败抛异常交给 `sys_job_log` 留失败记录（AGENTS §6.4）；③ **注册**：`docs/ddl/agent_restock_job.sql`（concurrent=1 禁并发、misfire_policy=2 错过补跑一次、status=0 正常，含回滚）；④ 测试 +30（Python 18：执行器 8 + 接口 9 + 图重入 1；Java 12：AgentTask 10 + 上游客户端 401 回归 2）；⑤ **端到端 20/20 PASS**（`verify-1-9-analyze.py`，真库：暂停期间计划行 update_time 不变、重复触发计划行数不变、request_id 贯穿留痕） | 1-4, 1-7 |
 | 1-10 / 1-11 | 前端补货工作台 + 调整/跳过弹窗与暂停横幅 | ⏳ | 原型对齐是 M2 验收项；**FIX-12**（真浏览器视觉验证）、**FIX-15**（建单失败重试的提示文案）一并在此处理 |
 | 1-12 | 联调 + 数据核对 | ⏳ | 前置：**FIX-3**（报表参数绑定）/ **FIX-4**（索引 DDL）/ **FIX-5**（档案权威源） |
 | 1-13 | M2 验收（≥10 台真实设备全闭环） | ⏳ | 前置：**FIX-6**（生产/测试库数据导出）+ dkd-app 测试环境与账号 |
@@ -349,6 +349,7 @@
 | --- | --- | --- | --- | --- |
 | 2026-09-21 | Phase 0 集成底座（0-1~0-15） | `feature/agent-gateway` → `main` | `e1f7604`（merge commit） | `origin/main`、`origin/develop` 同步 |
 | 2026-09-21 | **Phase 1 补货主体（1-1~1-7）+ 排期 V2.1** | `feature/agent-gateway-java` → `main`（`--no-ff`），`develop` 同步 | `9b8f9ae`（merge commit） | **已推送**：`e1f7604..9b8f9ae`（`main`/`develop`）；`feature/agent-gateway-java` 已推送为远端新分支（`527eae6`） |
+| 2026-09-28 | **Phase 1 任务 1-9（定时分析闭环）+ FIX-19（401 误判）** | 本地 `feature/agent-restock-schedule`（基于 `feature/deploy-docker`，含尚未合并的 Docker 交付） | `ab6e0a7`（fix）+ `6d361f8`（feat） | ⏳ **未推送/未合并**（`AGENTS §5.1`：需项目负责人明确批准） |
 
 约定（`AGENTS.md §5.1`）：
 1. 新特性从 `develop` 切 `feature/<模块>-<功能简述>`；**`main`/`develop` 的推送与合并需项目负责人明确批准**（本轮为负责人指令后执行）；
@@ -421,7 +422,7 @@
 
 > 只在「有证据 + 有归属任务 + 有验收方式」时才登记；关闭时必须写清证据（AGENTS §9.3 不隐瞒）。
 > 图例：🔴 阻塞/红线相关 · 🟡 影响验收或体验 · 🔵 技术债/观测性。归属列写的是**落地任务号**。
-> 更新于 2026-09-23（Phase 1 执行至 1-8 主体 + 1-7b/FIX-2 关闭后回写）。共 **18 条**：已关闭 3 条（FIX-2/8/9），待修 15 条。
+> 更新于 2026-09-28（Phase 1 执行至 1-9 + FIX-10/FIX-19 关闭后回写）。共 **19 条**：已关闭 5 条（FIX-2/8/9/10/19），待修 14 条。
 
 | # | 等级 | 问题 | 证据（file:line / 实测） | 影响 | 归属 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -434,7 +435,7 @@
 | FIX-7 | 🔴 | **0-14b 剩余凭据轮换未做**：MySQL root / Redis / JWT secret / OSS AK / Druid 口令 | `docs/security-credential-rotation.md`（四步流程 + 影响面 + 回滚）；实测旧 DeepSeek Key 已 401 失效 | 轮换前仍算“已泄露过的凭据”，属上线阻塞项；JWT secret 轮换会踢掉全部在线用户 | 需值班窗口 + 云控制台；**上线前置** | 待人工执行 |
 | FIX-8 | 🔵 | `create_agent_db_user.sql` 未包含 1-7 新增表 `agent_restock_pause` 的授权 → 按规范脚本建号会缺权限 | 本轮已修：`docs/ddl/create_agent_db_user.sql` 追加该表 GRANT 与验证项 9 | 新环境部署会踩“表存在但无权限” | — | **✅ 本轮已修** |
 | FIX-9 | 🔵 | 新增 `agent_*` 表时容易漏同步三处：规范授权脚本、`app/db.py::AGENT_OWNED_TABLES`、`docs/ddl` 回滚脚本 | 本轮 1-7 已按此三处同步（`agent_restock_pause`） | 漏一处会导致运行时权限错误或白名单不一致 | 流程约束（新增表 checklist） | **✅ 本轮已修 + 形成检查项** |
-| FIX-10 | 🟡 | **`/agents/restock/analyze` HTTP 触发端点不存在**：Python 侧只有图，没有定时任务可调的入口，也尚未读 `agent_restock_pause` 开关 | `app/api/ops.py` 仅 `/agents/usage/summary`；`restock_graph.analyze` 只能进程内调用（1-6/1-7 验收脚本即如此） | 1-9 的 quartz 任务无法触发；「暂停自动分析」开关目前只是状态位、尚无消费方 | **1-9** | 待做（1-9 内置） |
+| FIX-10 | 🟡 | **`/agents/restock/analyze` HTTP 触发端点不存在**：Python 侧只有图，没有定时任务可调的入口，也尚未读 `agent_restock_pause` 开关 | `app/api/ops.py` 曾仅 `/agents/usage/summary`；`restock_graph.analyze` 只能进程内调用（1-6/1-7 验收脚本即如此） | 1-9 的 quartz 任务无法触发；「暂停自动分析」开关只是状态位、无消费方 | **1-9** | **✅ 本轮已修**：`POST /agents/restock/analyze` 落地且**消费开关（暂停时 skipped，不建图）**；真库端到端 `verify-1-9-analyze.py` 20/20 PASS（含「暂停期间计划行 update_time 不变」） |
 | FIX-11 | 🟡 | **1-5 的真 LLM 校准链路未做 live 端到端**：本机全部验收都在 `DKD_AGENT_RESTOCK_CALIBRATION_ENABLED=0` 下跑 | 1-6/1-7 验收脚本均显式关闭校准；单测全打桩（AGENTS §8 要求） | “系数夹取/理由生成”在真实模型上尚未验证（可能遇到 JSON 漂移、超时、成本） | 建议随 1-9 或 M2 前安排一次 live 冒烟（需 key 与费用） | 待验证 |
 | FIX-12 | 🟡 | **前端视觉/交互未做真浏览器验证**（补货工作台 1-10/1-11 尚未开始，0-11 侧边栏为构建+分帧断言交付） | 排期 §七 Phase 0 之 6（0-11 手测清单 10 项中 4 项已自动化）；1-10/1-11 为待办 | 原型对齐是 M2 验收项，纯构建通过不足以证明 | **1-10/1-11** | 待做 |
 | FIX-13 | 🔵 | `X-Agent-Region` 常缺省：`sys_user` 无区域映射，网关只能给空 | 0-15 记录；`AgentRegionResolver` 已 fail-soft 不注入 | 仅影响审计上下文，“按设备区域选人”不受影响（取 `vm.region_id`） | 3-7 或后续（若审计需要按区域统计） | 待评估 |
@@ -443,6 +444,7 @@
 | FIX-16 | 🔵 | **`@RateLimiter` 的 Redis 依赖 fail-closed 未演练**：Redis 不可用时回调用例会全拒 | 0-15 记录（“属预期行为，未做演练”） | 上线后 Redis 抖动可能表现为“Agent 建单全失败” | 3-9 压测与故障演练 | 待演练 |
 | FIX-17 | 🟡 | **M1 遗留：真 LLM 全链的 `agent.enabled=false` 一键降级已验，但“Python 侧 LLM 密钥缺失→降级到规则增强版”的自动降级未验**（目前是校准开关手动关闭） | `restock_calibration.calibrate_plan` 捕获异常降级（单测覆盖）；真实密钥失效场景未演练 | 密钥过期时行为可预期（降级）但未实测 | 3-9 故障演练 | 待演练 |
 | FIX-18 | 🔵 | **代码交付通道依赖本机代理节点**：`github.com` 经代理偶发不可达（`CONNECT` 隧道返回 200 但 TLS 握手无响应），导致 `git push` 报 `TLS connect error: error:00000000:lib(0)::reason(0)` | 本轮实测：`curl -x http://127.0.0.1:7897 https://api.github.com` → **200**（代理本身可用），而 `https://github.com/` → **000**；重试 3 次 + 强制 `http.version=HTTP/1.1` 均失败；直连 000；`127.0.0.1:1080` 无服务；`ssh -T git@github.com` 可达但本机无 SSH 私钥 | 交付被阻塞（本轮靠切换节点恢复）；上线期的回滚/热修可能同样被卡 | 环境/运维（非代码）；建议登记备用通道（SSH key 或第二代理节点） | 待环境侧处理 |
+| FIX-19 | 🔴 | **Java→Python 带请求体的请求收到 401 会被误报为“服务不可达”**：JDK 的 `HttpURLConnection` 在流式（带请求体）请求上收到 401/407 时抛 `HttpRetryException`（`cannot retry due to server authentication, in streaming mode`——它想带凭据重放请求，但无法重发已写出的 body），Spring 再包成 `ResourceAccessException` | 1-9 开发中实测：`forward(POST + body)` 对 401 返回 `status=0`（传输层失败）而非 401；根因定位见 `AgentUpstreamClient.execute`（已在代码注释里写明） | 鉴权拒绝被当成故障：网关把 401 降级为“智能体不可用”；定时任务把“密钥不一致”报成“服务宕机”并**白重试 3 次**，运维朝错误方向排查（FIX-7 轮换期间最容易踩） | Java 侧（1-9 一并修） | **✅ 本轮已修**：识别 `HttpRetryException` 并按状态码合成“仅状态码”响应交回原 extractor（两条通道既有分支不乱）；回归用例 **+2**（`forward` 401 透传、`relayStream` 401 抛带状态码异常）。**代价已写明**：该类响应体确实被 JDK 丢弃，故 401 的 `msg` 拿不到（比“报成不可达”好得多） |
 
 ---
 
@@ -450,7 +452,9 @@
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.1）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。*
 
-*版本：**V2.7（2026-09-23，Docker 部署栈提前交付）**。本次变更：① 新增 `deploy/docker/` 全套部署脚本与四个 Dockerfile（详见补记）；② 为容器化把 DB/Redis/agent 地址改为带默认值的占位符（本机行为不变）；③ 实测并登记两个容器化障碍（agent 账号 host 模式、业务表 DDL 缺失在部署场景下成为硬阻断）；④ 记录未验证项（真实构建/镜像 tag）。**方案口径未变（仍 V1.1）**；若部署脚本在真实服务器上验证后需要调整运行时形态（如引入非 root 运行/HTTPS），届时按 §4.3 同步方案 §5.1 与 runbook。*
+*版本：**V2.8（2026-09-28，任务 1-9 定时分析闭环 + FIX-19/FIX-10 关闭）**。本次变更：① §七 Phase 1 表 1-9 行转 ✅（交付物 + 21 项新测试 + 20/20 真库端到端）；② §七 质量门禁更新为实测值（pytest 276 passed/95.11%、mvn 60 passed、ruff format 59 文件、verify-1-9 20/20）；③ §八 FIX-10 关闭、新增 FIX-19（JDK 流式请求 401 被误报为不可达，已修，含代价说明），计数改为「已关闭 5 / 待修 14」；④ 新增 2026-09-28 补记（交付内容 / 验证 / 未验证项 / 下一步）；⑤ 「交付与分支状态」新增本地分支行（**未推送/未合并**）。**方案口径未变（仍 V1.1）**：1-9 是排期 V2 已列任务，未改变任何既定约定；新增的“定时任务四条约定”（开关关闭/被暂停不算失败、4xx 不重试而 5xx 重试、最终失败必须抛异常交给 `sys_job_log`）已回写 AGENTS §6.4。*
+
+*上一版 **V2.7（2026-09-23，Docker 部署栈提前交付）**。本次变更：① 新增 `deploy/docker/` 全套部署脚本与四个 Dockerfile（详见补记）；② 为容器化把 DB/Redis/agent 地址改为带默认值的占位符（本机行为不变）；③ 实测并登记两个容器化障碍（agent 账号 host 模式、业务表 DDL 缺失在部署场景下成为硬阻断）；④ 记录未验证项（真实构建/镜像 tag）。**方案口径未变（仍 V1.1）**；若部署脚本在真实服务器上验证后需要调整运行时形态（如引入非 root 运行/HTTPS），届时按 §4.3 同步方案 §5.1 与 runbook。*
 
 *上一版 **V2.6（2026-09-23，新增 PG 选型评审稿待评审）**。本次变更：① 新增 `docs/dkd-agent-postgres-selection-review.md`（V0.1：三层拆解 + A/B/C 方案 + D1~D5 决策点 + 测试策略取舍）；② §八 FIX-14 关联该评审稿；③ 「阻塞与待办需求」新增第 9 项（D5 为硬前置）；④ 补记更正复盘稿「当期无 PG」的错前提。**未写任何 PG 代码、未改依赖，故方案保持 V1.1**；若 D1 通过（引入 PG），方案 §5.1 与 AGENTS §1 约束 5 必须同步改版并互相引用版本号。*
 
@@ -462,6 +466,22 @@
 
 ---
 
+
+### 2026-09-28 开发进度补记（V2.8 · 任务 1-9 定时分析闭环 + FIX-19）
+
+- **交付内容**：
+  ① Python：`app/api/ops.py::restock_analyze`（`POST /agents/restock/analyze`）、`app/services/restock_analyzer.py`、`app/services/decision_audit.py`（留痕纪律共用一份，1-7b 与 1-9 不再各写一遍）；
+  ② Java：`dkd-quartz/.../task/AgentTask.java`（`@Component("agentTask")`，`restockAnalyze()`）+ `AgentProperties` 新增 `analyzeRetryMax`（默认 2）/`analyzeRetryBackoffMs`（默认 5000）；
+  ③ 注册与脚本：`docs/ddl/agent_restock_job.sql`（06:00、禁并发、错过补跑一次、含回滚）、`docs/scripts/verify-1-9-analyze.py`；
+  ④ 文档：`dkd-agent/README.md` 新增「定时分析入口（任务 1-9）」。
+- **仅有的行为变化（对既有链路零改动）**：① 新增一个服务间接口与一个定时任务；② 人工干预的留痕写入路径改为调用共用模块（行为逐字不变，1-7b 的留痕用例与真库 `verify-1-7-restock-api.py` 的 [H] 段原样通过）；③ `AgentUpstreamClient` 修掉 401 误判（FIX-19）。
+- **验证（全部实跑）**：`ruff check` / `ruff format --check` 全过（59 文件）；`pytest` **276 passed / 10 deselected**、覆盖率 **95.11%**（本轮 +18 项）；`mvn -pl dkd-admin -am test` **60 passed**（本轮 +12：AgentTask 10 + UpstreamClient 2）；真库端到端 `verify-1-9-analyze.py` **20/20 PASS**。
+- **本轮发现并修掉的真问题（FIX-19，值得单独记一笔）**：JDK 对流式（带请求体）请求的 401 会抛 `HttpRetryException`，Spring 包成 `ResourceAccessException` → 客户端把“鉴权拒绝”报成“服务不可达”。若不是写 1-9 的 4xx 不重试用例，这个坑会在“轮换服务间密钥”那天才暴露——正是 FIX-7 要求上线前完成的事，属**上线阻塞级**缺陷。修法与代价已写入 §八 FIX-19。
+- **未验证（不隐瞒）**：
+  ① **真 LLM 的 06:00 全链未跑**：本机只在 `DKD_AGENT_RESTOCK_CALIBRATION_ENABLED=0` 下验收（脚本默认关闭校准）；真实校准链路的 live 冒烟仍是 FIX-11；
+  ② **Java 侧未做真机联调**：`AgentTask` 的 10 项单测用回环假服务，未与真 Python 进程 端到端跑过（缺 Java/Python 同时启动的联调环境）；`sys_job` 注册 SQL 也**未在本机执行**（本机 Java 是否连库运行未验证），只做了语法/字段核对与回滚路径设计；
+  ③ 定时任务的真告警通道仍是“`sys_job_log` 留失败记录 + ERROR 日志”，**未接短信/企业微信**（排期 §四风险表未要求，属上线期观测方案的一部分，4-3 值守时需人工看日志）。
+- **下一步（按风险排序）**：1-10/1-11 前端补货工作台（M2 验收项，FIX-12 一并处理）→ FIX-6（生产/测试库数据导出，1-4 的 ±20% 与 1-13 的 10 台真机验收都卡在这里）/ FIX-4（索引 DDL 评审）/ FIX-5（容量权威源）→ 1-12 对账前置的 FIX-3。
 
 ### 2026-09-23 开发进度补记（V2.5 · 1-7b / FIX-2 决策留痕）
 
