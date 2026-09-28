@@ -375,3 +375,30 @@ async def test_resume_with_empty_plans_does_not_hang(tmp_path):
     assert "__interrupt__" not in result
     assert result["plans"] == []
     assert result["summary"]["device_count"] == 0
+
+
+async def test_repeat_invoke_same_thread_reupserts_without_error(tmp_path):
+    """重入安全（排期 1-9）：同一日期重复触发等于重跑一次分析，不得报错、不得多出一份计划。
+
+    为什么允许重跑而不是「已分析过就拒绝」：数据修好后需要能重跑，把重跑变成“必须人工改库”
+    的动作只会制造事故。计划行由 `(vm_id, plan_date)` 唯一键 upsert 兜住，不会变成两份。
+    为什么在**图**这一层证明：1-9 的 thread_id 约定（`restock-<plan_date>`）就是这里传进去的，
+    执行器的其余部分是薄封装。
+    """
+    deps = FakeDeps(stock=_stock(), daily=_daily())
+    graph, store = await _open_graph(tmp_path / "repeat.db", deps)
+    config = {"configurable": {"thread_id": THREAD}}
+    try:
+        first = await graph.ainvoke(
+            new_restock_state(plan_date=PLAN_DATE, request_id="rid-first"), config
+        )
+        second = await graph.ainvoke(
+            new_restock_state(plan_date=PLAN_DATE, request_id="rid-second"), config
+        )
+    finally:
+        await store.close()
+
+    assert await _interrupt_value(first) == await _interrupt_value(second)
+    assert len(deps.saved_plans) == 2, "两次都跑了取数+落库（幂等由存储层的唯一键保证，不是靠跳过）"
+    assert [plan.vm_id for plan in deps.saved_plans] == [80, 80]
+    assert second.get("failures") == [], "重跑不得把第一次的结果记成失败"

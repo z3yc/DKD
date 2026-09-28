@@ -51,6 +51,23 @@ public class AgentProperties
     private List<String> callbackPathWhitelist = new ArrayList<String>(
             Arrays.asList("/agent/callback/task"));
 
+    /**
+     * 定时分析（任务 1-9）失败后的额外重试次数：0 表示只试一次。
+     *
+     * <p>为什么给默认 2（共 3 次）：06:00 那一刻 Python 可能正在重启（部署/滚动），
+     * 一次连不上就告警会让团队对告警脱敏；但也不能无限重试——全部失败必须抛异常，
+     * 由 RuoYi 的定时任务日志（sys_job_log）留下 status=失败 的记录供人工发现（AGENTS §6.4 不允许静默失败）。
+     */
+    private int analyzeRetryMax = 2;
+
+    /**
+     * 定时分析重试间隔基数（毫秒），第 n 次重试实际等待 n × 该值（线性退避）。
+     *
+     * <p>取 5s 而不是指数退避到分钟级：本任务的窗口是「早上运营上班前」，
+     * 等待过久会让 06:00 的计划错过早班确认。
+     */
+    private long analyzeRetryBackoffMs = 5000L;
+
     public boolean getEnabled()
     {
         return enabled;
@@ -109,5 +126,25 @@ public class AgentProperties
     public void setCallbackPathWhitelist(List<String> callbackPathWhitelist)
     {
         this.callbackPathWhitelist = callbackPathWhitelist;
+    }
+
+    public int getAnalyzeRetryMax()
+    {
+        return analyzeRetryMax;
+    }
+
+    public void setAnalyzeRetryMax(int analyzeRetryMax)
+    {
+        this.analyzeRetryMax = analyzeRetryMax;
+    }
+
+    public long getAnalyzeRetryBackoffMs()
+    {
+        return analyzeRetryBackoffMs;
+    }
+
+    public void setAnalyzeRetryBackoffMs(long analyzeRetryBackoffMs)
+    {
+        this.analyzeRetryBackoffMs = analyzeRetryBackoffMs;
     }
 }

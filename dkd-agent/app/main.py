@@ -20,6 +20,7 @@ from app.config import get_settings
 from app.db import dispose_engine
 from app.graphs.chat_graph import build_chat_graph
 from app.logging_conf import RequestContextMiddleware, setup_logging
+from app.services.restock_analyzer import build_default_analyzer
 
 logger = logging.getLogger("dkd.agent")
 
@@ -44,6 +45,9 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     app.state.chat_graph = build_chat_graph(checkpointer=store.saver, use_llm=s.use_llm)
     # 补货工作台服务（1-7）：真实 store + 真实只读依赖；测试可用 app.state.restock_service 整体替换
     app.state.restock_service = restock.build_default_service()
+    # 定时分析执行器（1-9）：与工作台共用同一份 checkpointer；
+    # 测试可用 app.state.restock_analyzer 整体替换
+    app.state.restock_analyzer = build_default_analyzer(checkpointer=store.saver, settings=s)
     logger.info("dkd-agent started (env=%s, use_llm=%s)", s.app_env, s.use_llm)
     try:
         yield

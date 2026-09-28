@@ -94,11 +94,13 @@ DKD_AGENT_LIVE_LLM=1 uv run pytest -m live -v
 | --- | --- | --- |
 | `DKD_AGENT_ENV` | 运行环境 | dev / test / prod |
 | `DKD_AGENT_SERVICE_SECRET` | 服务间密钥 | 与 Java `AgentProperties.secret` 对应；未配置则回调接口返回 503 |
-| `DKD_AGENT_DB_USER` / `_PASSWORD` | MySQL **只读账号** | 默认 `dkd_agent_ro`，禁止使用 root |
+| `DKD_AGENT_DB_USER` / `_PASSWORD` | MySQL **只读账号** | 默认 `dkd_agent`（两级授权见 `docs/ddl/create_agent_db_user.sql`），禁止使用 root |
 | `DKD_AGENT_SQLITE_PATH` | 会话 checkpoint 文件 | 默认 `var/checkpoints.db`，**需纳入备份**；备份/恢复见 `app/checkpoint.py` docstring |
 | `DKD_AGENT_USE_LLM` | 是否真实调用 LLM | `0`=echo 链路（默认）；`1` 但无密钥则**启动即失败** |
 | `DKD_AGENT_AUDIT_ENABLED` | 留痕/计量开关 | `0` 便于本地不连库调试 |
 | `DKD_AGENT_TOKEN_LIMIT_PER_USER` / `_GLOBAL` | 日 token 限额 | `0`=不限；超限返回 **429**（防成本失控） |
+| `DKD_AGENT_TABLE_WHITELIST` | 只读表白名单 | 表名带 `tb_` 前缀 |
+| `DKD_AGENT_RESTOCK_CALIBRATION_ENABLED` | 补货 LLM 校准开关 | `0`=纯统计基线（本地验收默认关闭，避免真实调用 LLM 产生费用） |
 
 ## 留痕与成本计量（任务 0-12）
 
@@ -113,7 +115,30 @@ curl -H "X-Agent-Secret: $DKD_AGENT_SERVICE_SECRET" \
 
 - **降级原则**：审计/计量属旁路，数据库故障时**记录 WARN 后放行**，不中断用户对话；
   但限额熔断属业务规则，命中时明确返回 `429`（不静默）。
-| `DKD_AGENT_TABLE_WHITELIST` | 只读表白名单 | 表名带 `tb_` 前缀 |
+
+## 定时分析入口（任务 1-9）
+
+06:00 的补货分析由 Java 的 dkd-quartz 触发本接口（任务注册见 `docs/ddl/agent_restock_job.sql`）：
+
+```bash
+curl -X POST -H "X-Agent-Secret: $DKD_AGENT_SERVICE_SECRET" \
+     -H "X-Request-Id: restock-job-manual01" -H "Content-Type: application/json" \
+     -d '{"planDate":"2026-09-28"}' \
+     http://127.0.0.1:8090/agents/restock/analyze
+```
+
+| 返回 `data.status` | 含义 | Java 侧反应 |
+| --- | --- | --- |
+| `analyzed` | 已生成计划并落库（`deviceCount`/`channelCount`/`totalQuantity`），图停在人工确认处 | 任务成功 |
+| `skipped` | `agent_restock_pause` 开关为暂停（**不是错误**） | 任务成功（不重试、不告警） |
+
+- 路径用 `/agents/**`（服务间密钥）而不是 `/agent/restock/**`（用户 JWT 经网关）：鉴权体系不同，
+  **不能混用**（AGENTS §7.5）；
+- 失败返回 502（Python 自身故障，Java 侧重试后仍失败则由 `sys_job_log` 留下失败记录）；
+- 同一日期重复触发安全（`thread_id = restock-<planDate>`，计划按 `(vm_id, plan_date)` 幂等 upsert）；
+- 每次触发都写 `agent_decision_log`（`scene=2`、`trigger_type=2`、`user_id=NULL`、`llm_output=NULL`）。
+
+端到端验收：`python ../docs/scripts/verify-1-9-analyze.py`（真 MySQL + 真实 FastAPI，20 项断言）。
 
 ## 当前进度（Phase 0）
 
@@ -127,3 +152,16 @@ curl -H "X-Agent-Secret: $DKD_AGENT_SERVICE_SECRET" \
 | 0-12 `request_id` 贯穿 + 决策留痕 + 成本计量与限额 | ✅ 全链：留痕/消息投影实写 MySQL（含脱敏）、限额熔断 429、`/agents/usage/summary` 报表；审计库故障降级不中断对话 |
 | 0-10 SQLite checkpointer 接入 | ✅ 跨请求恢复、进程重启后仍可读回、`Last-Event-ID` 断点续传均已验证 |
 | 0-4 只读账号 + 白名单 | ✅ `dkd_agent` 两级授权（业务表只读 + agent_* 可写无 DELETE）；8 项拒绝路径实测均被 MySQL 拒绝 |
+
+## 当前进度（Phase 1 · 补货 Agent）
+
+| 任务 | 状态 |
+| --- | --- |
+| 1-3 工单创建回调 | ✅ 唯一写通道 + 失败三分类 + 零重试；真库真回调 taskId=573 |
+| 1-4 统计基线引擎 | ✅ 纯函数 + 三条边界 + 200 次随机序列不变量；回测留档（±20% 验收受 FIX-6 数据缺失阻塞） |
+| 1-5 LLM 校准节点 | ✅ 系数化 + 三层不可信输入防护 + 失败降级（真实 live 链路待 FIX-11） |
+| 1-6 中断确认子图 + 状态机 | ✅ 跨进程恢复、终态不可复活、幂等 upsert |
+| 1-7 人工干预 API | ✅ 调整（可重算）/跳过/恢复/暂停，写操作强制网关身份 |
+| 1-7b 干预决策留痕 | ✅ 六类动作 × 四条终态路径全部留痕，`llm_output` 恒为 NULL |
+| 1-8 接单人分配与并发防护 | 🟡 主体实现 + CAS 乐观锁；10 台跨区域真机验收待环境（FIX-6） |
+| 1-9 06:00 定时分析 | ✅ `POST /agents/restock/analyze` 消费暂停开关 + Java `agentTask.restockAnalyze` 重试/告警 + 注册 SQL；端到端 20/20 |

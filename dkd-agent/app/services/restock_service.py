@@ -23,15 +23,13 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.audit import RESULT_FAIL, RESULT_OK, RESULT_REJECTED, TRIGGER_MANUAL, record_decision
+from app.audit import RESULT_FAIL, RESULT_OK, RESULT_REJECTED, TRIGGER_MANUAL
 from app.config import Settings, get_settings
-from app.db import get_sessionmaker
 from app.graphs.restock_baseline import compute_device_baseline
 from app.graphs.restock_decisions import (
     ACTION_ADJUST,
@@ -55,27 +53,15 @@ from app.graphs.restock_plan_store import (
 )
 from app.graphs.restock_state import PLAN_STATUS_SUGGESTED, SCENE_RESTOCK, RestockPlan
 from app.logging_conf import current_request_id
+from app.services.decision_audit import (
+    NO_REQUEST_ID,
+    AuditWriter,
+    write_decision,
+)
 from app.tools.read_tools import default_sales_window
 from app.tools.task_tools import CallbackError
 
 logger = logging.getLogger("dkd.agent.services.restock")
-
-# 留痕写入器签名（依赖注入点：单测传假写入器即可，不必连 MySQL）
-AuditWriter = Callable[..., Awaitable[None]]
-
-# 无网关注入 request_id 时的哨兵值（`logging_conf` 的 contextvar 缺省值）
-_NO_REQUEST_ID = "-"
-
-
-async def _default_audit_writer(**kwargs: Any) -> None:
-    """默认留痕写入器：自建会话写 `agent_decision_log`（1-7b）。
-
-    与 `app/api/chat.py::_record_turn` 同一套口径（scene/trigger_type/脱敏），
-    差别只在于本模块是**人工干预**入口，没有人机对话的 LLM 输出。
-    """
-    async with get_sessionmaker()() as session:
-        await record_decision(session, **kwargs)
-
 
 # 人工可指定的预测窗口上限/下限（与配置的窗口集合取交集后再校验，见 _validate_overrides）
 MAX_REASON = 500
@@ -125,7 +111,8 @@ class RestockService:
         # 开关存储单独注入：测试用内存实现时不该被拖去连 MySQL
         self._pause = pause_store or SqlPauseStore(getattr(store, "_session_factory", None))
         # 留痕写入器同理：单测注入假写入器，生产走默认的 MySQL 实现
-        self._audit_writer: AuditWriter = audit_writer or _default_audit_writer
+        # （默认实现与纪律见 app/services/decision_audit.py，1-7b 与 1-9 共用一份）
+        self._audit_writer: AuditWriter | None = audit_writer
 
     # ---------------- 读 ----------------
 
@@ -297,7 +284,7 @@ class RestockService:
         回调头里写 `-` 等于没写；`restock-confirm-<plan_id>` 至少能在 Java 日志里定位到计划。
         """
         rid = current_request_id()
-        return rid if rid and rid != _NO_REQUEST_ID else f"restock-confirm-{plan_id}"
+        return rid if rid and rid != NO_REQUEST_ID else f"restock-confirm-{plan_id}"
 
     async def _audit(
         self,
@@ -312,39 +299,27 @@ class RestockService:
     ) -> None:
         """写一条人工干预决策留痕（1-7b / FIX-2，AGENTS §6.3 强制项）。
 
-        三条纪律：
-        1. **留痕失败不得中断业务**——审计是旁路，捕获后只记 WARN（同 0-12 的对话链路）；
-           这里**故意用宽异常**：连接池耗尽、配置缺失、脱敏实现异常各异，
-           而审计侧的任何一种都不该让运营「点了确认却什么都没发生」。
-           不是静默吐掉：WARN + exc_info 会把堆栈打进日志，便于事后补录。
-        2. 审计关闭（`DKD_AGENT_AUDIT_ENABLED=0`）时不写，便于无库环境跑测试。
-        3. **不写 `llm_output`**：人工作业没有 LLM 输出，把人工参数塞进去会让 3-7 审计页
+        四条纪律（实现与理由见 `app/services/decision_audit.py`——1-7b 与 1-9 两条入口共用一份，
+        避免「其中一条把异常吞了」「其中一条把人工参数写进 llm_output」这类漂移）：
+        1. 留痕失败不得中断业务（WARN + 堆栈，不静默）；
+        2. 审计关闭时不写（便于无库环境跑测试）；
+        3. `request_id` 缺失时写 NULL，不编 ID；
+        4. **不写 `llm_output`**：人工作业没有 LLM 输出，把人工参数塞进去会让 3-7 审计页
            把「人做的事」渲染成「模型建议的事」；结果因此全部放在 `input_context` 里。
         """
-        if not self._settings.audit_enabled:
-            return
-        rid = current_request_id()
-        try:
-            await self._audit_writer(
-                scene=SCENE_RESTOCK,
-                action=action,
-                request_id=None if rid in (None, "", _NO_REQUEST_ID) else rid,
-                user_id=user_id,
-                trigger_type=TRIGGER_MANUAL,
-                input_context=input_context,
-                target_type=target_type,
-                target_id=target_id,
-                result=result,
-                error_msg=error_msg,
-            )
-        except Exception as exc:  # noqa: BLE001 —— 故意宽捕获：见 docstring 纪律 1（WARN + 堆栈，非静默）
-            logger.warning(
-                "决策留痕写入失败（业务不受影响，需事后补录）action=%s target=%s err=%s",
-                action,
-                target_id,
-                type(exc).__name__,
-                exc_info=True,
-            )
+        await write_decision(
+            settings=self._settings,
+            writer=self._audit_writer,
+            scene=SCENE_RESTOCK,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            user_id=user_id,
+            trigger_type=TRIGGER_MANUAL,
+            result=result,
+            input_context=input_context,
+            error_msg=error_msg,
+        )
 
     def _audit_context(
         self,
