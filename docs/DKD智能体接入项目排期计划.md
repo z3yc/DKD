@@ -243,7 +243,7 @@
 | `mvn -pl dkd-admin -am test` | **Tests run: 60, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient **10** / TaskCreate 6 / **AgentTask 10**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
-| DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142） |
+| DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142）；**1-9 新增任务注册 `docs/ddl/agent_restock_job.sql`** 已在本机 dkd 库执行（校验查询 1 行：cron `0 0 6 * * ?` / misfire=2 / concurrent=1 / status=0），幂等重跑退出码 0 |
 | 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**31/31 PASS**，其中 [H] 段为 1-7b 的留痕断言）；**`docs/scripts/verify-1-9-analyze.py`（本轮新增，真 MySQL + 真实 FastAPI，20/20 PASS：鉴权 3 项 / 暂停开关 3 项 / 正常触发 3 项 / 重入安全 2 项 / 留痕 9 项）**；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
 
 ### 本轮（0-6 / 0-7 / 0-8 / 0-11 / 0-14c）详细记录
@@ -479,7 +479,7 @@
 - **本轮发现并修掉的真问题（FIX-19，值得单独记一笔）**：JDK 对流式（带请求体）请求的 401 会抛 `HttpRetryException`，Spring 包成 `ResourceAccessException` → 客户端把“鉴权拒绝”报成“服务不可达”。若不是写 1-9 的 4xx 不重试用例，这个坑会在“轮换服务间密钥”那天才暴露——正是 FIX-7 要求上线前完成的事，属**上线阻塞级**缺陷。修法与代价已写入 §八 FIX-19。
 - **未验证（不隐瞒）**：
   ① **真 LLM 的 06:00 全链未跑**：本机只在 `DKD_AGENT_RESTOCK_CALIBRATION_ENABLED=0` 下验收（脚本默认关闭校准）；真实校准链路的 live 冒烟仍是 FIX-11；
-  ② **Java 侧未做真机联调**：`AgentTask` 的 10 项单测用回环假服务，未与真 Python 进程 端到端跑过（缺 Java/Python 同时启动的联调环境）；`sys_job` 注册 SQL 也**未在本机执行**（本机 Java 是否连库运行未验证），只做了语法/字段核对与回滚路径设计；
+  ② **Java 侧未做真机联调**：`AgentTask` 的 10 项单测用回环假服务，未与真 Python 进程做端到端联调（缺 Java/Python 同时启动的联调环境）；任务注册 SQL `docs/ddl/agent_restock_job.sql` **已在本机 dkd 库执行且幂等重跑通过**（校验 1 行），但“定时触发→Java 发起→Python 分析”的真机链路待下一次同时启动两端时验；
   ③ 定时任务的真告警通道仍是“`sys_job_log` 留失败记录 + ERROR 日志”，**未接短信/企业微信**（排期 §四风险表未要求，属上线期观测方案的一部分，4-3 值守时需人工看日志）。
 - **下一步（按风险排序）**：1-10/1-11 前端补货工作台（M2 验收项，FIX-12 一并处理）→ FIX-6（生产/测试库数据导出，1-4 的 ±20% 与 1-13 的 10 台真机验收都卡在这里）/ FIX-4（索引 DDL 评审）/ FIX-5（容量权威源）→ 1-12 对账前置的 FIX-3。
 
