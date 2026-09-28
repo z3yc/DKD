@@ -1,9 +1,11 @@
 package com.dkd.common.agent.support;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpRetryException;
 import java.net.URI;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -298,6 +300,26 @@ public class AgentUpstreamClient
             {
                 throw upstream;
             }
+            // JDK 对「带请求体的流式请求」收到 401（或代理 407）时**不会把响应交回来**，
+            // 而是抛 HttpRetryException（它想带凭据重放请求，但流式模式下无法重发请求体）。
+            // 这不是“不可达”：状态码是明确的鉴权拒绝，必须按状态码交给调用方——
+            // 否则“服务间密钥不一致”会被报成“智能体服务宕机”，运维会朝完全错误的方向排查
+            // （实测：排期 1-9 的定时任务 401 拒绝路径）。代价是这类响应的响应体拿不到
+            // （JDK 已丢弃），故合成一个“仅状态码”的响应交回原 extractor，保持回调契约不变。
+            HttpRetryException retry = findCause(e, HttpRetryException.class);
+            if (retry != null && retry.responseCode() > 0)
+            {
+                log.warn("上游返回 {} 且 JDK 因流式请求体无法重放（HttpRetryException），按仅状态码处理",
+                        retry.responseCode());
+                try
+                {
+                    return extractor.extractData(new StatusOnlyClientHttpResponse(retry.responseCode()));
+                }
+                catch (IOException io)
+                {
+                    throw new AgentUpstreamException(retry.responseCode(), "读取上游鉴权拒绝响应失败", io);
+                }
+            }
             if (e instanceof ResourceAccessException)
             {
                 throw new AgentUpstreamException(AgentUpstreamException.STATUS_TRANSPORT_FAILURE,
@@ -369,6 +391,62 @@ public class AgentUpstreamClient
         public void handleError(ClientHttpResponse response) throws IOException
         {
             // 上游错误由调用方按策略处理，此处无动作
+        }
+    }
+
+    /**
+     * 仅携带状态码的合成响应（见 {@link #execute} 里的 HttpRetryException 分支）。
+     *
+     * <p>为什么需要它：JDK 在流式请求收到 401/407 时已把响应体丢弃（异常消息就是
+     * “cannot retry due to server authentication, in streaming mode”），
+     * 但状态码是有效信息（“密钥不对”而不是“服务不可达”），不能用丢失的响应体
+     * 去否定这个事实。构造一个空体响应后，两条通道（{@code relayStream}/{@code forward}）
+     * 的既有分支无需改动即可正确归因：前者抛状态码为 401 的 {@code AgentUpstreamException}，
+     * 后者把 401 作为状态码交给调用方。
+     */
+    private static final class StatusOnlyClientHttpResponse implements ClientHttpResponse
+    {
+        private final int status;
+
+        StatusOnlyClientHttpResponse(int status)
+        {
+            this.status = status;
+        }
+
+        @Override
+        public HttpStatus getStatusCode()
+        {
+            return HttpStatus.valueOf(this.status);
+        }
+
+        @Override
+        public int getRawStatusCode()
+        {
+            return this.status;
+        }
+
+        @Override
+        public String getStatusText()
+        {
+            return HttpStatus.valueOf(this.status).getReasonPhrase();
+        }
+
+        @Override
+        public void close()
+        {
+            // 不持有连接，无需释放
+        }
+
+        @Override
+        public InputStream getBody()
+        {
+            return new ByteArrayInputStream(new byte[0]);
+        }
+
+        @Override
+        public HttpHeaders getHeaders()
+        {
+            return new HttpHeaders();
         }
     }
 }

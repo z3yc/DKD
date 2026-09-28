@@ -179,6 +179,43 @@ class AgentUpstreamClientTest
     }
 
     @Test
+    void 转发遇到上游401时按状态码透传而不是误报不可达() throws Exception
+    {
+        // 回归用例（排期 1-9 开发中实测发现）：带请求体的请求会走 JDK 的“流式模式”，
+        // HttpURLConnection 收到 401 时不会把响应交回来，而是抛
+        // HttpRetryException("cannot retry due to server authentication, in streaming mode")，
+        // Spring 再把它包成 ResourceAccessException。
+        // 若不特判，客户端会把「服务间密钥不一致」报成「智能体服务不可达」——
+        // 运维会去查 Python 进程/端口，而真正的问题是密钥（FIX-7 轮换期间最容易踩）。
+        try (FakeAgentServer server = new FakeAgentServer("/agents/restock/analyze",
+                exchange -> FakeAgentServer.respond(exchange, 401, "application/json",
+                        "{\"code\":401,\"msg\":\"服务间密钥校验失败\",\"data\":null}")))
+        {
+            AgentUpstreamResult result = newClient(server.baseUrl()).forward("POST", "/agents/restock/analyze", null,
+                    headers("7"), "{\"planDate\":\"2026-09-23\"}".getBytes(StandardCharsets.UTF_8));
+
+            assertThat(result.getStatus()).as("鉴权拒绝必须原样回传，不能被归因为传输层故障").isEqualTo(401);
+            assertThat(result.isSuccessful()).isFalse();
+            // 代价写明：JDK 已丢弃 401 的响应体，合成响应只能是空体（抛异常比空体更不利于定位）
+            assertThat(new String(result.getBody(), StandardCharsets.UTF_8)).isEmpty();
+        }
+    }
+
+    @Test
+    void 中继遇到上游401抛带状态码的异常而不是零状态() throws Exception
+    {
+        try (FakeAgentServer server = new FakeAgentServer("/agent/chat",
+                exchange -> FakeAgentServer.respond(exchange, 401, "application/json", "{\"code\":401}")))
+        {
+            assertThatThrownBy(() -> newClient(server.baseUrl()).relayStream("POST", "/agent/chat", null,
+                    headers("7"), "{\"message\":\"hi\"}".getBytes(StandardCharsets.UTF_8),
+                    new ByteArrayOutputStream()))
+                            .isInstanceOfSatisfying(AgentUpstreamException.class,
+                                    e -> assertThat(e.getStatus()).isEqualTo(401));
+        }
+    }
+
+    @Test
     void 探活_上游正常时true_端口关闭时false() throws Exception
     {
         try (FakeAgentServer server = new FakeAgentServer("/health",
