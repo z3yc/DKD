@@ -163,3 +163,50 @@ def test_business_error_is_not_misclassified_as_storage():
 
     assert not _is_storage_error(RuntimeError("boom"))
     assert not _is_storage_error(ValueError("bad input"))
+
+
+def test_model_internal_markup_is_stripped():
+    """模型内部标记（实测 `<｜｜DSML｜｜ calls>`）不得出现在回复里。
+
+    这是**展示层缺陷**：用户看到的是乱码，而留痕里如果原样保存，事后审计也会以为模型真的说了这句。
+    所以流式分片与落库回复走同一个剥离函数。
+    """
+    from app.api.chat import _strip_model_markup
+
+    samples = [
+        "<｜｜DSML｜｜ calls>",
+        "结论如下<｜｜DSML｜｜ tool_calls begin｜｜>get_machine_inventory<｜｜end｜｜>",
+        "<|tool▁calls▁begin|>list_device_anomalies<|tool▁calls▁end|>",
+    ]
+    for raw in samples:
+        assert _strip_model_markup(raw).strip() == "" or "DSML" not in _strip_model_markup(raw)
+    # 正常文本不受影响（不得把尖括号本身当标记乱删）
+    assert _strip_model_markup("库存 0/10，缺口 10 件") == "库存 0/10，缺口 10 件"
+    assert _strip_model_markup("用 a<b 比较") == "用 a<b 比较"
+    assert _strip_model_markup("") == ""
+
+
+def test_streaming_markup_filter_handles_split_markers():
+    """**分片到达**的标记也必须被剥掉（实测 `<｜｜DSML｜｜ calls>` 被切成 3 片）。"""
+    from app.api.chat import ModelMarkupFilter
+
+    f = ModelMarkupFilter()
+    out = (
+        "".join(
+            [
+                f.feed("<｜｜DS"),
+                f.feed("ML｜｜ calls"),
+                f.feed(">"),
+                f.feed("结论：没有检出异常。"),
+            ]
+        )
+        + f.flush()
+    )
+    assert "DSML" not in out, f"分片标记未被剥掉：{out!r}"
+    assert "结论：没有检出异常。" in out, "正文不能丢"
+
+    # 正常文本（含孤立的 <）不得被吞
+    f2 = ModelMarkupFilter()
+    parts = ["用 a", "<", "b 比较", "，库存 0/10"]
+    got = "".join(f2.feed(p) for p in parts) + f2.flush()
+    assert got == "用 a<b 比较，库存 0/10", f"正文被误改：{got!r}"

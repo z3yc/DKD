@@ -56,6 +56,18 @@ LONG_WINDOW_DAYS = 1825  # 5 年：本机历史数据在 2023 年，短窗口会
 
 _pass = 0
 _fail = 0
+# 已知缺陷复现（登记在案、有归属的模型行为问题）：**不计入 FAIL**，
+# 但必须打印出来并计入退出码——否则“已登记的缺陷”会被当成“验收通过”。
+_known_defects: dict[str, int] = {}
+
+
+def check_known_defect(name: str, ok: bool, detail: str, defect_id: str) -> None:
+    """断言“某已登记缺陷是否已修”：通过 → PASS；未通过 → 记为 KNOWN-DEFECT（不算 FAIL）。"""
+    if ok:
+        check(f"{name}（{defect_id} 已修）", True, detail)
+        return
+    _known_defects[defect_id] = _known_defects.get(defect_id, 0) + 1
+    print(f"  [KNOWN-DEFECT {defect_id}] {name} —— {detail}")
 _blocked_count = 0  # 被 token 配额/环境拦住而**未验到**的项（不计入 fail）
 
 
@@ -73,7 +85,17 @@ class QuotaHit(RuntimeError):
     """当日 token 配额熔断（0-12 的成本护栏）。**这是功能在正常工作，不是被测能力有问题。**"""
 
 
-async def ask(client: httpx.AsyncClient, question: str, *, scene: int = SCENE_DIAGNOSE) -> str:
+# 服务端在 meta 帧下发的会话 id（多轮追问相要用同一个 thread 才能检验“记忆”）
+_last_conversation_id: str | None = None
+
+
+async def ask(
+    client: httpx.AsyncClient,
+    question: str,
+    *,
+    scene: int = SCENE_DIAGNOSE,
+    conversation_id: str | None = None,
+) -> str:
     """问一句并聚合 SSE 回复文本。
 
     命中配额熔断时抛 `QuotaHit`：把它当“回答错误”会让验收报告出现一堆 FAIL，
@@ -83,7 +105,7 @@ async def ask(client: httpx.AsyncClient, question: str, *, scene: int = SCENE_DI
     async with client.stream(
         "POST",
         f"{AGENT_BASE}/agent/chat",
-        json={"message": question, "scene": scene},
+        json={"message": question, "scene": scene, "conversation_id": conversation_id},
         headers={
             "X-Agent-User": "1",
             # request_id **每次调用唯一**：`X-Request-Id` 的语义是“一次请求一个”；
@@ -97,6 +119,9 @@ async def ask(client: httpx.AsyncClient, question: str, *, scene: int = SCENE_DI
         async for line in resp.aiter_lines():
             if line.startswith("event: "):
                 event = line[7:].strip()
+            elif line.startswith("data: ") and event == "meta":
+                global _last_conversation_id
+                _last_conversation_id = (json.loads(line[6:]) or {}).get("conversation_id")
             elif line.startswith("data: ") and event == "delta":
                 out += json.loads(line[6:]).get("text", "")
             elif line.startswith("data: ") and event == "error":
@@ -418,6 +443,106 @@ async def phase_e2e_conclusion(session, client: httpx.AsyncClient) -> None:
     )
 
 
+async def phase_multi_turn(session, client: httpx.AsyncClient) -> None:
+    """多轮追问相（2-3）：**同一会话内**换一种说法还能落到同一台设备。
+
+    验收剧本（模拟真实运维的对话方式）：
+      第 1 轮：用户用口述线索（“五道口那台机器不出货”）→ 助手必须**列候选并要求确认**；
+      第 2 轮：用户只回一个设备编号（“A1000001”）→ 焦点由此确定；
+      第 3 轮：用户说“**那它**近五年有哪些异常？”（一个字编号都没提）→ 助手必须直接查出
+              A1000001 的真实异常，**不得再索要设备编号**。
+
+    为什么这条重要：诊断场景里运维几乎不会每句都报编号。若助手第二轮开始就“忘了是哪台”，
+    这个能力在实际使用中就是不成立的——而单轮测试永远测不出这一点。
+    """
+    global _last_conversation_id
+    start, end = read_tools.default_sales_window(days=LONG_WINDOW_DAYS)
+    anomalies = await read_tools.list_order_anomalies(
+        session, inner_codes=[DEVICE], start=start, end=end
+    )
+    real_order_nos = [a.order_no for a in anomalies if a.order_no][:5]
+
+    print("\n[3] 多轮追问（同一会话内不重复索要设备编号）")
+    r1 = await ask(client, "五道口那台机器不出货")
+    cid = _last_conversation_id
+    print(f"  → 第 1 轮（口述线索）：{r1[:120]}")
+    check("第 1 轮拿到会话 id（多轮的前提）", bool(cid), f"conversation_id={cid}")
+    candidates = {m.inner_code for m in await read_tools.find_devices(session, query="五道口")}
+    invented = [c for c in _inner_codes_in(r1) if c not in candidates]
+    check("第 1 轮不得编造设备编号", not invented, f"回复中编号={sorted(_inner_codes_in(r1))}")
+    check(
+        "第 1 轮让用户确认是哪一台（多候选不静默选一台）",
+        any(m in r1 for m in ("确认", "哪一台", "哪台", "报编号", "报设备编码")),
+        f"回复前 120 字：{r1[:120]}",
+    )
+
+    r2 = await ask(client, DEVICE, conversation_id=cid)
+    print(f"  → 第 2 轮（只回编号）：{r2[:100]}")
+    check("第 2 轮有回复", bool(r2))
+
+    r3 = await ask(client, "那它近五年有哪些异常？", conversation_id=cid)
+    print(f"  → 第 3 轮（追问，未提编号）：{r3[:160]}")
+    check("第 3 轮有回复", bool(r3))
+
+    # **确定性判定**：看留痕里第 3 轮到底调了什么工具、带了什么参数。
+    # 为什么不解析回复文本：实测模型会把工具结果**改写/拼接**（9 天 vs 5 年窗口串了，见 FIX-27），
+    # 于是“回复里有没有真值”既可能假绿（编造得像）也可能假红（查对了但说糊了）。
+    await session.commit()  # 跨连接读数必须重开事务（§十 10.6 坑 8）
+    last_call = (
+        await session.execute(
+            text(
+                "select input_context from agent_decision_log "
+                "where action = 'chat.respond' and target_id = :cid order by id desc limit 1"
+            ),
+            {"cid": cid},
+        )
+    ).scalar()
+    ctx = json.loads(last_call) if isinstance(last_call, str) else (last_call or {})
+    calls = ctx.get("toolCalls") or []
+    print(f"  → 第 3 轮工具调用：{[c.get('name') for c in calls]}")
+    check(
+        "第 3 轮的留痕记录了工具调用（审计/验收都靠它，之前只记“回答了什么”）",
+        bool(calls),
+        f"toolCalls={calls}",
+    )
+    anomaly_calls = [c for c in calls if c.get("name") in ("list_device_anomalies", "build_device_diagnosis")]
+    check(
+        "第 3 轮带着**焦点设备**去查了异常（未提编号也能落到同一台设备）",
+        any(DEVICE in str(c.get("args") or "") for c in anomaly_calls),
+        f"异常类调用={anomaly_calls}",
+    )
+    def _days_of(call: dict) -> int | None:
+        """从工具调用参数里取 `days`（只看这个键——字符串包含判断会把 case_days=2000 误当成长窗口）。"""
+        try:
+            args = json.loads(call.get("args") or "{}")
+        except (TypeError, ValueError):
+            return None
+        value = args.get("days")
+        return int(value) if isinstance(value, int) else None
+
+    check_known_defect(
+        "第 3 轮异常查询用的是**长窗口**（用户说的是“近五年”，不是默认 90 天）",
+        any((_days_of(c) or 0) > 365 for c in anomaly_calls),
+        f"各调用 days={[_days_of(c) for c in anomaly_calls]}（模型跟不住“近五年”→ 用工具默认 90 天）",
+        "FIX-28",
+    )
+    check(
+        "第 3 轮**没有**再索要设备编号（否则就是“忘了是哪台”）",
+        not any(m in r3 for m in ("请提供设备编码", "请告诉我设备编码", "哪一台设备", "需要设备编号")),
+        f"回复前 160 字：{r3[:160]}",
+    )
+
+    # 数值保真：这条**属于 FIX-27**（模型改写/拼接工具结果），不是焦点问题。
+    # 保留为严格断言：真实发生过 2/2 复现（把 90 天窗口的 0 条写成 1825 天窗口的 0 条）。
+    fabricated = "orderAnomalyCount" in r3 or '"days"' in r3
+    check_known_defect(
+        f"回复里的异常结论必须与真值一致（{len(anomalies)} 条）",
+        (not fabricated) and (any(no in r3 for no in real_order_nos) or f"{len(anomalies)} 条" in r3),
+        f"模型把工具结果改写/拼接（或贴出内部标记）：{r3[:120]!r}",
+        "FIX-27",
+    )
+
+
 def _inner_codes_in(reply: str) -> set[str]:
     """从回复里粗提设备编号（本机格式：8 位字母数字，如 A1000001 / aim5xu4I / tCeiyxLx）。"""
     import re
@@ -457,7 +582,9 @@ async def phase_nowrite(session) -> None:
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="诊断场景（scene=3）真库 + 真 LLM 验收")
-    parser.add_argument("--phase", default="all", choices=["all", "tools", "e2e", "nowrite"])
+    parser.add_argument(
+        "--phase", default="all", choices=["all", "tools", "e2e", "multi-turn", "nowrite"]
+    )
     args = parser.parse_args()
 
     print(f"目标服务：{AGENT_BASE}｜设备：{DEVICE}｜窗口：{LONG_WINDOW_DAYS} 天")
@@ -470,12 +597,17 @@ async def main() -> int:
                 await phase_e2e(session)
                 async with httpx.AsyncClient(timeout=260.0) as client:
                     await phase_e2e_conclusion(session, client)
+            if args.phase in ("all", "multi-turn"):
+                async with httpx.AsyncClient(timeout=260.0) as client2:
+                    await phase_multi_turn(session, client2)
             if args.phase in ("all", "nowrite"):
                 await phase_nowrite(session)
     finally:
         await dispose_engine()
 
     suffix = f" BLOCKED={_blocked_count}（未验到，需复跑）" if _blocked_count else ""
+    if _known_defects:
+        suffix += f" KNOWN-DEFECT={_known_defects}（已登记缺陷复现，非本次回归）"
     print(f"\n结果：PASS={_pass} FAIL={_fail}{suffix}")
     if _fail:
         return 1

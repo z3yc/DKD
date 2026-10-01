@@ -635,3 +635,133 @@ def test_conclusion_extraction_is_defensive():
     # **投影里不得出现逐条 detail**：那是给模型看的，不该进 done 帧（帧体量 + 前端也不需要）
     assert "detail" not in json.dumps(projected)
     assert len(json.dumps(projected, ensure_ascii=False)) < 2000, "投影必须体量有界"
+
+
+# ------------------------------------------------------------------------------------
+# 2-3 多轮问诊：`focus_inner_code`（“正在诊断哪台设备”是状态，不是模型的记性）
+# ------------------------------------------------------------------------------------
+
+
+def test_focus_prefers_explicit_code_then_unique_tool_hit():
+    """焦点优先级：用户原话里的编号 > 工具唯一命中 > 保持原值；多台候选**不得**替他选。"""
+    from langchain_core.messages import HumanMessage as H
+    from langchain_core.messages import ToolMessage
+
+    from app.graphs.chat_graph import _detect_focus, _focus_from_tools
+
+    # 1) 用户明确说了编号 → 以他说的为准（即使上一轮焦点是别的设备）
+    state = {"messages": [H(content="看看 A1000001 的问题")], "focus_inner_code": "tCeiyxLx"}
+    assert _detect_focus(state) == "A1000001"
+
+    # 2) 本轮没提编号 → 保持原焦点（追问「那它的库存呢」要落到同一台设备）
+    state = {"messages": [H(content="那它的库存呢")], "focus_inner_code": "tCeiyxLx"}
+    assert _detect_focus(state) == "tCeiyxLx"
+
+    # 3) 工具恰好一台候选 → 算确定
+    unique = ToolMessage(
+        content=json.dumps({"matchCount": 1, "devices": [{"innerCode": "A1000001"}]}),
+        name="find_devices",
+        tool_call_id="c1",
+    )
+    assert _focus_from_tools({"messages": [unique]}) == "A1000001"
+
+    # 4) 多台候选（用户在“五道口”里有 8 台）→ **不能**替他选一台
+    many = ToolMessage(
+        content=json.dumps({"matchCount": 3, "devices": [{"innerCode": "A"}, {"innerCode": "B"}]}),
+        name="find_devices",
+        tool_call_id="c2",
+    )
+    assert _focus_from_tools({"messages": [many]}) == "", "多候选必须留给用户确认，不得静默选一台"
+
+
+def test_prompt_carries_focus_only_when_known():
+    """焦点进提示词（否则模型无从知道“它”指哪台）；未确定时不得出现该段。"""
+    from app.prompts.assistant_chat import system_prompt
+
+    with_focus = system_prompt(SCENE_DIAGNOSE, focus_inner_code="A1000001")
+    assert "本次会话正在诊断的设备" in with_focus
+    assert "`A1000001`" in with_focus
+    assert "不要再向他索要编号" in with_focus
+
+    without = system_prompt(SCENE_DIAGNOSE)
+    assert "本次会话正在诊断的设备" not in without
+
+
+async def test_focus_survives_across_turns_through_checkpoint(monkeypatch, tmp_path):
+    """两轮对话：第 2 轮的 system 提示词必须带上第 1 轮确定的设备（跨 checkpoint 生效）。
+
+    这条是 2-3 的核心可用性：**追问同一台设备**不该靠模型记性。
+    """
+    seen: list[str] = []
+
+    class _Capturing:
+        def bind_tools(self, _tools):  # noqa: ANN001, ANN202
+            return self
+
+        async def ainvoke(self, messages):  # noqa: ANN001, ANN202
+            seen.append(str(messages[0].content))
+            return AIMessage(
+                content="好的。",
+                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                response_metadata={"model_name": "stub"},
+            )
+
+    model = _Capturing()
+    monkeypatch.setattr(chat_graph, "build_chat_model", lambda *a, **kw: model)
+
+    store = SqliteCheckpointStore(tmp_path / "cp-focus.db")
+    saver = await store.open()
+    try:
+        graph = build_chat_graph(checkpointer=saver, use_llm=True, tools=[])
+        config = {"configurable": {"thread_id": "t-focus"}}
+        await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "看看 A1000001"}], "scene": 3}, config=config
+        )
+        # 第一轮就带焦点是正确的：`resolve_focus` 在 `respond` **之前**跑，
+        # 用户原话里的编号当轮即可确定（本测试第一版断言“第一轮不该有”，那是错的）
+        assert "本次会话正在诊断的设备" in seen[0]
+        assert "`A1000001`" in seen[0]
+
+        await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "那它的库存呢"}], "scene": 3}, config=config
+        )
+        assert "`A1000001`" in seen[-1], "第二轮必须带上焦点设备"
+        assert "不要再向他索要编号" in seen[-1]
+
+        state = await graph.aget_state(config)
+        assert state.values.get("focus_inner_code") == "A1000001"
+    finally:
+        await store.close()
+
+
+def test_tool_calls_are_recorded_for_audit():
+    """留痕要能回答“这个回答基于哪几次查询”：工具调用必须被提取（名称+截断参数）。
+
+    为什么这条重要：模型会说错数字（实测把 90 天窗口的 0 条套到 1825 天窗口上，FIX-27），
+    排障第一步就是核对它**到底查了什么**；而“解析回复文本”既不可靠也没法回归。
+    """
+    from langchain_core.messages import AIMessage
+
+    from app.api.chat import _extract_tool_calls
+
+    ai = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "list_device_anomalies",
+                "args": {"inner_code": "A1000001", "days": 1825},
+                "id": "c1",
+            },
+            {"name": "build_device_diagnosis", "args": {"inner_code": "A1000001"}, "id": "c2"},
+        ],
+    )
+    calls = _extract_tool_calls([ai])
+    assert [c["name"] for c in calls] == ["list_device_anomalies", "build_device_diagnosis"]
+    assert "1825" in str(calls[0]["args"])
+    # 参数超长要截断（不许把大参数塞进留痕）
+    huge = AIMessage(
+        content="",
+        tool_calls=[{"name": "x", "args": {"blob": "y" * 1000}, "id": "c3"}],
+    )
+    assert len(str(_extract_tool_calls([huge])[0]["args"])) <= 401
+    assert _extract_tool_calls([]) == []

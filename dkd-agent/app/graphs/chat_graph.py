@@ -5,12 +5,21 @@
 
 state schema 冻结约定（任务 0-13）：本文件 `ChatState` 的字段一经上线不得删除或改名，
 新增字段必须带默认值——LangGraph 会把最新图代码应用于所有历史 checkpoint（方案 V1.1 §5.2）。
+
+## 本文件新增过哪些字段（按 0-13 的规矩登记）
+
+| 字段 | 何时加 | 为什么 | 兼容性 |
+| --- | --- | --- | --- |
+| `focus_inner_code` | 2026-10-01（2-3 多轮问诊） | 把“正在诊断哪台设备”变成**状态**，
+  而不是指望模型从历史里记住 |
+|  |  | 带默认 `""`；旧 checkpoint 缺该键时各处用 `or ""` 兜底，不依赖 channel 默认值 |
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
@@ -46,6 +55,9 @@ class ChatState(TypedDict):
     model: str
     tokens_in: int
     tokens_out: int
+    # 本次会话正在诊断的设备（2-3）：由 `resolve_focus` 节点维护（见 `_detect_focus`），
+    # 并被注入 system 提示词。空串 = 尚未确定。
+    focus_inner_code: str
 
 
 def _last_human_text(state: ChatState) -> str:
@@ -53,6 +65,67 @@ def _last_human_text(state: ChatState) -> str:
         if isinstance(msg, HumanMessage):
             return str(msg.content)
     return ""
+
+
+# 设备编号的形态（本机实测：8 位字母数字，首位是字母，如 A1000001 / aim5xu4I / tCeiyxLx）。
+# 用它从**用户原话**里认设备编号，比让模型猜可靠——模型猜出来的编号可能库里不存在。
+_DEVICE_CODE_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]{7}(?![A-Za-z0-9])")
+
+
+def _detect_focus(state: ChatState) -> str:
+    """算出“本次会话正在诊断哪台设备”（2-3 的多轮问诊记忆）。
+
+    优先级（**从最确定到最不确定**）：
+
+    1. **用户本轮原话里带了合法形态的设备编号** → 以它为准（人明确说的最可信）；
+    2. 否则看**最近一次 `find_devices` 的结果**：只有**恰好一台**候选时才算确定；
+       多台候选 = 用户还没确认，**不能**替他选（那是“静默选一台”，正是我们一直在防的错）；
+    3. 都没有 → 保持原有焦点（追问“那它的库存呢”要能落到同一台设备上）。
+
+    ⚠️ 这里刻意**不去解析模型的话术**（例如“是否指 A1000001？”）：从自然语言里猜语义会引入
+    一类很难复现的错（模型措辞一变，焦点就丢）。只认“结构化证据”——用户原话里的编号、工具的确定结果。
+    """
+    previous = str(state.get("focus_inner_code") or "")
+    for msg in reversed(list(state.get("messages") or [])):
+        if isinstance(msg, HumanMessage):
+            hit = _DEVICE_CODE_RE.search(str(msg.content))
+            return hit.group(0) if hit else previous
+    return previous
+
+
+def _focus_from_tools(state: ChatState) -> str:
+    """从最近一次 `find_devices` 的结果里取**唯一**候选（多台/零台都不算）。"""
+    for msg in reversed(list(state.get("messages") or [])):
+        if getattr(msg, "name", None) != "find_devices":
+            continue
+        content = getattr(msg, "content", "")
+        text = content if isinstance(content, str) else str(content)
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return ""
+        if not isinstance(payload, dict) or payload.get("matchCount") != 1:
+            return ""
+        devices = payload.get("devices") or []
+        if len(devices) == 1 and devices[0].get("innerCode"):
+            return str(devices[0]["innerCode"])
+        return ""
+    return ""
+
+
+async def resolve_focus(state: ChatState) -> dict[str, Any]:
+    """维护 `focus_inner_code`（图入口节点，2-3）。
+
+    为什么要有这个节点而不是在提示词里让模型自己记：模型“记不记得住”是不可回归的
+    （换个模型/换个措辞就变），而“追问同一台设备”是诊断场景的**基本可用性**。
+    把它做成状态 + 确定性规则，就能用两轮对话把它测出来。
+    """
+    user_said = _detect_focus(state)
+    from_tool = _focus_from_tools(state)
+    focus = user_said or from_tool
+    if focus and focus != str(state.get("focus_inner_code") or ""):
+        logger.info("诊断焦点更新：%s", focus)
+    return {"focus_inner_code": focus}
 
 
 async def respond(state: ChatState) -> dict[str, Any]:
@@ -121,7 +194,12 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
     ]
     # system 必须在最前面（放在历史之后会变成“事后补充说明”，模型容易忽略）
     messages: list[AnyMessage] = [
-        SystemMessage(content=system_prompt(int(state.get("scene", SCENE_GENERAL))))
+        SystemMessage(
+            content=system_prompt(
+                int(state.get("scene", SCENE_GENERAL)),
+                focus_inner_code=str(state.get("focus_inner_code") or ""),
+            )
+        )
     ]
     messages.extend(history)
 
@@ -233,8 +311,12 @@ def build_chat_graph(
     else:
         tool_list = list(tools or [])
         node = _make_llm_node(tool_list) if use_llm else respond
+    # 入口先跑焦点节点（2-3）：在“问”之前把“这次在诊断哪台设备”算出来，
+    # 这样 system 提示词里能带上它，追问才落到同一台设备上。
+    builder.add_node("focus", resolve_focus)
     builder.add_node("respond", node)
-    builder.add_edge(START, "respond")
+    builder.add_edge(START, "focus")
+    builder.add_edge("focus", "respond")
 
     if use_llm and tool_list:
         # handle_tool_errors 显式传**自定义处理器**而不是默认值/True：

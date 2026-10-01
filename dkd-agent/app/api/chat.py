@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -87,6 +88,75 @@ class ChatRequest(BaseModel):
     scene: int = Field(
         default=1, ge=1, le=4, description="场景：1-通用问答 2-补货 3-诊断 4-运营分析"
     )
+
+
+# ----------------------------------------------------------------------------------
+# 模型内部标记的剥离（2026-10-01 实测：回复里出现过 `<｜｜DSML｜｜ calls>`）
+# ----------------------------------------------------------------------------------
+#
+# 这是**展示层缺陷**，不是“模型说错话”：DeepSeek 系列在流式模式下偶尔会把工具调用的
+# 内部标记当正文吐出来（实测多轮追问时出现），用户看到的就是一串乱码。
+# 处理原则：**在边界处剥掉**（流式分片与落库回复都过同一个函数），并且**静默剥掉不替换**——
+# 替换成“（内容已过滤）”会让用户以为我们说漏了什么，而这些标记对用户本来就没有意义。
+#
+# 为什么用“标记形态”而不是穷举关键词：不同实现用过 `<|tool▁calls▁begin|>`、`<｜｜DSML｜｜…>`
+# 等形态，共同特征是**用竖线/全角竖线包着的大写标识 + 可能的尖括号**。匹配形态更耐久。
+_MODEL_MARKUP_RE = re.compile(
+    # 允许 `</` 闭合成对形态（实测漏过 `</｜｜DSML｜｜ parameter>`）；
+    # 关键字放宽到 calls/parameter/invoke/antml —— 都是工具调用的内部语法，对用户无意义。
+    r"</?[\uff5c|]{0,2}\s*[A-Za-z_]{0,24}\s*[\uff5c|]{0,2}\s*"
+    r"(?:DSML|tool[\u2581_]?calls?|function[\u2581_]?calls?|parameter|invoke|antml)"
+    r"[^<>]{0,300}?[\uff5c|]{0,2}>",
+    re.IGNORECASE,
+)
+_MODEL_MARKUP_BARE_RE = re.compile(
+    r"</?[\uff5c|]{1,2}\s*(?:DSML|tool[\u2581_]?calls?|parameter|invoke)[^<>]{0,120}",
+    re.IGNORECASE,
+)
+
+
+class ModelMarkupFilter:
+    """**流式**剥标记：标记可能被分片切开，所以必须把“疑似标记的尾巴”留在缓冲里。
+
+    为什么按分片替换不行（实测）：`<｜｜DSML｜｜ calls>` 会分几次到达
+    （`<｜｜DS` + `ML｜｜ calls` + `>`），逐分片正则永远匹配不到，用户照样看到乱码。
+    所以按“最右一个未闭合的 `<`”切一刀：**能判定的立刻吐出，判不了的留在缓冲**；
+    流结束时调 `flush()` 收尾（保证不丢正文）。
+    """
+
+    __slots__ = ("_buf",)
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, text: str) -> str:
+        self._buf += text or ""
+        if "<" not in self._buf:
+            out, self._buf = self._buf, ""
+            return out
+        idx = self._buf.rfind("<")
+        tail = self._buf[idx:]
+        # 尾巴里已经有 `>`（标记闭合了）或长到不可能是标记 → 全部可判定，一起处理
+        if ">" in tail or len(tail) > 200:
+            out, self._buf = _strip_model_markup(self._buf), ""
+            return out
+        head = self._buf[:idx]
+        self._buf = tail
+        return _strip_model_markup(head)
+
+    def flush(self) -> str:
+        """流结束：把缓冲里剩下的内容吐出来（真标记已在 `feed` 里被剥掉）。"""
+        out, self._buf = _strip_model_markup(self._buf), ""
+        return out
+
+
+def _strip_model_markup(text: str) -> str:
+    """剥掉模型内部标记（流式与落库都调用它，保证“用户看到的”与“留痕记的”一致）。"""
+    if not text or "<" not in text:
+        return text
+    cleaned = _MODEL_MARKUP_RE.sub("", text)
+    cleaned = _MODEL_MARKUP_BARE_RE.sub("", cleaned)
+    return cleaned
 
 
 def _sse(event: str, data: dict[str, object], event_id: int | None = None) -> str:
@@ -167,6 +237,31 @@ def _compact_conclusion(payload: dict) -> dict:
     }
 
 
+def _extract_tool_calls(messages: object) -> list[dict[str, object]]:
+    """本轮调用过哪些工具、带了什么参数（写进留痕；也是验收的确定性信号）。
+
+    为什么要记这个：
+      1. **审计**：只记“回答了”不够，还要能回答“这个回答是基于哪几次查询得出的”
+         （尤其当模型把数字说错时，第一件事就是核对它到底查了什么）；
+      2. **验收**：多轮追问（2-3）要靠“第 3 轮到底有没有带着焦点设备去查”来判定，
+         而**解析模型的回复文本**是不可靠的（实测它会把结果改写、甚至拼接两个窗口的结论）。
+         工具调用是结构化的，判得准、可回归。
+    参数按需截断（防止把大参数塞进留痕）。
+    """
+    calls: list[dict[str, object]] = []
+    for msg in list(messages or []):  # type: ignore[arg-type]
+        for call in getattr(msg, "tool_calls", None) or []:
+            name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+            args = call.get("args") if isinstance(call, dict) else getattr(call, "args", None)
+            if not name:
+                continue
+            text_args = json.dumps(args, ensure_ascii=False)
+            calls.append(
+                {"name": str(name), "args": text_args[:400] + ("…" if len(text_args) > 400 else "")}
+            )
+    return calls
+
+
 def _extract_conclusion(messages: object) -> dict | None:
     """取本轮最后一次 `build_device_diagnosis` 的结论（没有/不可用 → None）。
 
@@ -207,6 +302,7 @@ class _TurnOutcome:
         "tokens_in",
         "tokens_out",
         "conclusion",
+        "tool_calls",
     )
 
     def __init__(self) -> None:
@@ -218,6 +314,8 @@ class _TurnOutcome:
         self.tokens_out = 0
         # 结构化诊断结论（2-4）：仅当本轮调用了 build_device_diagnosis 时非空
         self.conclusion: dict | None = None
+        # 本轮的工具调用（名称+参数，已截断）：写进留痕，供审计与该验的确定性判定
+        self.tool_calls: list[dict[str, object]] = []
 
 
 def _chunk_text(token: object) -> str:
@@ -254,6 +352,7 @@ async def _stream_graph_tokens(
     “整段 token”发一帧、再被兜底分片重复发一遍。只有 `AIMessageChunk` 才是真分片。
     """
     final_state: dict[str, Any] = {}
+    markup = ModelMarkupFilter()
     async for mode, chunk in graph.astream(  # type: ignore[attr-defined]
         {"messages": [HumanMessage(content=message)], "scene": scene},
         config,
@@ -267,18 +366,23 @@ async def _stream_graph_tokens(
             continue
         if not isinstance(token, AIMessageChunk):
             continue
-        text = _chunk_text(token)
+        text = markup.feed(_chunk_text(token))
         if text:
             outcome.streamed += text
             yield text
 
-    outcome.reply = str(final_state.get("reply", "")) or outcome.streamed
+    tail = markup.flush()  # 收尾：把缓冲里的正文吐出来（真标记已剥掉）
+    if tail:
+        outcome.streamed += tail
+        yield tail
+    outcome.reply = _strip_model_markup(str(final_state.get("reply", ""))) or outcome.streamed
     outcome.history_len = len(final_state.get("messages", []))
     model = final_state.get("model")
     outcome.model = str(model) if model else None
     outcome.tokens_in = int(final_state.get("tokens_in", 0) or 0)
     outcome.tokens_out = int(final_state.get("tokens_out", 0) or 0)
     outcome.conclusion = _extract_conclusion(final_state.get("messages"))
+    outcome.tool_calls = _extract_tool_calls(final_state.get("messages"))
 
 
 async def _meter(session: object, *, settings: Settings, scene: int, user_id: int | None) -> None:
@@ -362,7 +466,14 @@ async def _record_turn(
                 action="chat.respond",
                 request_id=rid,
                 user_id=ctx_user_id,
-                input_context={"message": payload.message, "thread_id": thread_id},
+                input_context={
+                    "message": payload.message,
+                    "thread_id": thread_id,
+                    # 本轮调用过哪些工具（名称+截断后的参数）：审计要能回答
+                    # “这个回答是基于哪几次查询得出的”，而不是只知道“它回答了”
+                    "toolCalls": outcome.tool_calls,
+                    "toolCallCount": len(outcome.tool_calls),
+                },
                 llm_output={"reply": outcome.reply, "model": outcome.model},
                 target_type="conversation",
                 target_id=thread_id,
