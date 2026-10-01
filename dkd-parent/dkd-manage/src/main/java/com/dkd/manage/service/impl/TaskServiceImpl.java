@@ -21,8 +21,12 @@ import com.dkd.manage.service.IEmpService;
 import com.dkd.manage.service.ITaskDetailsService;
 import com.dkd.manage.service.IVendingMachineService;
 import org.apache.commons.collections4.EnumerationUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import com.dkd.manage.mapper.TaskMapper;
@@ -39,6 +43,19 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class TaskServiceImpl implements ITaskService 
 {
+    private static final Logger log = LoggerFactory.getLogger(TaskServiceImpl.class);
+
+    /**
+     * 唯一键冲突时对用户展示的统一文案（FIX-1 配套改动）。
+     *
+     * <p>为什么不再让它变成“系统异常”：加了 {@code uk_task_active_dedup} 唯一约束后，
+     * 并发建单的落败方不再收到“设备有未完成工单”，而是 MyBatis 抛出的 1062 —— 用户看到的是
+     * 不可读的错误。文案同时覆盖两种唯一键：
+     * ① 活跃工单去重键（同设备同类型已有未完成工单）；② {@code tb_task.task_code} 唯一键
+     * （Redis 流水被清空/多实例编号撞车时也会抛 1062）。
+     */
+    private static final String TASK_CREATE_CONFLICT_MESSAGE = "设备有未完成工单或工单号冲突，请刷新重试";
+
     @Autowired
     private TaskMapper taskMapper;
 
@@ -209,21 +226,41 @@ public class TaskServiceImpl implements ITaskService
         task.setAddr(vm.getAddr());
         task.setCreateTime(DateUtils.getNowDate());
         task.setTaskCode(generateTaskCode());
-        taskMapper.insertTask(task);
-        //判断是否为补货工单
-        if(taskDto.getProductTypeId().equals(DkdContants.TASK_TYPE_SUPPLY)){
-        //获取补货工单详
-            List<TaskDetailsDto> details = taskDto.getDetails();
-            if (CollUtil.isNotEmpty(details)) {
-                // 将dto转换成po
-                List<TaskDetails> taskDetailsList =  details.stream().map(dto -> {
-                    TaskDetails taskDetails = BeanUtil.copyProperties(dto, TaskDetails.class);
-                    taskDetails.setTaskId(task.getTaskId());
-                    return taskDetails;
-                }).collect(Collectors.toList());
-                //批量新增
-                taskDetailsService.insertTaskDetailsBatch(taskDetailsList);
+        // 为什么把“插入 + 明细”一起包在 try 里（FIX-1 的 Java 配套改动，2026-10-01）：
+        // 唯一约束（uk_task_active_dedup）会把并发落败方从“ServiceException 业务拒绝”变成
+        // DataIntegrityViolationException / DuplicateKeyException（1062）——
+        // 对用户而言就是“系统异常”，而正确的语义是“已经有人建了单 / 工单号撞了”。
+        // 这里把两类完整性异常都翻译成同一条**可读业务文案**；原始异常必须挂在 cause 上
+        // （数据完整性异常的原因不止一种，日志要能查到真因，不能因为改了文案就丢掉证据）。
+        // @Transactional 下抛出 ServiceException（RuntimeException）会整体回滚，不会留半个工单。
+        try {
+            taskMapper.insertTask(task);
+            //判断是否为补货工单
+            if(taskDto.getProductTypeId().equals(DkdContants.TASK_TYPE_SUPPLY)){
+            //获取补货工单详
+                List<TaskDetailsDto> details = taskDto.getDetails();
+                if (CollUtil.isNotEmpty(details)) {
+                    // 将dto转换成po
+                    List<TaskDetails> taskDetailsList =  details.stream().map(dto -> {
+                        TaskDetails taskDetails = BeanUtil.copyProperties(dto, TaskDetails.class);
+                        taskDetails.setTaskId(task.getTaskId());
+                        return taskDetails;
+                    }).collect(Collectors.toList());
+                    //批量新增
+                    taskDetailsService.insertTaskDetailsBatch(taskDetailsList);
+                }
             }
+        } catch (DuplicateKeyException e) {
+            // 唯一键冲突：活跃工单去重键或 task_code（业务语义清晰，可原样重试）
+            log.warn("创建工单命中唯一键冲突，转业务文案：innerCode={} productTypeId={} taskCode={}",
+                    taskDto.getInnerCode(), taskDto.getProductTypeId(), task.getTaskCode(), e);
+            throw new ServiceException(TASK_CREATE_CONFLICT_MESSAGE, e);
+        } catch (DataIntegrityViolationException e) {
+            // 其它完整性约束（非唯一键）在正常入参下不应发生；一并转成可读文案，
+            // 但保留原异常作为 cause，排障时从日志能拿到真正的约束名。
+            log.warn("创建工单命中数据完整性约束，转业务文案：innerCode={} productTypeId={} taskCode={}",
+                    taskDto.getInnerCode(), taskDto.getProductTypeId(), task.getTaskCode(), e);
+            throw new ServiceException(TASK_CREATE_CONFLICT_MESSAGE, e);
         }
         return task;
     }
