@@ -205,13 +205,34 @@ DKD_AGENT_ENABLED=false   # 网关层：/agent/status 报 enabled=false；对话
 | 脚本 | 覆盖 | 最近结果 |
 | --- | --- | --- |
 | `docs/scripts/verify-checkpoint-pg.py` | PG 后端：配置/脱敏/生命周期/setup 幂等/5 项越权拒绝/跨进程恢复/DML 探针 | 18/18 + 3/3 |
-| `docs/scripts/verify-3-9-drills.py` | 对话并发（8 会话无串话）/ PG 连接中断恢复 / Python 宕机降级 | 4/4 + 4/4 |
+| `docs/scripts/verify-3-9-drills.py` | 对话并发（8 会话无串话，**断言按 `meta.mode` 分支**）/ PG 连接中断恢复 / Python 宕机降级 / **SQLite 文件损坏**（7/7）/ **MySQL 慢查询护栏**（8/8） | 4/4（llm，echo 为 5/5）+ 4/4 + 2/2 + **7/7** + **8/8** |
 | `docs/scripts/verify-fix16-redis-failmode.py` | Redis fail-closed 的三相位形态 | 基 2/2 + 故 7/7 + 恢 2/2 |
 | `docs/scripts/verify-fix17-llm-degrade.py` | 密钥失效降级（真 401）/ 真 LLM 校准 live | 6/6 + 7/7 |
 | `docs/scripts/verify-1-12-reconcile.py` | Agent 聚合口径 vs Java 报表口径 | 8/8 |
 | `docs/scripts/restock-workbench-browser-check.cjs` | 补货工作台真浏览器 | 29/29 |
 | `docs/scripts/agent-audit-browser-check.cjs` | 决策审计页真浏览器 | 14/14 |
 | `docs/scripts/sample-2-7-case-library.py` | 知识库数据质量门槛（**当前不达标**，降级规则库） | 4 项不过 |
+| `docs/scripts/verify-1-13-m2-acceptance.py` | M2「≥10 台真机全闭环」一键验收 + 报告（**默认只读**） | 只读 10/10；`--confirm-write` 15/15（已回退） |
+| `docs/scripts/compare-1-14-rule-vs-baseline.py` | 规则版 vs 基线引擎建议量双跑对比 + 3-8 三项指标（只读） | 口径验证通过（n=2，偏差根因为 FIX-5） |
+| `docs/scripts/verify-assistant-tools.py` | 助手只读工具真库取数 + 端到端 + **不写护栏** | 16/16 |
+
+### 7.1 会写数据的脚本：必须有的两道护栏（新增纪律，2026-10-01）
+
+`verify-1-3-build-task.py`、`verify-1-13-m2-acceptance.py --confirm-write`、
+`restock-workbench-browser-check.cjs` 这类脚本**会真的建单**。就此定两条硬规矩（来自三次真实事故）：
+
+1. **写入护栏**：跑前/跑后对比“活跃补货工单数”，**新增数必须精确等于成功建单数**，否则判 FAIL 并列出差额；
+2. **护栏的读数必须跨事务**：脚本的 `AsyncSession` 若从很早就开着事务，InnoDB REPEATABLE READ 会让它
+   **读不到服务端另一条连接刚写的值**——实测出现过“新增 0 == 成功 0”静默通过、而库里真多了一张工单。
+   修法：跨连接读数前先结束当前读事务（`await session.commit()`）或另开 session（见脚本里的 `refresh()`）。
+
+> **可读出写前快照的护栏，比没有护栏更危险**——因为团队会相信它。
+
+### 7.2 何时不要跑这些脚本
+
+- `verify-3-9-drills.py --phase python-down` 要求 **Python 已停**；`--phase concurrent` 要求它**在跑**；
+  两相都自带前置自检，不满足会拒跑（这是 FIX-16 误写事故留下的护栏）；
+- 数据库维护窗口、生产环境、以及任何“只想看看”的场合：**不要**加 `--confirm-write`。
 
 > ⚠️ 这些脚本会**读写真实环境**（部分会写业务数据，如 `verify-1-3-build-task.py` 真建单）。
 > 人工显式执行、执行后按脚本提示清理；**不要塞进 CI**（AGENTS §8）。
