@@ -82,9 +82,15 @@ def _isolate_env() -> Iterator[None]:
     本轮（1-7b）实测过这个漏子：未注入假写入器的失败用例仍然向 `agent_decision_log`
     写入了 2 行真数据。要验留痕的用例请显式注入假写入器
     （见 `tests/test_api_restock.py` 的 `FakeAuditWriter`）。
+    为什么额外强制 sqlite 后端：本机 `.env` 在验证 PG 后端期间会把
+    `DKD_AGENT_CHECKPOINT_BACKEND` 置为 `postgres`，而 pydantic-settings 中
+    **已存在的环境变量优先于 `.env`**；不在这里钉死，`uv run pytest` 就会去连真 PG，
+    直接违反 AGENTS §8「测试不得连外部依赖」（也会让单测随本机服务状态时好时坏）。
+    要验 PG 路径请走 `docs/scripts/verify-checkpoint-pg.py`（显式构造 Settings）。
     """
     saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("DKD_")}
     os.environ["DKD_AGENT_AUDIT_ENABLED"] = "0"
+    os.environ["DKD_AGENT_CHECKPOINT_BACKEND"] = "sqlite"
     yield
     for k in [k for k in os.environ if k.startswith("DKD_") and k not in saved]:
         os.environ.pop(k, None)

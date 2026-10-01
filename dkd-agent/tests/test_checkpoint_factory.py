@@ -214,6 +214,133 @@ def test_postgres_location_never_leaks_password():
     assert "127.0.0.1" in store.location  # 仍能定位到目标实例，便于排障
 
 
+# --- 7. Windows 事件循环策略（PG 异步的硬前置，2026-10-01 实测） --------------------
+
+
+class _RecordingPolicy:
+    """假策略类：只记录“被实例化过”，不碰真实事件循环。"""
+
+    instances = 0
+
+    def __init__(self) -> None:
+        type(self).instances += 1
+
+
+def _patch_loop_policy(monkeypatch, platform: str) -> list:
+    """把平台改成指定值，并拦下真实的策略设置（不动测试进程的事件循环）。"""
+    import asyncio
+
+    from app import checkpoint
+
+    applied: list = []
+    _RecordingPolicy.instances = 0
+    monkeypatch.setattr(checkpoint.sys, "platform", platform)
+    monkeypatch.setattr(asyncio, "WindowsSelectorEventLoopPolicy", _RecordingPolicy, raising=False)
+    monkeypatch.setattr(asyncio, "set_event_loop_policy", lambda p: applied.append(p))
+    return applied
+
+
+def test_windows_event_loop_policy_applied_for_postgres(monkeypatch):
+    """Windows + postgres 必须切 SelectorEventLoop。
+
+    不切的实际后果：服务能启动，但第一次真正连库时抛 psycopg.InterfaceError
+    『cannot use the ProactorEventLoop』——报错指向 psycopg 内部，很难联想到事件循环策略。
+    """
+    from app.checkpoint import ensure_windows_event_loop_policy
+
+    applied = _patch_loop_policy(monkeypatch, "win32")
+    settings = _settings(DKD_AGENT_CHECKPOINT_BACKEND="postgres", DKD_AGENT_PG_DSN=PG_DSN)
+
+    assert ensure_windows_event_loop_policy(settings) is True
+    assert len(applied) == 1 and isinstance(applied[0], _RecordingPolicy)
+
+
+def test_windows_event_loop_policy_skipped_for_sqlite(monkeypatch):
+    """sqlite 后端不得被 Windows 特有约束牵连（无谓地改全局策略是有代价的）。"""
+    from app.checkpoint import ensure_windows_event_loop_policy
+
+    applied = _patch_loop_policy(monkeypatch, "win32")
+    assert ensure_windows_event_loop_policy(_settings()) is False
+    assert applied == []
+
+
+def test_windows_event_loop_policy_skipped_on_linux(monkeypatch):
+    """Linux 部署不受影响。"""
+    from app.checkpoint import ensure_windows_event_loop_policy
+
+    applied = _patch_loop_policy(monkeypatch, "linux")
+    settings = _settings(DKD_AGENT_CHECKPOINT_BACKEND="postgres", DKD_AGENT_PG_DSN=PG_DSN)
+    assert ensure_windows_event_loop_policy(settings) is False
+    assert applied == []
+
+
+# --- 8. 事件循环兼容性守卫（uvicorn 0.36+ 的 loop_factory 机制变更） ------------------
+
+
+class _FakeLoop:
+    """用类名伪造事件循环（真实循环很难在单测里换掉）。"""
+
+
+class SelectorEventLoop(_FakeLoop):  # noqa: N801 —— 类名要与 asyncio 真类一致，守卫按类名判断
+    pass
+
+
+class ProactorEventLoop(_FakeLoop):  # noqa: N801
+    pass
+
+
+def test_loop_compat_accepts_selector():
+    from app.checkpoint import loop_supports_async_pg
+
+    assert loop_supports_async_pg(SelectorEventLoop()) is True
+
+
+def test_loop_compat_rejects_proactor_on_windows(monkeypatch):
+    """Windows + Proactor 是不兼容组合，必须能被守卫识别出来。"""
+    from app import checkpoint
+    from app.checkpoint import loop_supports_async_pg
+
+    monkeypatch.setattr(checkpoint.sys, "platform", "win32")
+    assert loop_supports_async_pg(ProactorEventLoop()) is False
+
+
+def test_loop_compat_is_platform_gated(monkeypatch):
+    """非 Windows 不受这个 Windows 特有约束影响（避免守卫在 Linux 上误杀）。"""
+    from app import checkpoint
+    from app.checkpoint import loop_supports_async_pg
+
+    monkeypatch.setattr(checkpoint.sys, "platform", "linux")
+    assert loop_supports_async_pg(ProactorEventLoop()) is True
+
+
+async def test_postgres_open_on_proactor_loop_gives_actionable_error(monkeypatch):
+    """事件循环不兼容时，报错必须是**可执行的启动指引**，而不是 psycopg 的内部异常。
+
+    为什么较真：实测把 `uvicorn app.main:app`（不带 `--loop none`）拿去跑 PG 后端时，
+    报错是 `psycopg.InterfaceError: cannot use the 'ProactorEventLoop'`——
+    运维看到的是“库连不上”，而真正原因是 uvicorn 0.36+ 改用 loop_factory 后
+    不再读全局事件循环策略。一个错误消息把排查方向带偏，代价比失败本身大。
+    """
+    import asyncio
+
+    from app import checkpoint
+
+    monkeypatch.setattr(checkpoint.sys, "platform", "win32")
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: ProactorEventLoop())
+
+    store = PostgresCheckpointStore(PG_DSN)
+    with pytest.raises(RuntimeError) as exc:
+        await store.open()
+
+    message = str(exc.value)
+    assert "ProactorEventLoop" in message
+    assert "--loop none" in message  # 可直接照抄的修法之一
+    assert "python -m app" in message  # 推荐入口
+    assert "uvicorn 0.36+" in message  # 说明“为什么”，否则下次还会踩
+    # 负向：不得因为要报错而先把连接串打出来
+    assert "s3cr3t-pass" not in message
+
+
 def test_health_reports_actual_backend_and_no_credentials(client):
     """`/health` 必须报**实际装配**的后端，且不得出现口令。
 

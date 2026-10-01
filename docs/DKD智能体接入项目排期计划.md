@@ -226,7 +226,7 @@
 | 0-7 | Java 回调（`AgentCallbackController`） | ✅ | `/agent/callback/task` 服务间密钥 + 白名单 + 限流；实机 4 项拒绝路径：无密钥 401 / 伪造 401 / 未配置密钥 503 / 非白名单 404；正确密钥 → 鉴权放行并由 `insertTaskDto` 校验链拒绝（“售货机不存在”**原样回传**，未写库） |
 | 0-8 | G1 中间验收（SSE 端到端透传） | ✅ 服务端链路全过（前端视觉待手测） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**（登录→状态→SSE 逐帧+requestId 回带→回调 3 类拒绝→未认证信封→停机降级）；一键降级 `--agent.enabled=false` 另测 4 项全符 |
 | 0-9 | Python 服务骨架（/health + SSE + 鉴权 + request_id） | ✅ | ruff / pytest 全绿；SSE 实测 meta→delta→done 逐帧输出、身份头透传、客户端断开即停 |
-| 0-10 | checkpointer 落地（SQLite 默认 + **PG 可切换**） | ✅ 代码就绪 | 跨请求恢复（history_len 2→4）、进程重启后仍可读回、`Last-Event-ID` 断点续传（只补发未收帧）均已验证。**V2.9 新增 PG 后端**：`app/checkpoint.py` 工厂（`SqliteCheckpointStore`/`PostgresCheckpointStore`）+ 配置校验（fail-fast）+ `/health` 报**实际装配**后端与 `checkpoint_open`；契约测试 **16 项**（`tests/test_checkpoint_factory.py`，零外部依赖）。⚠️ **真 PG 路径未验证**（`checkpoint.py` 覆盖率 88%，未覆盖段即 PG `open()` 主体）——需 D5 闭环后跑 `verify-checkpoint-pg.py` |
+| 0-10 | checkpointer 落地（SQLite 默认 + **PG 实测可用**） | ✅ **真库已验收** | 跨请求恢复（history_len 2→4）、进程重启后仍可读回、`Last-Event-ID` 断点续传（只补发未收帧）均已验证。**PG 后端 2026-10-01 真库验收**：`verify-checkpoint-pg.py` **18/18 PASS** + 跨进程（两个独立进程）写读续接 **3/3 PASS** + DML 探针（证伪方案 2）；服务级：`python -m app` → `/health` `checkpoint_backend=postgres`/`checkpoint_open=true`（已脱敏），真实 SSE 会话落 PG（thread_id=`pg-verify-conv`，验收后已清理）。契约测试 **20 项**（`tests/test_checkpoint_factory.py`，零外部依赖）。新发现并已修 FIX-20（uvicorn 0.36+ 事件循环） |
 | 0-11 | 前端 SSE 客户端 + 侧边栏壳 | ✅ | `sseFrames.js`（纯分帧）/`sse.js`（fetch+ReadableStream+AbortController+空闲超时）/`api/manage/agent.js`/`store/modules/agent.js`/`components/AgentAssistant/index.vue` + Navbar 入口 + layout 挂载；`npm run build:prod` exit 0；**用真实抓包字节流跑 18 项分帧断言全过**（含 303 个二分切点/逐字符/随机分片/CRLF/半帧） |
 | 0-12 | request_id + 留痕 + 成本计量与限额 | ✅ | 留痕/消息投影实写 MySQL（手机号实测脱敏为 `138****5678`，明文 0 行）；限额熔断 429；`/agents/usage/summary` 鉴权 401/200 正确；**审计库故障降级不中断对话**（3 项降级测试覆盖） |
 | 0-13 | LangGraph 版本锁定 + state schema 评审 | ✅ 评审稿就绪（待开会确认） | 交付 `docs/dkd-agent-restock-state-schema.md`（冻结表 + 中断契约 + 兼容规则 + 10 项检查清单）；代码侧 `restock_state.py` 冻结 + 15 项契约测试；**评审中发现 `expect_capacity` 语义陷阱**（见该稿 §4.2） |
@@ -239,10 +239,11 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | **59 files already formatted** |
-| `uv run pytest` | **292 passed**（10 个 live 用例默认 deselect；本轮 **+16**：checkpointer 工厂/配置/脱敏契约测试），覆盖率 **94.89%**（要求 ≥70%）。覆盖率较上轮 95.11% 略降，原因**如实说明**：新增了未被真库覆盖的 PG `open()` 分支（`app/checkpoint.py` 88%）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
+| `uv run pytest` | **299 passed**（10 个 live 用例默认 deselect；累计本轮 **+20**：checkpointer 工厂/配置/脱敏/事件循环守卫契约测试），覆盖率 **94.88%**（要求 ≥70%）。覆盖率较上轮 95.11% 略降，原因**如实说明**：新增了未被真库覆盖的 PG `open()` 主体分支（`app/checkpoint.py` 已由 88% 升至 **90%**；PG 真库路径改由 `docs/scripts/verify-checkpoint-pg.py` 覆盖）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
 | `mvn -pl dkd-admin -am test` | **Tests run: 60, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient **10** / TaskCreate 6 / **AgentTask 10**）；纯单测，不依赖 MySQL/Redis/Spring 上下文。**本轮 Java 侧未改动**，作为回归基线 |
 | `uv run ruff check` / `ruff format --check` | All checks passed；**60 files** already formatted（本轮新增 1 个测试文件） |
 | `npm run build:prod`（**本轮新增前端交付**） | exit 0（仅既有 chunk 体积告警）；新增 `views/manage/restock/**` 已按路由分包（`RestockAdjustDialog` / `RestockReasonDialog` 各自成 chunk） |
+| 端到端（**2026-10-01 新增**） | `docs/scripts/verify-checkpoint-pg.py` **--phase all 18/18 PASS**（含 5 项越权拒绝路径）；**跨进程** write/read 两独立进程 **3/3 PASS**；服务级 `python -m app` → `/health` `checkpoint_backend=postgres`/`checkpoint_open=true`；真实 SSE 会话落 PG 后已清理 |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142）；**1-9 新增任务注册 `docs/ddl/agent_restock_job.sql`** 已在本机 dkd 库执行（校验查询 1 行：cron `0 0 6 * * ?` / misfire=2 / concurrent=1 / status=0），幂等重跑退出码 0 |
 | 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**31/31 PASS**，其中 [H] 段为 1-7b 的留痕断言）；**`docs/scripts/verify-1-9-analyze.py`（本轮新增，真 MySQL + 真实 FastAPI，20/20 PASS：鉴权 3 项 / 暂停开关 3 项 / 正常触发 3 项 / 重入安全 2 项 / 留痕 9 项）**；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
@@ -390,10 +391,11 @@
    ② `ReportMapper.xml:122-130` 丢了参数绑定。两者都在 Java 业务代码里，Agent 侧不越界改（AGENTS §9.3）；
 8. **真实 LLM 校准链路需要一次 live 验证（FIX-11）**：单测全打桩、本机验收全程 `CALIBRATION_ENABLED=0`；
    上线前需一次真实 DeepSeek 调用验证「系数夹取 + 理由生成 + token 计量」（需要 key 与少量费用预算）；
-9. **PostgreSQL 选型评审（新增，2026-09-23）**：评审稿 `docs/dkd-agent-postgres-selection-review.md`（V0.1 待评审），
-   需拍板 **D1~D5**；其中 **D5 是硬前置**：① 本机 PG 17 的账号（或授权新建专用角色/库）；
-   ② 生产是否允许新增 DB 引擎、是否已有 PG 实例。**D5 未闭环前不得进入编码**（否则只能写出本机能跑的实现）；
-   决策结论会同时决定 FIX-14 的关闭方式（换 PG saver 或升级 Redis 8.0+）。
+9. **PostgreSQL 选型评审（2026-09-23 发起 → 2026-10-01 本机已闭环 + 真库验收）**：评审稿 `docs/dkd-agent-postgres-selection-review.md` **V1.1 已定稿**；
+   D1~D4 已拍板采用方案 A；**D5 本机半场已闭环**（角色/库已建，`verify-checkpoint-pg.py` 18/18 + 跨进程 3/3），
+   **只剩生产半场待拍板**：是否允许新增 DB 引擎（以及生产是否已有 PG 实例）。
+   本机已实际切到 `postgres` 后端并跑通；回滚=改一个环境变量（不做双向同步）。
+   FIX-14 的关闭方式已确定为「PG saver」（而非升级 Redis）。
 
 ### 2026-09-23 补记（V2.7 · Docker 部署栈提前交付）
 
@@ -423,7 +425,7 @@
 
 > 只在「有证据 + 有归属任务 + 有验收方式」时才登记；关闭时必须写清证据（AGENTS §9.3 不隐瞒）。
 > 图例：🔴 阻塞/红线相关 · 🟡 影响验收或体验 · 🔵 技术债/观测性。归属列写的是**落地任务号**。
-> 更新于 2026-09-28（Phase 1 执行至 1-9 + FIX-10/FIX-19 关闭后回写）。共 **19 条**：已关闭 5 条（FIX-2/8/9/10/19），待修 14 条。
+> 更新于 2026-10-01（Phase 1 执行至 1-11 + PG 本机真库验收闭环后回写）。共 **20 条**：已关闭 6 条（FIX-2/8/9/10/19/20），待修 14 条。
 
 | # | 等级 | 问题 | 证据（file:line / 实测） | 影响 | 归属 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -440,12 +442,13 @@
 | FIX-11 | 🟡 | **1-5 的真 LLM 校准链路未做 live 端到端**：本机全部验收都在 `DKD_AGENT_RESTOCK_CALIBRATION_ENABLED=0` 下跑 | 1-6/1-7 验收脚本均显式关闭校准；单测全打桩（AGENTS §8 要求） | “系数夹取/理由生成”在真实模型上尚未验证（可能遇到 JSON 漂移、超时、成本） | 建议随 1-9 或 M2 前安排一次 live 冒烟（需 key 与费用） | 待验证 |
 | FIX-12 | 🟡 | **前端视觉/交互未做真浏览器验证**（补货工作台 1-10/1-11 尚未开始，0-11 侧边栏为构建+分帧断言交付） | 排期 §七 Phase 0 之 6（0-11 手测清单 10 项中 4 项已自动化）；1-10/1-11 为待办 | 原型对齐是 M2 验收项，纯构建通过不足以证明 | **1-10/1-11** | 待做 |
 | FIX-13 | 🔵 | `X-Agent-Region` 常缺省：`sys_user` 无区域映射，网关只能给空 | 0-15 记录；`AgentRegionResolver` 已 fail-soft 不注入 | 仅影响审计上下文，“按设备区域选人”不受影响（取 `vm.region_id`） | 3-7 或后续（若审计需要按区域统计） | 待评估 |
-| FIX-14 | 🔵 | **Redis 3.2.100 技术债**：无模块系统、内核 < 5.0（无 Streams）、`appendonly no`、与 Java 共用 db0 | 方案 V1.1 §5.1 实测；本期默认仍用 SQLite saver 绕开 | 多实例部署或需跨机共享会话时必须升级 | 独立技术债；**V1.0 评审已定稿**：`docs/dkd-agent-postgres-selection-review.md`（D1~D4 拍板方案 A，**D5 待运维闭环**）；代码侧已落地 PG 后端开关（`app/checkpoint.py`） | 🟡 **降级为「待 D5 闭环 + 真库验收」**（触发条件已有实现，不再是纯登记） |
+| FIX-14 | 🔵 | **Redis 3.2.100 技术债**：无模块系统、内核 < 5.0（无 Streams）、`appendonly no`、与 Java 共用 db0 | 方案 V1.1 §5.1 实测；本期默认仍用 SQLite saver 绕开 | 多实例部署或需跨机共享会话时必须升级 | 独立技术债；评审稿 **V1.1**：`docs/dkd-agent-postgres-selection-review.md`（D1~D4 方案 A，**D5 本机已闭环、生产待拍板**）；PG 后端已落地并**真库验收通过**（`app/checkpoint.py` 工厂 + `app/__main__.py` 入口） | ✅ **触发条件已有实现且已验证**（本机可随时切 PG；剩生产半场） |
 | FIX-15 | 🔵 | **回调失败后的“重试建单”只有隐式路径**：建单失败时计划状态不变，运营需**再次点「确认」**重试（服务层已如此实现，但未在接口文档/前端提示中写明） | `restock_service._execute`（失败不落库、状态不变）+ `restock_graph.create_tasks` 同类取舍 | 运营可能以为“点了没反应”；接口文档缺一句说明 | 1-10 前端提示 + 4-1 接口文档 | 待补文档 |
 | FIX-16 | 🔵 | **`@RateLimiter` 的 Redis 依赖 fail-closed 未演练**：Redis 不可用时回调用例会全拒 | 0-15 记录（“属预期行为，未做演练”） | 上线后 Redis 抖动可能表现为“Agent 建单全失败” | 3-9 压测与故障演练 | 待演练 |
 | FIX-17 | 🟡 | **M1 遗留：真 LLM 全链的 `agent.enabled=false` 一键降级已验，但“Python 侧 LLM 密钥缺失→降级到规则增强版”的自动降级未验**（目前是校准开关手动关闭） | `restock_calibration.calibrate_plan` 捕获异常降级（单测覆盖）；真实密钥失效场景未演练 | 密钥过期时行为可预期（降级）但未实测 | 3-9 故障演练 | 待演练 |
 | FIX-18 | 🔵 | **代码交付通道依赖本机代理节点**：`github.com` 经代理偶发不可达（`CONNECT` 隧道返回 200 但 TLS 握手无响应），导致 `git push` 报 `TLS connect error: error:00000000:lib(0)::reason(0)` | 本轮实测：`curl -x http://127.0.0.1:7897 https://api.github.com` → **200**（代理本身可用），而 `https://github.com/` → **000**；重试 3 次 + 强制 `http.version=HTTP/1.1` 均失败；直连 000；`127.0.0.1:1080` 无服务；`ssh -T git@github.com` 可达但本机无 SSH 私钥 | 交付被阻塞（本轮靠切换节点恢复）；上线期的回滚/热修可能同样被卡 | 环境/运维（非代码）；建议登记备用通道（SSH key 或第二代理节点） | 待环境侧处理 |
 | FIX-19 | 🔴 | **Java→Python 带请求体的请求收到 401 会被误报为“服务不可达”**：JDK 的 `HttpURLConnection` 在流式（带请求体）请求上收到 401/407 时抛 `HttpRetryException`（`cannot retry due to server authentication, in streaming mode`——它想带凭据重放请求，但无法重发已写出的 body），Spring 再包成 `ResourceAccessException` | 1-9 开发中实测：`forward(POST + body)` 对 401 返回 `status=0`（传输层失败）而非 401；根因定位见 `AgentUpstreamClient.execute`（已在代码注释里写明） | 鉴权拒绝被当成故障：网关把 401 降级为“智能体不可用”；定时任务把“密钥不一致”报成“服务宕机”并**白重试 3 次**，运维朝错误方向排查（FIX-7 轮换期间最容易踩） | Java 侧（1-9 一并修） | **✅ 本轮已修**：识别 `HttpRetryException` 并按状态码合成“仅状态码”响应交回原 extractor（两条通道既有分支不乱）；回归用例 **+2**（`forward` 401 透传、`relayStream` 401 抛带状态码异常）。**代价已写明**：该类响应体确实被 JDK 丢弃，故 401 的 `msg` 拿不到（比“报成不可达”好得多） |
+| FIX-20 | 🔴 | **Windows + PG 后端：uvicorn 0.36+ 不再读事件循环策略，直接用 `uvicorn app.main:app` 会启动失败**——它改用 `loop_factory` 直接指定循环（实测 0.53：`uvicorn.loops.asyncio.asyncio_loop_factory` 在 win32 返回 `ProactorEventLoop`），而 psycopg 异步不支持 Proactor | 2026-10-01 实测：`uvicorn app.main:app` → `psycopg.InterfaceError: cannot use the 'ProactorEventLoop'`；改用 `--loop none` 或 `python -m app` 正常（`/health` 报 `checkpoint_backend=postgres`、`checkpoint_open=true`）。**光设全局策略无用**（已在 `app/main.py` 模块级设了，仍失败，因为 uvicorn 绕过了策略） | 运维/开发会照旧习惯直接 `uvicorn app.main:app` 启动 → PG 后端完全打不开；且报错指向 psycopg 内部，与真因（uvicorn 机制变更）相距很远，排查代价高 | Python 侧（0-10 真库验收一并修） | **✅ 本轮已修**：新增 `app/__main__.py` 启动入口（`loop="none"` + 先定策略）；`PostgresCheckpointStore.open()` 加启动守卫，把该错误转为**含具体命令的可执行提示**（而非 psycopg 内部异常）；回归用例 **+4**（selector 接受 / win32+proactor 拒绝 / 非 Windows 平台门控 / 守卫报错文案）；AGENTS §1 约束 5 与 README 同步 |
 
 ---
 
@@ -505,7 +508,9 @@ B线  [波2 PG底座] ──► [波4 知识库地基] ──► [波5 诊断Age
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` **V1.2**）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0（已定稿）**。*
 
-*版本：**V2.9（2026-09-28，1-10/1-11 前端交付 + PG checkpointer 落地）**。本次变更：① §七 Phase 1 表 1-10/1-11 转 🟡（前端已交付、待真浏览器验证），Phase 0 的 0-10 行补 PG 可切换与未验证边界；② §七 质量门禁更新为实测值（pytest **292 passed / 94.89%**、ruff 60 文件、`npm run build:prod` exit 0、`mvn -pl dkd-admin -am test` **60 passed / BUILD SUCCESS**（Java 本轮未改动，作回归基线））；③ §八 FIX-14 降级为「待 D5 闭环 + 真库验收」；④ **新增 §九「按能力批次的重排版本」**（六波次 + 依赖图 + 裁剪清单）；⑤ 新增 2026-09-28 开发进度补记（V2.9）。**方案同步改版为 V1.2**（§5.1 会话持久化行、§5 目录结构、§十 `checkpoint.py` 职责），评审稿置为 V1.0 定稿——三者互相引用版本号（AGENTS §4.3）。*
+*版本：**V2.10（2026-10-01，PG 本机真库验收闭环 + FIX-20）**。本次变更：① §七 0-10 行转 ✅**真库已验收**（证据：`verify-checkpoint-pg.py` 18/18 + 跨进程 3/3 + DML 探针 + 服务级 `/health` + 真实 SSE 会话落 PG）；② §八 FIX-14 转「触发条件已有实现且已验证」、**新增 FIX-20（uvicorn 0.36+ 事件循环，已修）**；③ 「阻塞与待办需求」第 9 项更新为「本机已闭环、生产待拍板」；④ 新增 2026-10-01 开发进度补记。**方案 V1.2 口径未变**（PG 双后端选型不变）；评审稿升为 **V1.1**（§8-4 假设关闭：方案 2 经实测证伪）；AGENTS §1 约束 5 新增「Windows + PG 事件循环」实测边界（第四次回写）。*
+
+*上一版 **V2.9（2026-09-28，1-10/1-11 前端交付 + PG checkpointer 落地）**。本次变更：① §七 Phase 1 表 1-10/1-11 转 🟡（前端已交付、待真浏览器验证），Phase 0 的 0-10 行补 PG 可切换与未验证边界；② §七 质量门禁更新为实测值（pytest **292 passed / 94.89%**、ruff 60 文件、`npm run build:prod` exit 0、`mvn -pl dkd-admin -am test` **60 passed / BUILD SUCCESS**（Java 本轮未改动，作回归基线））；③ §八 FIX-14 降级为「待 D5 闭环 + 真库验收」；④ **新增 §九「按能力批次的重排版本」**（六波次 + 依赖图 + 裁剪清单）；⑤ 新增 2026-09-28 开发进度补记（V2.9）。**方案同步改版为 V1.2**（§5.1 会话持久化行、§5 目录结构、§十 `checkpoint.py` 职责），评审稿置为 V1.0 定稿——三者互相引用版本号（AGENTS §4.3）。*
 
 *上一版 **V2.8（2026-09-28，任务 1-9 定时分析闭环 + FIX-19/FIX-10 关闭）**。本次变更：① §七 Phase 1 表 1-9 行转 ✅（交付物 + 21 项新测试 + 20/20 真库端到端）；② §七 质量门禁更新为实测值（pytest 276 passed/95.11%、mvn 60 passed、ruff format 59 文件、verify-1-9 20/20）；③ §八 FIX-10 关闭、新增 FIX-19（JDK 流式请求 401 被误报为不可达，已修，含代价说明），计数改为「已关闭 5 / 待修 14」；④ 新增 2026-09-28 补记（交付内容 / 验证 / 未验证项 / 下一步）；⑤ 「交付与分支状态」新增本地分支行（**未推送/未合并**）。**方案口径未变（仍 V1.1）**：1-9 是排期 V2 已列任务，未改变任何既定约定；新增的“定时任务四条约定”（开关关闭/被暂停不算失败、4xx 不重试而 5xx 重试、最终失败必须抛异常交给 `sys_job_log`）已回写 AGENTS §6.4。*
 
@@ -575,3 +580,34 @@ B线  [波2 PG底座] ──► [波4 知识库地基] ──► [波5 诊断Age
   ④ **批量确认的部分失败场景未真机演练**：逐条汇总逻辑已写，但未在"真 Java 回调中途失败"下跑过（需 M2 真机环境）；
   ⑤ **PG 权限方案 2（无 CREATE 权限）未验证**：授权脚本方案 1 给角色独立库 owner（`setup()` 开箱可用），方案 2 的 `setup()` 行为**未经真库验证**，选它前必须先验。
 - **下一步（按风险排序）**：① 执行菜单 SQL + 真浏览器跑一遍波1 手测清单（FIX-12）；② 催 **D5**（PG 账号/生产放行）与 **FIX-6**（生产/测试库数据导出）；③ FIX-5 业务拍板容量权威源 + FIX-3 那行 Java SQL；④ 以上到位后进入波3（1-12 对账 → 1-13 M2 验收）。
+
+### 2026-10-01 开发进度补记（V2.10 · PG 本机真库验收闭环 + FIX-20）
+
+- **本次做了什么**：把「PG 后端代码就绪」推进到「**本机真库实测通过**」，并在过程中发现并修掉一个**上线阻塞级**的环境陷阱。
+- **交付/执行内容**：
+  ① **建角色与独立库**（本机无 psql，新增可执行等价脚本 `docs/scripts/setup-agent-pg.py`）：
+     角色 `dkd_agent_pg`（NOSUPERUSER/NOCREATEDB/NOCREATEROLE/CONNECTION LIMIT 20，口令随机生成且只落 `.env`，**不复用超级用户口令**）+ 库 `dkd_agent_state`（owner=该角色）+ 收紧 public schema 与 database PUBLIC 权限；重复执行幂等。
+  ② **真库验收脚本** `docs/scripts/verify-checkpoint-pg.py`（新增）：`--phase all` 涵配置/工厂/脱敏/生命周期/5 项拒绝路径；`--phase write|read` 跑**两个独立进程**验跨进程恢复；`--phase e` 为 §8-4 的权限探针；`--phase cleanup` 清理验收数据。
+  ③ **启动入口** `app/__main__.py`（新增）+ `PostgresCheckpointStore.open()` 启动守卫 + `loop_supports_async_pg()`（见 FIX-20）。
+  ④ **测试加固**：`tests/conftest.py` 强制把 `DKD_AGENT_CHECKPOINT_BACKEND` 钉为 `sqlite`——因为本机 `.env` 已切 postgres，而 pydantic-settings 中已存在的环境变量优先于 `.env`，不钉死则 `pytest` 会去连真 PG，直接违反 AGENTS §8。
+  ⑤ **本机 `.env`**：新增 `DKD_AGENT_CHECKPOINT_BACKEND=postgres` + `DKD_AGENT_PG_DSN`（含注释与回滚说明；`.env` 已 gitignore）。
+- **验收结果（全部实跑）**：
+  · `verify-checkpoint-pg.py --phase all` → **PASS=18 FAIL=0**（含越权建库/建角色/改系统参数/装非 trusted 扩展/在别的库建表全部 `InsufficientPrivilege`）；
+  · 跨进程：进程 A 写入 2 条 → **全新进程 B** 读回 2 条（内容一致）并继续追加到 4 条 → **3/3 PASS**（这是 0-10 依赖的核心验收点）；
+  · 服务级：`uv run python -m app` → `/health` 报 `checkpoint_backend=postgres` / `checkpoint_location` 已脱敏 / `checkpoint_open=true`；真实 SSE 对话成功且会话落 PG（`thread_id=pg-verify-conv`，checkpoints 3 行 / blobs 3 行，**验收后已清理**）；
+  · 门禁：`ruff check` 全过 / `ruff format` 61 文件 / `pytest` **299 passed**（本轮 +4）、覆盖率 **94.88%**（`app/checkpoint.py` 由 88% 升至 **90%**）。
+- **本轮两个真实发现（都不是推测，是实测撞出来的）**：
+  1. **FIX-20（🔴 上线阻塞级）**：**光设事件循环策略不够**。uvicorn **0.36+** 改用 `loop_factory` **直接指定**事件循环，**不再读 asyncio 全局策略**；它在 Windows 上的默认工厂就是 `ProactorEventLoop`，而 psycopg 异步不支持 Proactor。
+     实测现象：`uvicorn app.main:app` → `psycopg.InterfaceError: cannot use the 'ProactorEventLoop'`，而报错直指 psycopg 内部，与真因（uvicorn 机制变更）相距很远；改用 `--loop none` 或 `python -m app` 后一切正常。
+     修法：新增启动入口 + 启动守卫（把错误转成**含具体命令**的提示）+ 4 项回归用例；已回写 AGENTS §1 约束 5 与 README。
+     顺带验证了一个方法论上的坑：同一个错误在验收脚本里也复现了一次（把策略切换写在 `phase_a` 里，`[A]` 全 PASS 但 `[B]` 第一行就炸）——这类“顺序敏感”的前提必须写在**建循环之前**，不能写在业务流程里。
+  2. **§8-4 假设关闭 + 一条必须记录的边界**：
+     · **方案 2（DBA 预建表 + 只授 DML）经实测证伪**：探针角色（`has_schema_privilege(CREATE)=false`）跑 `setup()` 直接 `InsufficientPrivilege: 对模式 public 权限不够`——`setup()` 不只在建表时需要权限，它还要跑 `CREATE INDEX IF NOT EXISTS` 与 migration 记录写入。**因此授权只能走方案 1**（角色拥有独立库）。
+     · **已接受边界**：库 owner **可以安装 trusted 扩展**（实测 `CREATE EXTENSION pg_trgm` 成功，属 PostgreSQL 13+ 的 trusted extension 机制 + owner 形态的固有含义）。影响面仅限自有库（装不了 `postgres_fdw`，也碰不到业务数据），故本期明确接受并**写进授权脚本**（不靠人记得）。该扩展在探针后已 DROP。
+- **未验证（不隐瞒）**：
+  ① **生产半场的 D5 未闭环**：是否允许新增 DB 引擎待运维/负责人拍板（本机已闭环）；Docker 部署栈也需同步注入 `DKD_AGENT_PG_DSN`，且容器内的 PG 主机名与 `agent` 账号 host 模式需一并确认（参考 V2.7 记录的容器化障碍）；
+  ② **`--reload` 下 PG 后端不可用**：uvicorn `--reload` 会强制 Proactor，此时不能用 PG（已写入 `ensure_windows_event_loop_policy` docstring 与 README）；
+  ③ **真 LLM 的 06:00 全链仍未跑**（FIX-11 照旧）；
+  ④ **macOS/Linux 未实测**：事件循环分支与 PG 后端在非 Windows 环境下按设计为 no-op/默认机制，但**未在本机以外验证**；
+  ⑤ 本机 `.env` 已切 postgres：若 PostgreSQL 服务停掉，本地服务将无法启动（回滚=改 `DKD_AGENT_CHECKPOINT_BACKEND=sqlite` 一行，SQLite 文件一直保留）。
+

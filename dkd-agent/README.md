@@ -58,6 +58,20 @@ uv add <包>             # 需要写入 pyproject 时用这个（会更新 uv.lo
 
 ## 运行
 
+```bash
+# 推荐入口（Windows + postgres 后端**必须**用它，理由见下）
+uv run python -m app
+
+# 直接用 uvicorn 时必须加 --loop none
+uv run uvicorn app.main:app --loop none
+```
+
+> ⚠️ **别用 `uvicorn app.main:app`（不带 `--loop none`）跑 postgres 后端**：
+> uvicorn **0.36+** 用 `loop_factory` 直接指定事件循环，**不再读 asyncio 全局策略**，
+> 而它在 Windows 上的默认工厂是 `ProactorEventLoop`——psycopg 异步不支持，启动会失败，
+> 且报错指向 psycopg 内部。`python -m app` 内部用 `loop="none"` 回到“按策略建循环”，
+> 并在建循环前把策略设为 `SelectorEventLoop`（排期 FIX-20）。
+
 ```powershell
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8090
 # 健康检查
@@ -130,7 +144,14 @@ uv sync --extra postgres                 # 装 langgraph-checkpoint-postgres + p
 **排查入口**：`GET /health` 会报 `checkpoint_backend` / `checkpoint_location`（已脱敏）/ `checkpoint_open`。
 报的是**实际装配**的后端而不是配置值，且单独给出 `checkpoint_open` —— 避免“存储已在关闭后仍报绿灯”。
 
-⚠️ **D5 未闭环前不得把 `BACKEND` 置为 `postgres`**（本机 PG 账号 / 生产是否允许新增 DB 引擎待确认）。
+**本机已实际切到 postgres 并验收（2026-10-01）**：角色/库已建（`docs/scripts/setup-agent-pg.py`）、
+`verify-checkpoint-pg.py` **18/18** + 跨进程恢复 **3/3** + DML 探针。回滚一行：把
+`DKD_AGENT_CHECKPOINT_BACKEND` 改回 `sqlite`。
+
+⚠️ **生产启用仍需 D5 的另一半拍板**：是否允许新增 DB 引擎（本机已闭环）。
+
+⚠️ 另一条已接受的边界：库 owner 可以安装 **trusted 扩展**（实测 `pg_trgm` 成功）——
+见 `docs/ddl/create_agent_pg_role.sql` 第 5.3 节。
 
 ## 留痕与成本计量（任务 0-12）
 

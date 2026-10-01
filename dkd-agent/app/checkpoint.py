@@ -27,8 +27,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Protocol
@@ -63,6 +65,70 @@ def mask_dsn(dsn: str) -> str:
     if "password" in dsn.lower() or "@" in dsn:
         return "<pg-dsn:已省略，无法安全脱敏>"
     return dsn
+
+
+def loop_supports_async_pg(loop: object) -> bool:
+    """当前事件循环能不能跑 psycopg 异步。
+
+    Windows 的 `ProactorEventLoop` **不行**（psycopg 明确拒绝），`SelectorEventLoop` 可以。
+
+    为什么用类名判断而不是 `isinstance(loop, asyncio.ProactorEventLoop)`：
+    后者在非 Windows 上该属性不存在，得写 `getattr` 兼容；而类名判断在两种平台上都安全，
+    且能用一个普通假对象做单测（真实事件循环很难在单测里换掉）。
+    """
+    return not (sys.platform == "win32" and type(loop).__name__ == "ProactorEventLoop")
+
+
+PROACTOR_REMEDY = (
+    "Windows 上用 pg 后端必须让事件循环是 SelectorEventLoop，具体二选一：\n"
+    "  ① 推荐：用本仓入口启动  `uv run python -m app`\n"
+    "  ② 直接用 uvicorn 时必须加 `--loop none`（并确保策略已设）：\n"
+    "     `uv run uvicorn app.main:app --loop none`\n"
+    "原委：uvicorn 0.36+ 用 loop_factory **直接指定**事件循环，不再读 asyncio 全局策略；\n"
+    "它在 Windows 上的默认工厂就是 ProactorEventLoop，而 psycopg 异步不支持 Proactor。"
+)
+
+
+def ensure_windows_event_loop_policy(settings: Settings) -> bool:
+    """Windows + postgres 后端的前置条件：把事件循环策略换成 `SelectorEventLoop`。
+
+    ## 为什么必须有这个（2026-10-01 实测，不是推测）
+
+    psycopg 的异步模式**不能**跑在 Windows 默认的 `ProactorEventLoop` 上，实测报：
+
+        psycopg.InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run in
+        async mode. Please use a compatible event loop, for instance by setting
+        'asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())'
+
+    而 Python 3.8+ 在 Windows 上的默认策略就是 Proactor，uvicorn 也不会替我们改正
+    （`--reload` 时它甚至**显式**设成 Proactor）。不修这条，PG 后端的失败会发生在
+    「第一次真正连库」而不是启动时，且报错是 psycopg 的内部异常——很难联想到事件循环策略。
+
+    ## 为什么只在「Windows + 选了 postgres」时改
+
+    改全局事件循环策略有代价（`SelectorEventLoop` 不支持 asyncio 的子进程 API）。
+    默认 sqlite 部署与 Linux 部署都不该被这个 Windows 特有约束牵连，因此按条件精确生效。
+
+    ## 必须在**事件循环创建之前**调用
+
+    uvicorn 的 `Server.__init__` 会先 import 应用、再 `setup_event_loop()` / `asyncio.run()`，
+    所以 `app/main.py` 放在模块级是对的。
+    ⚠️ **已知例外**：`uvicorn --reload` 会强制 Proactor，此种启动方式下 PG 后端不可用
+    （需去掉 reload，或自行在 reloader 子进程里先设好策略）。
+
+    @return 是否真的切换了策略（供启动日志与测试断言）
+    """
+    if sys.platform != "win32" or settings.checkpoint_backend != BACKEND_POSTGRES:
+        return False
+    policy_cls = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy_cls is None:  # 非 Windows 构建 / 未来 Python 移除该 API
+        return False
+    asyncio.set_event_loop_policy(policy_cls())
+    logger.info(
+        "Windows + postgres 后端：事件循环策略已切换为 SelectorEventLoop"
+        "（psycopg 异步的硬约束，见 ensure_windows_event_loop_policy docstring）"
+    )
+    return True
 
 
 class CheckpointBackend(Protocol):
@@ -199,6 +265,13 @@ class PostgresCheckpointStore:
 
     async def open(self) -> Any:
         """建连接 + `setup()` 幂等建表。"""
+        # 先查事件循环兼容性：不查的话报错会从 psycopg 内部冒出（InterfaceError 提到
+        # ProactorEventLoop），运维看到的是“库连不上”，与真正的原因差得很远。
+        if not loop_supports_async_pg(asyncio.get_running_loop()):
+            raise RuntimeError(
+                "psycopg 异步不支持 Windows 的 ProactorEventLoop。" + PROACTOR_REMEDY
+            )
+
         try:
             from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
         except ImportError as exc:  # 依赖缺失：给出可执行的补救命令，而不是让它像“连不上库”

@@ -5,9 +5,12 @@
 -- 对位脚本：`docs/ddl/create_agent_db_user.sql`（MySQL 侧的两级授权）
 -- 执行环境：PostgreSQL 17（本机服务名 `postgresql-x64-17`，5432 已监听）
 --
--- ⚠️⚠️ 执行状态：**本脚本尚未在任何 PG 实例上执行过**（评审稿 D5 未闭环：本机 PG 账号
---      与「生产是否允许新增 DB 引擎」尚未确认）。执行后请在下文「执行记录」登记。
---      在 D5 闭环前，任何环境都**不得**把 `DKD_AGENT_CHECKPOINT_BACKEND` 置为 postgres。
+-- ⚠️⚠️ 执行状态：**已在本机 PG 17.11 执行（2026-10-01）**，带真实验收证据：
+--      `docs/scripts/verify-checkpoint-pg.py` → **18/18 PASS**（含 5 项拒绝路径）
+--      + 跨进程恢复 3/3 PASS + DML 探针 1/1（结论见下【实测更正】）。
+--      本机执行方式：**通过 `docs/scripts/setup-agent-pg.py`**（等价实现）——因为实测本机
+--      `psql` 不在 PATH；本文件仍是评审与回滚的**权威文本**，两者改授权策略时须同步。
+--      生产环境仍未执行：**D5 的另一半**（是否允许新增 DB 引擎）待运维/负责人拍板。
 --
 -- 幂等性：部分幂等——`CREATE ROLE` / `CREATE DATABASE` 重复执行会报错（这是有意的：
 --        静默跳过会让「授权没生效」查不出原因）。重跑前先执行文件末尾「回滚」段。
@@ -30,17 +33,20 @@
 -- **CREATE 权限**（建 `checkpoints` / `checkpoint_writes` / `checkpoint_blobs` 等表与索引）。
 -- 两条出路：
 --
---   方案 1（本脚本采用，推荐）：角色**自己拥有**一个独立 database（DDL 被限制在自己的库内）。
---        · 简单、`setup()` 开箱可用、蓝绿/备份体系可复用；
---        · 「隔离」体现在**库级边界**而不是「表级授权」——对这个库之外的一切无权限。
---   方案 2（更严，需 DBA 介入）：DBA 用超级用户跑一次 `setup()` 预建表，应用角色只给
+--   方案 1（本脚本采用，**实测唯一可行**）：角色**自己拥有**一个独立 database
+--        （DDL 被限制在自己的库内）。简单、`setup()` 开箱可用、备份体系可复用；
+--        「隔离」体现在**库级边界**而不是「表级授权」——对这个库之外的一切无权限。
+--   方案 2（更严）：DBA 用超级用户跑一次 `setup()` 预建表，应用角色只给
 --        SELECT/INSERT/UPDATE/DELETE，**不给 CREATE**。
---        · ⚠️ **未验证**：`setup()` 是否能在无 CREATE 权限下于已存在的表上幂等通过，
---          尚未在真库验证（含 `CREATE INDEX IF NOT EXISTS` 的权限判定）。
---          选方案 2 之前必须先用 `docs/scripts/verify-checkpoint-pg.py` 验一次，
---          否则会在「首次部署」而不是「写代码」时才发现。
+--        ⛔ **实测结论（2026-10-01）：方案 2 不可行**——探针角色
+--        （只有 CONNECT/USAGE + ALL TABLES 的 DML，`has_schema_privilege(CREATE)=false`）
+--        跑 `setup()` 直接失败：
+--            InsufficientPrivilege: 对模式 public 权限不够
+--        原因：`setup()` 不只在“表不存在时建表”，它还要跑 `CREATE INDEX IF NOT EXISTS`
+--        与 migration 记录写入，均需模式的 CREATE 权限。**因此不要再尝试方案 2**
+--        （评审稿 §8-4 登记的那条未验证假设，现已关闭）。
 --
--- 本脚本给出方案 1；方案 2 的 GRANT 以注释形式附在末尾。
+-- 本脚本给出方案 1；方案 2 仅作为已证伪的历史记录保留在上面。
 -- =============================================================================
 
 
@@ -111,6 +117,11 @@ GRANT  ALL ON SCHEMA public TO dkd_agent_pg;   -- 建表所需（setup() 幂等�
 
 -- 兜底：确保没有其他角色能连上/写入这个库
 REVOKE ALL ON DATABASE dkd_agent_state FROM PUBLIC;
+-- ⚠️ 实测修正（2026-10-01）：这一句会连带收走**任何**其他角色的 CONNECT 权限。
+--    这是有意为之的收紧（等价于 MySQL 侧只授 127.0.0.1），但代价是：
+--    新增任何使用者（如监控账号、DBA 排障账号）时**必须显式** GRANT CONNECT，
+--    否则报的是「用户没有CONNECT权限」——这句本身就是我们收走的。
+--    踩到实例：方案 2 探针角色第一次跑就卡在这一步（脚本缺陷，非结论）。
 
 -- ⚠️ 不授任何业务相关对象：这里的库里没有业务表可授；
 --    而 MySQL 的业务库与本引擎无关，天然不可达（这正是选独立引擎的隔离优势）。
@@ -134,21 +145,41 @@ REVOKE ALL ON DATABASE dkd_agent_state FROM PUBLIC;
 --     然后启动服务：DKD_AGENT_CHECKPOINT_BACKEND=postgres uv run uvicorn app.main:app
 --     再重启一次确认 setup() 幂等（第二次启动不报错）
 --
--- 5.2 负向（必须全部被拒，对应 MySQL 侧 8 项拒绝路径的同等要求）
---     ① 读别的库：      SELECT * FROM dkd_public_schema.anything;      -- 期望 permission denied / 库不存在
---     ② 建新库：        CREATE DATABASE x;                            -- 期望 permission denied（NOCREATEDB）
---     ③ 建角色：        CREATE ROLE x;                                -- 期望 permission denied（NOCREATEROLE）
---     ④ 超级用户操作：  ALTER SYSTEM SET log_statement='all';         -- 期望 permission denied
---     ⑤ 删 checkpoint： DELETE FROM checkpoints;                      -- 允许（checkpoint 属会话状态，
---                                                                         评审稿 D4：切换不做双向同步）
+-- 5.2 负向（必须全部被拒；**已实测，见下方执行记录**）
+--     ① 建新库：        CREATE DATABASE x;           -- InsufficientPrivilege（NOCREATEDB）✅
+--     ② 建角色：        CREATE ROLE x;               -- InsufficientPrivilege（NOCREATEROLE）✅
+--     ③ 改系统参数：    ALTER SYSTEM SET ...;        -- InsufficientPrivilege（非超级用户）✅
+--     ④ 装非 trusted 扩展：CREATE EXTENSION postgres_fdw;  -- InsufficientPrivilege ✅
+--     ⑤ 在别的库建表：  CREATE TABLE x(id int);      -- InsufficientPrivilege ✅
+--
+-- 5.3 ⚠️ 已记录且已接受的边界（**不是漏洞，但必须知道**）
+--     库 owner 可以安装 **trusted 扩展**：实测 `CREATE EXTENSION pg_trgm` **成功**。
+--     这是 PostgreSQL 13+ 的 trusted extension 机制 + “角色是自己库的 owner”的固有含义。
+--     影响面：仅限该自有库（装不了 postgres_fdw 等非 trusted 扩展，也碰不到业务数据）。
+--     若业务上不能接受，则授权形态必须换掉（而方案 2 已证伪，所以实际等价于
+--     “由 DBA 代装扩展 + 把库 owner 收归 DBA + 承担 setup() 需预建表的维护负担”）——
+--     成本明显高于收益，故本期**明确接受**该边界，但要求它写在脚本里而不是靠人记得。
 -- ---------------------------------------------------------------------------
 
 
 -- ---------------------------------------------------------------------------
 -- 执行记录
 -- ---------------------------------------------------------------------------
--- 2026-09-28：脚本创建，**尚未在任何 PG 实例上执行**（D5 未闭环）。
---   执行后请登记：执行人 / 时间 / PG 版本 / 第 5.2 节 5 项结果 / setup() 是否幂等。
+-- 2026-09-28：脚本创建（当时未执行）。
+-- 2026-10-01：**已在本机执行**。执行人：开发（AI 协作）；PG 版本 **PostgreSQL 17.11**（Windows）。
+--   执行方式：`docs/scripts/setup-agent-pg.py`（本机无 psql）→ 建角色 `dkd_agent_pg`
+--   （NOSUPERUSER/NOCREATEDB/NOCREATEROLE/CONNECTION LIMIT 20）+ 建库 `dkd_agent_state`
+--   （owner = 该角色）+ 收紧 public schema 与 database PUBLIC 权限；脚本重复执行幂等（角色/库已存在则跳过）。
+--   验收结果（全部实跑）：
+--     · `docs/scripts/verify-checkpoint-pg.py --phase all` → **PASS=18 FAIL=0**
+--       （含 setup 幂等、生命周期、5 项拒绝路径、口令脱敏、事件循环策略）
+--     · 跨进程验收（两个独立进程）→ 进程 A 写 2 条 / 进程 B 新进程读回 2 条并追加到 4 条，**3/3 PASS**
+--     · **方案 2 探针 → 不可行**（InsufficientPrivilege: 对模式 public 权限不够）
+--     · 服务级验证：`python -m app` 启动后 `/health` → `checkpoint_backend=postgres`、
+--       `checkpoint_open=true`、`checkpoint_location` 已脱敏；真实 SSE 会话落 PG
+--       （`thread_id=pg-verify-conv`，checkpoints 3 行 / blobs 3 行，验收后已清理）
+--   已接受边界：库 owner 可装 trusted 扩展（pg_trgm 实测成功，探针遗留已 DROP）。
+--   生产待办：D5 的另一半 —— 是否允许新增 DB 引擎（非本机环境）尚未拍板。
 
 
 -- ---------------------------------------------------------------------------

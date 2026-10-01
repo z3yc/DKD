@@ -15,7 +15,11 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api import chat, ops, restock
-from app.checkpoint import get_checkpoint_store, open_checkpoint_store
+from app.checkpoint import (
+    ensure_windows_event_loop_policy,
+    get_checkpoint_store,
+    open_checkpoint_store,
+)
 from app.config import get_settings
 from app.db import dispose_engine
 from app.graphs.chat_graph import build_chat_graph
@@ -124,5 +128,12 @@ def create_app() -> FastAPI:
 
     return app
 
+
+# ⚠️ 模块级副作用，但必须在这里（不能在 lifespan 里）：
+# Windows + postgres 后端要求事件循环策略是 SelectorEventLoop，而策略必须在
+# **事件循环被创建之前**生效；uvicorn 的 Server.__init__ 先 import 应用再建循环，
+# 所以模块级是唯一够早的时机（原委见 ensure_windows_event_loop_policy docstring）。
+# 条件式生效：非 Windows 或 sqlite 后端时本行为 no-op。
+ensure_windows_event_loop_policy(get_settings())
 
 app = create_app()

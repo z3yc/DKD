@@ -1,12 +1,15 @@
-# 智能体存储后端 · PostgreSQL 选型评审稿（V1.0 · **已定稿**）
+# 智能体存储后端 · PostgreSQL 选型评审稿（V1.1 · **已定稿 + 本机已验收**）
 
-> 状态：**已定稿（2026-09-28）**。评审结论：采用 **方案 A**（只换 checkpointer，不搬
-> `agent_*` 表）；其中 ③ 知识库/向量检索由项目负责人确认为**要做的方向**，但按 §4.3 的
-> 分阶段原则落地（先 PG 实例，向量表待波次 4 / 排期 2-7 口径冻结后建）。
-> ⚠️ **D5 尚未闭环**（本机 PG 账号 / 生产是否允许新增 DB 引擎）：D5 闭环前，
-> `DKD_AGENT_CHECKPOINT_BACKEND` **不得**在任何环境置为 `postgres`（配置了就启动即失败）。
-> 落地代码：`app/checkpoint.py`（工厂 + 双实现）、`docs/ddl/create_agent_pg_role.sql`、
-> `tests/test_checkpoint_factory.py`（T3 契约测试）。
+> 状态：**已定稿（2026-09-28）并在本机完成真库验收（2026-10-01）**。评审结论：采用 **方案 A**
+> （只换 checkpointer，不搬 `agent_*` 表）；其中 ③ 知识库/向量检索由项目负责人确认为**要做的方向**，
+> 但按 §4.3 的分阶段原则落地（先 PG 实例，向量表待波次 4 / 排期 2-7 口径冻结后建）。
+> ⚠️ **D5 只剩生产和半场**：本机账号/库已建并全量验收通过；
+> **「生产是否允许新增 DB 引擎」仍需运维/负责人拍板**，未拍板前不得在生产置 `postgres`
+> （配置了就启动即失败，不会静默回退）。
+> 落地代码与证据：`app/checkpoint.py`（工厂 + 双实现 + 事件循环守卫）、
+> `app/__main__.py`（启动入口）、`docs/ddl/create_agent_pg_role.sql`（已执行）、
+> `docs/scripts/setup-agent-pg.py`、`docs/scripts/verify-checkpoint-pg.py`（**18/18 + 3/3**）、
+> `tests/test_checkpoint_factory.py`（20 项零依赖契约测试）。
 >
 > 影响面：排期 **0-10（checkpointer 落地）**、**FIX-14（Redis 3.2.100 技术债）**、Phase 2 的 2-7（故障案例库 RAG，方案写「RAG 后置」）、AGENTS §1 约束 5（基础设施实测边界）
 > 相关文档：方案 **V1.2** §5.1 / §4.2、排期 **V2.9** §七/§八、`docs/DKD智能体项目-面试讲解与复盘.md` §4.2 / §九、`docs/ddl/create_agent_db_user.sql`
@@ -134,13 +137,21 @@
 | **D2** | 范围是否只限 checkpointer（不搬 agent_* 表） | ✅ **是**（理由见 §4.2：搬走会打断 3-7 审计页的 RuoYi/MySQL 数据通路） | 项目负责人 / 2026-09-28 |
 | **D3** | PG 路径测试方式 | ✅ **T1 + T3**：PG 真库路径标 `-m live`，另加零依赖契约测试（已落地 `tests/test_checkpoint_factory.py`，16 项） | Python / 2026-09-28 |
 | **D4** | 存量 SQLite checkpoint 是否迁移 | ✅ **不迁移**：切换后旧会话不可恢复（会话价值低、非审计数据）；回滚 = 改环境变量，不做双向同步 | 项目负责人 + 产品 / 2026-09-28 |
-| **D5** | 环境与凭据 | ⏳ **未闭环（硬前置）**：需 ① 本机 PG 账号（或授权新建专用角色/库）；② 生产是否允许新增 DB 引擎、是否已有 PG 实例 | 运维 / 项目负责人 · 待提供 |
+| **D5** | 环境与凭据 | 🟡 **本机已闭环，生产待拍板**：① 本机 PG 17.11 角色/库已建并全量验收（2026-10-01）；② **「生产是否允许新增 DB 引擎」待运维/负责人拍板** | 运维 / 项目负责人 · 生产半场待提供 |
 
-> **D5 未闭环前，方案 A 不得在生产启用**（代码已就位，但任何环境都不得把
-> `DKD_AGENT_CHECKPOINT_BACKEND` 置为 `postgres`；配置缺失 DSN 时服务拒绝启动，不会静默回退）。
-> 目前待验的仍是 §8-4 那条：**账号只有 DML 权限（无 CREATE）时 `setup()` 首次部署会失败** ——
-> 授权脚本给出两条出路（方案 1 独立库 owner / 方案 2 DBA 预建表），选后者前必须先用
-> `docs/scripts/verify-checkpoint-pg.py` 验一次。
+> **D5 的本机半场已闭环，生产半场未闭环**：本机已把后端切到 `postgres` 并跑通全链
+> （`/health` 报 `checkpoint_backend=postgres`、真实 SSE 会话落 PG）；
+> 生产启用前需拍板「是否允许新增 DB 引擎」，并同步容器/部署环境的 `DKD_AGENT_PG_DSN`。
+>
+> ✅ **§8-4 的未验证假设已关闭（2026-10-01 实测）**：账号只有 DML 权限（无 CREATE）时
+> `setup()` **失败**——`InsufficientPrivilege: 对模式 public 权限不够`。
+> 因此**方案 2 不可行**，只能采用方案 1（角色拥有独立 database）。完整证据见
+> `docs/ddl/create_agent_pg_role.sql` 的「执行记录」。
+>
+> 🆕 **本轮新增发现（已修正，见排期 FIX-20）**：uvicorn **0.36+** 改用 `loop_factory`
+> 直接指定事件循环，**不再读 asyncio 全局策略**；它的 Windows 默认工厂就是
+> `ProactorEventLoop`，而 psycopg 异步不支持 Proactor。所以本机必须用
+> `uv run python -m app`（本仓入口，`loop="none"`）或 `uvicorn ... --loop none` 启动。
 >
 > ⚠️ **第三节「知识库直接换 PG 行不行」的最终口径**：方向已定（要走 PG + 向量），但
 > **本期只落 PG 实例，不建向量表**（§4.3 第 ③ 层与 `create_agent_pg_role.sql` 末尾「后续」段）：
@@ -154,7 +165,10 @@
 1. **运维面新增**：2~3 人团队要同时维护 MySQL + Redis + PG 三套（备份/监控/权限/值班）；D1 的成本核算必须把这部分算进去，而不是只算代码改造。
 2. **团队 PG 经验缺口**：本机**有** PG，但团队**没有**在本项目里用过——"能装"不等于"能运维"（备份策略、`max_connections`、连接池与 PG 侧 idle 超时的配合）。
 3. **代理不稳**：FIX-18 记录过 `github.com` 偶发不可达；装 `psycopg` 走 PyPI 同样受影响。
-4. **一条没验证的假设**：`AsyncPostgresSaver.setup()` 需要建表权限；若 PG 侧账号只给 DML，**首次部署会直接失败**——需在验收脚本里显式覆盖这条拒绝路径。
+4. **一条已关闭的假设（2026-10-01 实测）**：评审稿曾担心“`AsyncPostgresSaver.setup()` 需要建表权限；
+   若 PG 侧账号只给 DML，首次部署会直接失败”。现已验证：**确实是硬失败**
+   （`InsufficientPrivilege: 对模式 public 权限不够`）→ 方案 2（DBA 预建表 + 只授 DML）**不可行**，
+   采用方案 1（角色拥有独立库）。该实测由 `verify-checkpoint-pg.py --phase e` 固定下来（可复跑）。
 5. **不做的事**：本稿不主张把 `agent_*` 表、业务表或审计页数据迁到 PG；也不主张现在引入向量库。
 
 ---
@@ -175,6 +189,7 @@
 | --- | --- | --- | --- |
 | 2026-09-23 | V0.1 | 首版（待评审）：三层拆解、A/B/C 方案、D1~D5 决策点、测试策略取舍、实测事实表 | 开发（AI 协作） |
 | 2026-09-28 | **V1.0** | **定稿**：D1~D4 拍板（方案 A）；D5 待闭环。落地 `app/checkpoint.py` 工厂 + `PostgresCheckpointStore`、`docs/ddl/create_agent_pg_role.sql`、`tests/test_checkpoint_factory.py`（T3，16 项）、`.env.example` 占位符、`pyproject.toml` 可选依赖组 `postgres`。同步改版：方案 V1.2 §5.1、排期 V2.9、AGENTS §1 约束 5 | 开发（AI 协作） |
+| 2026-10-01 | **V1.1** | **本机真库验收完成**：建角色/库（`setup-agent-pg.py`，本机无 psql）→ `verify-checkpoint-pg.py` **18/18** + 跨进程恢复 **3/3** + DML 探针；**§8-4 假设关闭（方案 2 证伪）**；新增 uvicorn 0.36+ `loop_factory` 与 psycopg Proactor 不兼容的修复（`app/__main__.py` + 启动守卫，见排期 FIX-20）；D5 降级为「本机已闭环、生产待拍板」 | 开发（AI 协作） |
 
 ---
 
