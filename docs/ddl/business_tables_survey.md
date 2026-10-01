@@ -86,10 +86,12 @@ Extra: Using index condition; Using where; Using temporary
 
 ## 三、发现的既有问题（不是本次改动引入，需产品/Java 侧决策）
 
-| # | 问题 | 证据 | 影响 | 建议 |
-| --- | --- | --- | --- | --- |
-| 1 | **Java 报表 SQL 丢了参数绑定** | `ReportMapper.xml:122-130`：`sumRevenueByStatusAndDateRange` / `countOrdersByStatusAndDateRange` 只写 `where status >= 1`，未绑定 `#{status}`、未用 `beginTime/endTime`（而接口 `ReportMapper.java:27-33` 声明了这三个 `@Param`） | “AI 报表分析”页营收/订单数/榜单实为**全量 `status>=1`**，与所选时间窗无关；Agent 若以它为对账基准会一直对不上 | 交 Java 侧修（属业务口径变更，不由 Agent 侧顺手改）；Agent 侧对账改用 `ReportServiceImpl.java:28` 的口径定义 + 独立 SQL |
-| 2 | **`tb_order` 缺聚合所需索引** | 见 §2.1/§2.2 | 数据量上来后 30 天聚合会全表扫描，与主库业务争抢（本机无只读从库） | 采纳 §2.3 建议索引（附回滚） |
+> 更新 2026-10-01：第 1、2 项**已关闭**（FIX-3 修完并真库复验、FIX-4 索引已执行）；第 3 项仍待业务拍板。
+
+| # | 问题 | 证据 | 影响 | 建议 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **Java 报表 SQL 丢了参数绑定** | `ReportMapper.xml:122-130`：`sumRevenueByStatusAndDateRange` / `countOrdersByStatusAndDateRange` 只写 `where status >= 1`，未绑定 `#{status}`、未用 `beginTime/endTime`（而接口 `ReportMapper.java:27-33` 声明了这三个 `@Param`） | “AI 报表分析”页营收/订单数/榜单实为**全量 `status>=1`**，与所选时间窗无关；Agent 若以它为对账基准会一直对不上 | 交 Java 侧修（属业务口径变更，不由 Agent 侧顺手改）；Agent 侧对账改用 `ReportServiceImpl.java:28` 的口径定义 + 独立 SQL | **✅ 已修（FIX-3，2026-10-01）**：四条聚合 SQL（含 `topNodesByRevenue`/`topProductsBySales`，原一并漏绑）改为 `status = #{status} AND create_time >= #{beginTime} AND create_time < #{endTime}`。真库复验：旧 28/26 → 新 **7/5**（缩窗到单日变 3/3），且 **7/5 与本表 §一 记录的 Agent 侧独立 SQL 对账值一致**；防回归新增 `ReportMapperSqlTest`（5 项） |
+| 2 | **`tb_order` 缺聚合所需索引** | 见 §2.1/§2.2 | 数据量上来后 30 天聚合会全表扫描，与主库业务争抢（本机无只读从库） | 采纳 §2.3 建议索引（附回滚） | **✅ 本机已执行（FIX-4，2026-10-01）**：`SHOW INDEX` 确认 3 个新索引存在；EXPLAIN 复验 FIX-3 新 SQL → `type=range` / `key=idx_order_status_create_time` / `rows=5`；对照 `date_format()` 写法 → `possible_keys=NULL`、`type=index`（全索引扫描）。**生产待低峰执行** |
 | 3 | **`tb_inventory` 与 `tb_channel` 档案不一致（实测 3/3）** | `sku_id` 与容量两侧全不一致（例：vm=80 channel=4732 → inventory.sku_id=1 / channel.sku_id=6，`inventory.max_stock=6` / `channel.max_capacity=10`） | “货道容量”取哪个直接决定建议量；若静默选边，补货建议会系统性偏大或偏小 | ① 读工具**如实返回两侧取值**并暴露 `data_consistent=false`（已实现）；② 需业务确认权威源（建议：`tb_channel` 为货道档案权威，`tb_inventory` 只管库存数）；③ 补数据修复任务 |
 | 4 | **订单状态口径须锁死** | `VmSystemConstant.java:83-102`（0 创建/1 支付/2 出货成功/3 出货失败/4 失效）；`ReportServiceImpl.java:28` 报表用 `2` | 口径混用会让“销量”差好几倍 | Agent 侧固定 `status=2`（配置项 `DKD_AGENT_SALES_ORDER_STATUS`），并在输出里带上口径说明 |
 | 5 | **`tb_task_details` 明细缺失** | 22 个工单仅 13 条明细（`left join` 后部分工单 channels 为空） | 在途工单去重若只盯明细，会漏判 | 读工具返回工单级在途列表（`channels` 可能为空，已实现） |

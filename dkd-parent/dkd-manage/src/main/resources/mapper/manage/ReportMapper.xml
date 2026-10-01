@@ -118,21 +118,53 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         )
     </insert>
 
-    <!-- 数据聚合查询：统计所有已完成订单 -->
+    <!--
+      数据聚合查询：**时间窗与订单状态必须显式绑定**（FIX-3，2026-10-01 修复）
+
+      为什么要改（原 SQL 只写 `where status >= 1`，接口声明的三个入参全是装饰）：
+        · 营收/订单数/榜单与所选时间窗**完全无关**——「近 7 天报表」实际统计的是历史全量，
+          任务 1-12 的 Agent 对账因此永远对不上（这也是 Agent 侧改用独立 SQL 的原因）；
+        · `status >= 1` 把「支付(1)+出货成功(2)+出货失败(3)+失效(4)」全算进营收，
+          与 `VmSystemConstant` 的状态定义及 `ReportServiceImpl.ORDER_STATUS_SUCCESS=2` 相矛盾。
+          本机开发库实测差异真实存在：status 0/1/2/3/4 分别有 3/10/7/2/7 行。
+
+      为什么用范围比较而不是 `date_format(create_time, ...)`：
+        对索引列做函数包裹会让 `create_time` 上的索引失效（AGENTS §10 点名的反例
+        `OrderMapper.xml:44`）。范围比较可走 `(status, create_time)` 复合索引
+        （索引 DDL 见 docs/ddl/add_index_tb_order_and_tb_task.sql）。
+
+      为什么上界用 `<` 而不是 `<=`：
+        `beginTime/endTime` 由 `ReportServiceImpl` 以「当日/当周零点」传入，
+        是**半开区间** [begin, end)。写成 `<=` 会把上界那一刻的订单同时算进相邻两期。
+
+      为什么 status 用等值而不是 `>=`：
+        订单状态是**枚举语义**（2=出货成功），不是“达到某级别”。用 `>=` 只是把原 bug
+        换个写法，且 3=出货失败 仍会被算进营收——那是本 bug 最贵的一部分。
+
+      边界：status 传 null 时本查询返回 0 行（`status = null` 恒为假）。
+        这里刻意不做 `<if>` 兜底：一旦为空就“统计全部状态”，等于把口径歧义重新藏回 SQL，
+        而 0 行是**看得见**的失败。唯一调用方 `ReportServiceImpl` 传常量 2。
+    -->
     <select id="sumRevenueByStatusAndDateRange" resultType="Long">
         select COALESCE(sum(amount), 0) from tb_order
-        where status &gt;= 1
+        where status = #{status}
+          and create_time &gt;= #{beginTime}
+          and create_time &lt; #{endTime}
     </select>
 
     <select id="countOrdersByStatusAndDateRange" resultType="Integer">
         select count(*) from tb_order
-        where status &gt;= 1
+        where status = #{status}
+          and create_time &gt;= #{beginTime}
+          and create_time &lt; #{endTime}
     </select>
 
     <select id="topNodesByRevenue" resultType="java.util.HashMap">
         select node_name as nodeName, sum(amount) as revenue
         from tb_order
-        where status &gt;= 1
+        where status = #{status}
+          and create_time &gt;= #{beginTime}
+          and create_time &lt; #{endTime}
         group by node_id, node_name
         order by revenue desc limit 10
     </select>
@@ -140,7 +172,9 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
     <select id="topProductsBySales" resultType="java.util.HashMap">
         select sku_name as skuName, count(*) as sales
         from tb_order
-        where status &gt;= 1
+        where status = #{status}
+          and create_time &gt;= #{beginTime}
+          and create_time &lt; #{endTime}
         group by sku_id, sku_name
         order by sales desc limit 10
     </select>

@@ -1,9 +1,10 @@
 -- ============================================================================
 -- 索引变更建议（Phase 1 / 任务 1-2）
 --
--- 状态：**待评审，尚未执行**（AGENTS §2.4：唯一约束与索引变更必须附 DDL 文件并经评审）。
+-- 状态：**已在本机 dkd 库执行（2026-10-01）**；生产仍需低峰单独执行（见文件末执行记录）。
 -- 依据：docs/ddl/business_tables_survey.md §2（EXPLAIN 量化证据：同一查询在
---       “无索引”与“复合索引 + 范围比较”下预估扫描行数 199430 → 2）。
+--       “无索引”与“复合索引 + 范围比较”下预估扫描行数 199430 → 2）；
+--       另经 **FIX-3 修复后的真库 EXPLAIN 复验**（2026-10-01，见文件末）。
 -- 执行环境：dkd 库（MySQL 8.0）。**大表请在低峰执行**（MySQL 8 的在线 DDL 默认
 --       INPLACE + 不锁表，但会占用 IO；行数 > 百万且业务敏感时用 pt-osc/gh-ost）。
 -- 回滚：见文件末尾（逐条对应）。
@@ -37,6 +38,25 @@ ALTER TABLE tb_task ADD INDEX idx_task_inner_status_type (inner_code, task_statu
 --   WHERE inner_code IN ('A1000001') AND create_time >= '2023-09-01'
 --     AND create_time < '2023-09-16' AND status = 2
 --   GROUP BY inner_code, channel_code LIMIT 2000\G
+
+-- ----------------------------------------------------------------------------
+-- 执行记录
+-- ----------------------------------------------------------------------------
+-- 2026-10-01：**已在本机 dkd 库执行**（MySQL 8.0.40）。执行对象：第 1~3 条 ALTER
+--   （第 4 条 tb_inventory_log 仍注释未执行：该表不在本机 DDL 归档中，需先核列名）。
+--   验证（SHOW INDEX）：tb_order 新增 idx_order_inner_code_create_time、
+--   idx_order_status_create_time；tb_task 新增 idx_task_inner_status_type。
+--   **EXPLAIN 复验（真库，tb_order 29 行）**：
+--     · FIX-3 修复后的 aggregate：type=range、key=idx_order_status_create_time、
+--       key_len=10、rows=5、Extra=Using index condition  —— 走了范围扫描
+--     · inner_code 等值 + create_time 范围：key=idx_order_inner_code_create_time、key_len=68
+--     · **对照反例**：`where date_format(create_time,'%Y-%m-%d') >= ...`  →
+--       possible_keys=**NULL**、type=index（全索引扫描）—— 在真表上复现了 AGENTS §10
+--       点名的“函数包裹索引列导致索引失效”，而不是纸面警告。
+--   ⚠️ 本机开发库数据量极小（tb_order 29 行），“rows 从 199430 降到 2”的量级证据来自
+--      勘查记录里的 20 万行合成表 tmp_order_scale，两者不可混为一谈。
+--   ⚠️ 生产执行属于 4-1/4-2 范畴：大表需低峰 + 评估锁表（MySQL 8 在线 DDL 默认
+--      INPLACE 不锁表，但占用 IO；百万行以上建议 pt-osc/gh-ost）。
 
 -- ----------------------------------------------------------------------------
 -- 回滚（逐条对应，可单独执行）

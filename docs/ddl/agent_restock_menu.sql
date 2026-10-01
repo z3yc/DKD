@@ -29,28 +29,49 @@ ORDER BY menu_id;
 
 -- 备用区间候选（依次尝试，选第一个返回 0 行的）：
 --   9000 / 19000 / 29000
--- 如全部占用，把 @menu_base 改成任意未占用的起始值（下方 10 个 ID 必须连续可用）。
+-- 如全部占用，把 @menu_base 改成任意未占用的起始值（下方 **7 个** ID 必须连续可用）。
+-- ⚠️ 本机实测（2026-10-01）：业务菜单实际占用区间为 **2000~2075**（task/node/vm/emp/sku/policy/order），
+--    9000~9010 为空，已按此区间执行（见文件末「执行记录」）。
 
 -- ---------------------------------------------------------------------------
 -- 变量：改这两行即可（@parent_id = 0 表示顶级菜单）
 -- ---------------------------------------------------------------------------
 SET @menu_base := 9000;
-SET @parent_id := 0;
+SET @top_parent_id := 0;
 SET @now := sysdate();
 
--- 如需挂在现有业务目录下（例：挂在名称为「库存管理」的目录下），改用下面这句，
--- 并确认 SELECT 结果非空（为空会让菜单挂到不存在的父节点上、前端不显示）：
---   SELECT @parent_id := menu_id FROM sys_menu WHERE menu_name = '库存管理' AND menu_type = 'M' LIMIT 1;
---   SELECT @parent_id;  -- 必须非 NULL
-
 -- ---------------------------------------------------------------------------
--- 主菜单（menu_type = 'C'）
+-- ① 一级目录「AI 智能体」（menu_type = 'M'）
+--
+-- 为什么建目录而不是把页面平铺在顶级：本页不是孤岛——排期里还有
+-- 2-6 诊断对话页、3-7 决策审计页要挂进来；现在平铺，以后要么做一次菜单搬迁
+-- （影响角色已授权的 sys_role_menu），要么把不相关的页面堆在顶级目录里。
+-- order_num=6：排在既有业务目录（1~5 为 RuoYi 系统目录之外的业务类）与系统管理（11）之前。
+-- ⚠️ 若本库 order_num 6 已被占用，会与既有目录换位——不报错但顺序会变，验收时看一眼菜单顺序。
 -- ---------------------------------------------------------------------------
 INSERT INTO sys_menu VALUES(
   @menu_base + 0,
+  'AI 智能体',
+  @top_parent_id,
+  '6',
+  'ai',
+  NULL,
+  '',
+  1, 0, 'M', '0', '0',
+  '',
+  'star',
+  'admin', @now, '', NULL,
+  '智能体能力的统一入口（补货工作台 / 诊断对话 / 决策审计）'
+);
+
+-- ---------------------------------------------------------------------------
+-- ② 子菜单「智能补货工作台」（menu_type = 'C'）
+-- ---------------------------------------------------------------------------
+INSERT INTO sys_menu VALUES(
+  @menu_base + 1,
   '智能补货工作台',
-  @parent_id,
-  '5',
+  @menu_base + 0,
+  '1',
   'restock',
   'manage/restock/index',
   '',
@@ -68,11 +89,11 @@ INSERT INTO sys_menu VALUES(
 -- 但权限标识先建出来，避免后续收权限时还要补一轮 DDL。
 -- 若确认本轮不需要按钮级权限，可把下面 5 行整体注释掉——不影响页面可用性。
 -- ---------------------------------------------------------------------------
-INSERT INTO sys_menu VALUES(@menu_base+1, '补货清单查询', @menu_base+0, '1', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:list',    '#', 'admin', @now, '', NULL, '');
-INSERT INTO sys_menu VALUES(@menu_base+2, '补货建议确认', @menu_base+0, '2', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:confirm', '#', 'admin', @now, '', NULL, '');
-INSERT INTO sys_menu VALUES(@menu_base+3, '补货建议调整', @menu_base+0, '3', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:adjust',  '#', 'admin', @now, '', NULL, '');
-INSERT INTO sys_menu VALUES(@menu_base+4, '补货建议跳过', @menu_base+0, '4', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:skip',    '#', 'admin', @now, '', NULL, '');
-INSERT INTO sys_menu VALUES(@menu_base+5, '自动分析开关', @menu_base+0, '5', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:pause',   '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+2, '补货清单查询', @menu_base+1, '1', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:list',    '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+3, '补货建议确认', @menu_base+1, '2', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:confirm', '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+4, '补货建议调整', @menu_base+1, '3', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:adjust',  '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+5, '补货建议跳过', @menu_base+1, '4', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:skip',    '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+6, '自动分析开关', @menu_base+1, '5', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:pause',   '#', 'admin', @now, '', NULL, '');
 
 -- ---------------------------------------------------------------------------
 -- 角色授权（可选）
@@ -83,28 +104,35 @@ INSERT INTO sys_menu VALUES(@menu_base+5, '自动分析开关', @menu_base+0, '5
 -- ---------------------------------------------------------------------------
 -- SET @role_id := 2;
 -- INSERT INTO sys_role_menu(role_id, menu_id)
---   SELECT @role_id, menu_id FROM sys_menu WHERE menu_id BETWEEN 9000 AND 9005;
+--   SELECT @role_id, menu_id FROM sys_menu WHERE menu_id BETWEEN 9000 AND 9006;
 
 -- ---------------------------------------------------------------------------
--- 校验：应返回 6 行（1 个 C + 5 个 F），且 component / perms 与前端一致
+-- 校验：应返回 **7 行**（1 个目录 M + 1 个菜单 C + 5 个按钮 F），
+--      且 component / perms 与前端一致；目录行的 parent_id=0、菜单行的 parent_id=9000
 -- ---------------------------------------------------------------------------
 SELECT menu_id, menu_name, parent_id, menu_type, perms, component
 FROM sys_menu
-WHERE menu_id BETWEEN @menu_base AND @menu_base + 5
+WHERE menu_id BETWEEN @menu_base AND @menu_base + 6
 ORDER BY menu_id;
 
 -- ---------------------------------------------------------------------------
 -- 执行记录
 -- ---------------------------------------------------------------------------
--- 2026-09-28：脚本创建，**尚未在任何环境执行**。
---   本机执行后请在此登记：执行人 / 时间 / @menu_base 取值 / 校验是否 6 行。
---   生产执行属于 4-1/4-2（上线收尾）范畴，需与前端发布同批。
+-- 2026-09-28：脚本创建，当时**尚未在任何环境执行**。
+-- 2026-10-01：**已在本机 dkd 库执行**（MySQL 8.0.40，root@localhost）。
+--   执行前实测：9000~9010 区间为空（业务菜单占用 2000~2075）；
+--   执行方式：`mysql --defaults-extra-file=<临时选项文件> dkd < agent_restock_menu.sql`
+--   （口令从本机 .env 读取写入临时文件，用完即删，未打印、未入仓）。
+--   执行结果：校验 SELECT 返回 **7 行**（9000 目录 M / 9001 菜单 C / 9002~9006 按钮 F），
+--   parent_id 层级正确（目录 parent=0，菜单与按钮 parent 指向 9000/9001）。
+--   ⚠️ 菜单入口需重新登录（或清 RuoYi 菜单缓存）才在前端出现——菜单是登录时下发的。
+--   待办：非 admin 角色若需可见，需按上面「角色授权」段自行 INSERT sys_role_menu。
 
 -- ---------------------------------------------------------------------------
 -- 回滚（按需执行；先删角色关联再删菜单）
 -- ---------------------------------------------------------------------------
--- DELETE FROM sys_role_menu WHERE menu_id BETWEEN 9000 AND 9005;
--- DELETE FROM sys_menu      WHERE menu_id BETWEEN 9000 AND 9005;
+-- DELETE FROM sys_role_menu WHERE menu_id BETWEEN 9000 AND 9006;
+-- DELETE FROM sys_menu      WHERE menu_id BETWEEN 9000 AND 9006;
 --
 -- 回滚影响面：仅移除菜单入口与按钮权限，**不触碰任何业务数据与 agent_* 表**；
 -- 回滚后前端页面文件仍在仓库中，只是入口不可达（可直接回滚，无需回滚代码）。
