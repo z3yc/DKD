@@ -166,6 +166,26 @@ Python 侧日志与 `agent_decision_log.request_id` 都带它。**排障时先�
 - **诊断场景的独立性**：`scene=3` 的工具集与 `scene=2` **不共享**（除库存/在途两个通用件），
   所以“补货场景问诊断问题”不会悄悄去查故障案例——那份 schema 根本没给它。
 
+## 二·补二、决策审计页接口（Java manage，只读）
+
+审计页（3-7）由 Java 侧提供三个**只读** GET，都在 `/manage/agent/decision-log` 下，
+权限分别是 `manage:agentAudit:list` / `manage:agentAudit:query`：
+
+| 接口 | 参数 | 说明 |
+| --- | --- | --- |
+| `GET /list` | `scene` / `triggerType` / `action` / `targetType` / `targetId` / `requestId` / `result` / `params.beginTime` / `params.endTime` + 分页 | 分页列表；**不返回** `input_context` / `llm_output` 两个 JSON 列（该表随每次对话增长，列表塞大 JSON 会让分页越来越慢） |
+| `GET /{id}` | 主键 | 单条详情，**含**两个 JSON 列（审计回放用） |
+| `GET /trace` | `requestId`（必填） | **按请求号串联同一次请求的全部留痕**，`order by id asc` + `limit 50`，复用详情列片段（因此带 JSON 上下文） |
+
+**为什么 `trace` 要单独一个接口，而不是“列表按 requestId 过滤”**：列表是 `order by id desc` 且分页，
+把同一条链路的时间顺序**打反了**，而审计要回答的恰恰是先后顺序（状态机放行 → 回调建单 → 回写状态）。
+另外 `requestId` 为空时接口**直接报错**（`code=500` + 中文原因），而不是退化成“最近 50 条留痕”——
+那种结果看起来像一条链路，实际与本次请求无关，比报错更危险。
+
+> 时间过滤一律用**范围比较**（`create_time >= ... and < DATE_ADD(..., INTERVAL 1 DAY)`），
+> 禁止 `date_format()` 包裹索引列（AGENTS §10）。该约定由 `AgentDecisionLogMapperSqlTest` 锁死
+> （含「列表不带 JSON / 详情与链路带 JSON」这一列集合差异）。
+
 ## 三、状态码语义（前端必须按这个提示，不能一律说“操作失败”）
 
 ### 3.1 对照表

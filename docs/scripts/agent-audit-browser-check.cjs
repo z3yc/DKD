@@ -109,7 +109,39 @@ async function step(name, fn) {
     await sleep(400)
   })
 
-  await step('[6] 控制台无错误 + 截图留证', async () => {
+  await step('[6] 链路：按 X-Request-Id 串联同一次请求的全部留痕（升序）', async () => {
+    // 先回收列表：第 4 步筛成了「补货」，这里重置回全量，保证第一行有 requestId 可点
+    await page.click('button:has-text("重置")')
+    await sleep(1500)
+
+    // 取第一行的追踪ID（列在表格里以 `.mono` 渲染）与它的「链路」按钮
+    const firstRow = page.locator('.el-table__body-wrapper tbody tr.el-table__row').first()
+    const rid = ((await firstRow.locator('.mono').first().textContent()) || '').trim()
+    ok(rid.length > 0 && rid !== '—', `第一行有可追溯的追踪ID：${rid}`)
+
+    await firstRow.locator('button:has-text("链路")').click({ timeout: 10000 })
+    await page.waitForSelector('.trace', { timeout: 10000 })
+    // ⚠️ 必须限定 `:visible`：Element Plus 关闭弹窗后 **DOM 仍保留**
+    // （排期 §十 10.6 坑 4），`.el-dialog__header` 会先命中已关闭的「详情」弹窗，
+    // 于是断言拿到的是“决策详情（审计回放）”这个标题（本脚本第一版就是这么红的）。
+    const title = (
+      (await page.locator('.el-dialog:visible .el-dialog__header').last().textContent()) || ''
+    ).trim()
+    ok(title.includes(rid), `链路弹窗标题带上本次请求号：${title.slice(0, 60)}`)
+
+    const items = await page.locator('.trace .el-timeline-item').count()
+    ok(items >= 1, `链路至少渲染 1 条留痕（实际 ${items} 条）`)
+    const traceText = ((await page.textContent('.trace')) || '').replace(/\s+/g, ' ')
+    ok(/chat\.respond|restock\./.test(traceText), `链路里能看到动作名：${traceText.slice(0, 80)}`)
+    ok(/输入上下文|\{|\[/.test(traceText), '链路条目带可读的输入上下文')
+
+    await page.screenshot({ path: path.join(SHOT_DIR, 'agent-audit-trace.png'), fullPage: false })
+    console.log('      截图：' + path.join(SHOT_DIR, 'agent-audit-trace.png'))
+    await page.locator('.el-dialog__footer button:has-text("关闭")').last().click({ timeout: 10000 })
+    await sleep(400)
+  })
+
+  await step('[7] 控制台无错误 + 截图留证', async () => {
     await page.screenshot({ path: path.join(SHOT_DIR, 'agent-audit.png'), fullPage: true })
     console.log('      截图：' + path.join(SHOT_DIR, 'agent-audit.png'))
     const real = errors.filter((e) => !/favicon|ResizeObserver/i.test(e))

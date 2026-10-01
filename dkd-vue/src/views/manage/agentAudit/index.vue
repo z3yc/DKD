@@ -117,9 +117,21 @@
           <span class="mono">{{ row.requestId || '—' }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="80" align="center" fixed="right">
+      <el-table-column label="操作" width="140" align="center" fixed="right">
         <template #default="{ row }">
           <el-button size="small" type="primary" link @click="handleDetail(row)">详情/回放</el-button>
+          <!--
+            链路入口：只有带 requestId 的行才有链路可串（留痕行理论上都可能为空，故显式判空）。
+            与「详情」的分工：详情看**这一条**的完整上下文；链路看**同一次请求**的先后顺序。
+          -->
+          <el-button
+            v-if="row.requestId"
+            size="small"
+            type="primary"
+            link
+            @click="handleTrace(row)"
+          >链路</el-button>
+          <span v-else class="dim">—</span>
         </template>
       </el-table-column>
     </el-table>
@@ -172,12 +184,56 @@
         <el-button @click="detail.open = false">关闭</el-button>
       </template>
     </el-dialog>
+
+    <!--
+      本次请求链路（按 X-Request-Id 串联，升序）。
+
+      为什么需要它：审计最常问的不是“某一条留痕写了什么”，而是
+      「这一次操作到底发生了什么」——状态机放行 → 回调建单 → 回写状态，
+      可能落在 1~3 条留痕上。列表是倒序分页，看不到这个顺序。
+    -->
+    <el-dialog
+      v-model="trace.open"
+      :title="'本次请求链路：' + (trace.requestId || '—')"
+      width="820px"
+      append-to-body
+    >
+      <div v-loading="trace.loading" class="trace">
+        <el-empty v-if="!trace.loading && trace.rows.length === 0" description="该请求号在留痕表里没有记录" />
+        <el-timeline v-else>
+          <el-timeline-item
+            v-for="row in trace.rows"
+            :key="row.id"
+            :timestamp="row.createTime"
+            placement="top"
+            :type="resultTagType(row.result)"
+          >
+            <div class="trace-item">
+              <div class="trace-head">
+                <b>{{ row.action }}</b>
+                <el-tag size="small" :type="resultTagType(row.result)">{{ resultLabel(row.result) }}</el-tag>
+                <span class="dim">
+                  #{{ row.id }} · {{ triggerLabel(row.triggerType) }} ·
+                  {{ row.targetType }}<span v-if="row.targetId">#{{ row.targetId }}</span>
+                </span>
+              </div>
+              <div v-if="row.errorMsg" class="err-text">{{ row.errorMsg }}</div>
+              <pre class="json-block__body">{{ pretty(row.inputContext) }}</pre>
+            </div>
+          </el-timeline-item>
+        </el-timeline>
+      </div>
+      <template #footer>
+        <span class="dim trace-foot">只读：按 X-Request-Id 串联同一次请求的全部留痕（升序，最多 50 条）</span>
+        <el-button @click="trace.open = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup name="AgentAudit">
 import { ElMessage } from 'element-plus'
-import { getDecisionLog, listDecisionLogs } from '@/api/manage/agentAudit'
+import { getDecisionLog, listDecisionLogs, traceDecisionLog } from '@/api/manage/agentAudit'
 
 /**
  * 智能体决策审计页（排期任务 3-7）。
@@ -220,6 +276,8 @@ const logList = ref([])
 const total = ref(0)
 const dateRange = ref([])
 const detail = reactive({ open: false, row: null })
+/** 链路弹窗状态（requestId + 升序留痕行）；loading 必须在 finally 复位（AGENTS §2.2） */
+const trace = reactive({ open: false, loading: false, requestId: '', rows: [] })
 
 const data = reactive({
   queryParams: {
@@ -299,6 +357,28 @@ function resetQuery() {
   handleQuery()
 }
 
+/**
+ * 打开「本次请求链路」：按 requestId 取升序留痕。
+ *
+ * 错误处理与列表一致：失败不静默（AGENTS §6.2），给用户可读提示并保持弹窗可关。
+ */
+function handleTrace(row) {
+  trace.open = true
+  trace.loading = true
+  trace.requestId = row.requestId
+  trace.rows = []
+  traceDecisionLog(row.requestId)
+    .then((response) => {
+      trace.rows = response.data || []
+    })
+    .catch(() => {
+      ElMessage.error('链路查询失败，请稍后重试')
+    })
+    .finally(() => {
+      trace.loading = false
+    })
+}
+
 function handleDetail(row) {
   detail.row = row
   detail.open = true
@@ -318,6 +398,31 @@ onMounted(() => {
 </script>
 
 <style lang="scss" scoped>
+/* 链路弹窗：把每条留痕的上下文压成可扫读的块（与详情弹窗的 json-block 同一视觉语言） */
+.trace {
+  max-height: 60vh;
+  overflow-y: auto;
+
+  .trace-item {
+    .trace-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+
+    .json-block__body {
+      max-height: 160px;
+    }
+  }
+
+  .trace-foot {
+    float: left;
+    line-height: 32px;
+    font-size: 12px;
+  }
+}
+
 .agent-audit {
   .dim {
     color: var(--el-text-color-secondary);

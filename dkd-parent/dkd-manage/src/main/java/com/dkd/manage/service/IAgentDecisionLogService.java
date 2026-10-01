@@ -25,4 +25,11 @@ public interface IAgentDecisionLogService
      * @param id 主键
      */
     AgentDecisionLog selectAgentDecisionLogById(Long id);
+
+    /**
+     * 按 request_id 取整条链路（**升序**，含 JSON 上下文）。
+     *
+     * @param requestId 贯穿网关→Python→回调的请求号
+     */
+    List<AgentDecisionLog> selectTraceByRequestId(String requestId);
 }

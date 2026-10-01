@@ -26,4 +26,15 @@ public interface AgentDecisionLogMapper
      * 详情查询（**含**两个 JSON 列，供“回放”查看决策上下文）。
      */
     AgentDecisionLog selectAgentDecisionLogById(Long id);
+
+    /**
+     * 按 {@code request_id} 取**整条链路**（3-7 决策审计页的“最后一公里”）。
+     *
+     * <p>为什么要单独一个方法而不是“列表按 requestId 过滤”：列表是 {@code order by id desc} 且分页，
+     * 把同一条链路的**时间顺序打反了**；而审计要看的正是先后顺序
+     * （状态机放行 → 回调建单 → 回写状态）。这里**升序**返回。
+     *
+     * @param requestId 贯穿网关→Python→回调的请求号（同一请求的多次留痕共用）
+     */
+    List<AgentDecisionLog> selectAgentDecisionLogTrace(String requestId);
 }

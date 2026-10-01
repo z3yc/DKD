@@ -35,3 +35,20 @@ export function getDecisionLog(id) {
     method: 'get'
   })
 }
+
+/**
+ * 按 X-Request-Id 取**整条链路**（升序，含 JSON 上下文）。
+ *
+ * 与「列表按 requestId 过滤」的区别：列表是倒序分页，看链路时顺序是反的、还要翻页；
+ * 审计要回答的恰恰是先后顺序（状态机放行 → 回调建单 → 回写状态）。后端单条 SQL 里
+ * `order by id asc` + `limit 50`，并复用详情列片段（因此带 input_context / llm_output）。
+ *
+ * @param {string} requestId 贯穿网关→Python→回调的请求号（必填，空值后端直接 500 信封拒绝）
+ */
+export function traceDecisionLog(requestId) {
+  return request({
+    url: '/manage/agent/decision-log/trace',
+    method: 'get',
+    params: { requestId }
+  })
+}

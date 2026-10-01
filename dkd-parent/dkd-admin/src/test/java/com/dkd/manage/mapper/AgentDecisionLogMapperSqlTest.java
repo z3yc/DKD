@@ -70,6 +70,31 @@ class AgentDecisionLogMapperSqlTest
         throw new AssertionError(RESOURCE_PATH + " 中找不到 " + tagName + " id=" + id);
     }
 
+    /** 原始 XML 文本（用于断言 <include> 的 refid —— DOM 的 getTextContent 拿不到它）。 */
+    private static String rawXml() throws Exception
+    {
+        try (InputStream in = AgentDecisionLogMapperSqlTest.class.getClassLoader()
+                .getResourceAsStream(RESOURCE_PATH))
+        {
+            assertNotNull(in, "类路径上找不到 " + RESOURCE_PATH);
+            // 用 Spring 的 StreamUtils 而不是 InputStream.readAllBytes()：后者是 Java 9+ API，
+            // 本项目编译目标是 Java 8（AGENTS §2.1 的硬边界）。
+            return org.springframework.util.StreamUtils.copyToString(in, java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
+
+    /** 取某个元素（含属性与子节点）的原始片段。 */
+    private static String rawBlock(String tagName, String id) throws Exception
+    {
+        String raw = rawXml();
+        String head = "<" + tagName + " id=" + '"' + id + '"';
+        int start = raw.indexOf(head);
+        assertTrue(start >= 0, "原始 XML 里找不到 " + tagName + " id=" + id);
+        int end = raw.indexOf("</" + tagName + ">", start);
+        assertTrue(end > start, "原始 XML 里 " + id + " 没有闭合标签");
+        return raw.substring(start, end);
+    }
+
     @Test
     @DisplayName("时间过滤必须是范围比较，且不得用 date_format() 包裹索引列")
     void timeFilterMustUseRangeComparisonWithoutFunctionOnColumn()
@@ -110,6 +135,32 @@ class AgentDecisionLogMapperSqlTest
         String detailVo = textOf("sql", "selectAgentDecisionLogDetailVo");
         assertTrue(detailVo.contains("input_context"), "详情应包含 input_context（审计回放需要）\nSQL=" + detailVo);
         assertTrue(detailVo.contains("llm_output"), "详情应包含 llm_output\nSQL=" + detailVo);
+    }
+
+    @Test
+    @DisplayName("按 request_id 的链路查询：升序 + LIMIT + 参数绑定 + 带 JSON 上下文")
+    void traceQueryIsOrderedAndBounded() throws Exception
+    {
+        String trace = textOf("select", "selectAgentDecisionLogTrace");
+
+        // 参数绑定（不得拼字符串——requestId 来自网关注入的头，属于不可信输入）
+        assertTrue(trace.contains("request_id = #{requestId}"),
+                "链路查询必须用 #{} 参数绑定\nSQL=" + trace);
+        // 升序：列表是 order by id desc，看链路时顺序是反的（审计关心的正是先后顺序）
+        assertTrue(trace.contains("order by id asc"),
+                "链路必须按 id 升序（先发生什么、后发生什么）\nSQL=" + trace);
+        // 有界：request_id 是外部可影响字符串，不能假设“一条链路只有几行”
+        assertTrue(trace.toLowerCase().contains("limit"),
+                "链路查询必须有 LIMIT（无界查询在单主库上是红线，AGENTS §10）\nSQL=" + trace);
+        // 回放需要 JSON 上下文（链路的行数有上限，与列表“不带大 JSON”的取舍不冲突）
+        // 回放需要 JSON 上下文。注意：列定义来自 <include>，DOM 的 getTextContent() 拿不到，
+        // 所以断言“复用了详情列片段”（这也正是真实契约：链路与详情同一组列，列表另一组）。
+        String traceBlock = rawBlock("select", "selectAgentDecisionLogTrace");
+        assertTrue(traceBlock.contains("selectAgentDecisionLogDetailVo"),
+                "链路查询应复用详情列片段（因此自带 input_context / llm_output）\nBLOCK=" + traceBlock);
+        assertTrue(trace.contains("del_flag = '0'"), "链路查询也必须过滤已删除\nSQL=" + trace);
+        assertFalse(trace.toLowerCase().contains("date_format("),
+                "不得用 date_format() 包裹索引列\nSQL=" + trace);
     }
 
     @Test

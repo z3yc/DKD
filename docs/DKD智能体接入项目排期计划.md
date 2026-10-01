@@ -251,7 +251,7 @@
 | 诊断场景浏览器（**V2.13 新增**） | `docs/scripts/assistant-diagnosis-browser-check.cjs` **15/15**：切场景清会话、欢迎语不越权、快捷问题均可答、异常问答带真值、建单被拒 + **数库护栅 32→32** |
 | 端到端（**2026-10-01 新增**） | `docs/scripts/verify-checkpoint-pg.py` **--phase all 18/18 PASS**（含 5 项越权拒绝路径）；**跨进程** write/read 两独立进程 **3/3 PASS**；服务级 `python -m app` → `/health` `checkpoint_backend=postgres`/`checkpoint_open=true`；真实 SSE 会话落 PG 后已清理 |
 | 前端真浏览器（**2026-10-01 新增，FIX-12**） | `docs/scripts/restock-workbench-browser-check.cjs` 在**全栈真环境**下 **29/29 PASS**（菜单/骨架/真实数据 3 行/依据展开/弹窗两模式互斥/原因必填拦截/筛选生效/暂停恢复闭环/控制台 0 错误）；截图 `docs/evidence/restock-workbench-fix12.png`、`restock-paused-fix12.png`。依赖装在项目外（`playwright-core`，AGENTS 禁止擅自引入仓库依赖） |
-| 审计页真浏览器（**2026-10-01 新增，任务 3-7**） | `docs/scripts/agent-audit-browser-check.cjs` **14/14 PASS**：菜单/只读提示条/**无写操作按钮（断言）**/110 条真实留痕/场景与结果中文标签/筛选 110→109 且不再出现其它场景/详情回放 JSON 已格式化缩进/控制台 0 错误；截图 `docs/evidence/agent-audit-3-7.png`、`agent-audit-detail-3-7.png` |
+| 审计页真浏览器（**2026-10-01 新增，任务 3-7；V2.14 补齐「按 request_id 链路」→ 19/19**） | `docs/scripts/agent-audit-browser-check.cjs` **19/19 PASS**：菜单/只读提示条/**无写操作按钮（断言）**/110 条真实留痕/场景与结果中文标签/筛选 110→109 且不再出现其它场景/详情回放 JSON 已格式化缩进/控制台 0 错误；截图 `docs/evidence/agent-audit-3-7.png`、`agent-audit-detail-3-7.png` |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142）；**1-9 新增任务注册 `docs/ddl/agent_restock_job.sql`** 已在本机 dkd 库执行（校验查询 1 行：cron `0 0 6 * * ?` / misfire=2 / concurrent=1 / status=0），幂等重跑退出码 0 |
 | 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**31/31 PASS**，其中 [H] 段为 1-7b 的留痕断言）；**`docs/scripts/verify-1-9-analyze.py`（本轮新增，真 MySQL + 真实 FastAPI，20/20 PASS：鉴权 3 项 / 暂停开关 3 项 / 正常触发 3 项 / 重入安全 2 项 / 留痕 9 项）**；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
@@ -559,7 +559,7 @@ M2 验收脚本与 1-14 对比口径已就绪（V2.12）；Phase 2 首项（2-1 
 | 1 | **3-9 真实数据量下的慢查询演练** | 现在只有 `sleep` 合成的慢查询；拿到 M2 数据后把 `--phase slow-query` 的“不覆盖”改成真实断言 |
 | 2 | ~~2-2/2-3 规则检索骨架~~ → **V2.13 已完成** | 2-2 规则库检索（三级降级 + `phenomenon_usable`）与 2-3 的实体消歧 `find_devices` 已落地，端到端 22/22 |
 | 3 | ~~把 2-1 的读工具接进诊断对话~~ → **V2.13 已完成（按场景挂载）** | 剩 **2-3 多轮问诊循环**与 **2-4 结构化结论**（置信度排序）未做 |
-| 4 | **审计页按 `request_id` 串联视图** | 3-7 页已交付；这是“留痕可回放”的最后一公里（V2.10 记的未做项） |
+| 4 | ~~审计页按 `request_id` 串联视图~~ → **V2.14 已完成** | 后端 `GET /manage/agent/decision-log/trace`（升序 + LIMIT 50 + 参数绑定）+ 前端链路弹窗；浏览器 **19/19**（含 5 项链路断言） |
 | 5 | **把 `verify-3-9-drills.py` 的 `python-down` 相纳入一键回归** | 该相必须先停 Python，目前靠人工；可做成“停→验→起”的自包含脚本 |
 
 ### 10.3 被外部阻塞的（催人，不是写代码）
@@ -672,7 +672,12 @@ cd dkd-vue && npm run build:prod
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` **V1.2**）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0（已定稿）**。*
 
-*版本：**V2.13（2026-10-01，Phase 2 首批能力落地：2-1 / 2-2 / 2-3 的一部分）**。本次变更：
+*版本：**V2.14（2026-10-01，3-7 收官：审计「按 request_id 链路」+ 接口文档补齐）**。本次变更：
+① 新增 `GET /manage/agent/decision-log/trace`（按请求号串联同一次请求的全部留痕，**升序** + `limit 50` + 参数绑定；空 requestId 直接报错而不是退化成“最近 50 条”）；前端加「链路」入口与时间线弹窗；
+② 审计页浏览器验收 **14/14 → 19/19**（新增 5 项链路断言；过程中再次踩到 §十 10.6 坑 4：Element Plus 弹窗关闭后 DOM 仍保留，标题断言必须先限定 `:visible`）；
+③ 验收脚本的 `X-Request-Id` 改为**每次调用唯一**（此前写死常量，导致审计页把多次请求串成一条链路，实测 13 行）；
+④ `AgentDecisionLogMapperSqlTest` **+1**（链路查询的升序/LIMIT/参数绑定/复用详情列片段），`mvn` **76 passed**；
+⑤ 排期 §十 10.2b 的四项「仍可立刻开工」只剩 1 项（python-down 相自动化）。上一版如下。
 ① **修正一个事实错误**：2-7 抽样把 `product_type_id=1`（投放工单）当成了维修工单——权威枚举是 `DkdContants.TASK_TYPE_REPAIR=3`；修正后**真实维修工单 5 条**（不是 8 条），样本是 `111`×4 + `后台工作人员取消`×1，结论不变（仍降级规则库），脚本新增运行时枚举自证；
 ② **2-2 规则库检索**落地（三级降级 + `phenomenon_usable` 诚实标记 + `noEvidenceHint`），**2-3 的设备实体消歧**落地；
 ③ **助手按场景挂工具**（补货 2 个场景工具集 / 诊断 3 个），提示词与绑定名单同源并有断言——杜绝“提示与能力脱节”第三次复发；
@@ -1178,3 +1183,34 @@ cd dkd-vue && npm run build:prod
   ③ 诊断场景**未在浏览器里跑“多轮上下文”**（当前每问一轮都是新主题，会话上下文沿用同一 thread，
      但“追问上一台设备”这种行为未验）；
   ④ 前端**未做逐像素视觉评审**（执行环境不支持读图，断言都在 DOM 层）。
+
+### 2026-10-01 开发进度补记（V2.14 · 3-7 收官：按 request_id 的链路视图）
+
+- **为什么补这一刀**：审计页 3-7 交付时只做到了「能按条件筛出留痕、能看单条详情」，
+  但审计最常问的问题其实是**「这一次操作到底发生了什么」**——状态机放行 → 回调建单 → 回写状态
+  可能落在 1~3 条留痕上。列表是**倒序分页**，看链路时顺序是反的、还要翻页。这是 V2.10 记下的未做项。
+
+- **交付**：
+  ① 后端 `GET /manage/agent/decision-log/trace?requestId=...`（`AgentDecisionLogMapper.selectAgentDecisionLogTrace`）：
+     **`order by id asc`**（审计要的是先后顺序）+ **`limit 50`**（request_id 是外部可影响的字符串，
+     不能假设“一条链路只有几行”）+ `#{requestId}` 参数绑定 + 复用详情列片段（因此带两个 JSON 上下文）。
+     空/缺 `requestId` **直接返回错误信封**——退化成“最近 50 条”会得到一条看起来像链路、实际无关的结果。
+  ② 前端：列表行加「链路」按钮（无 `requestId` 的行显示 `—`），弹窗用 `el-timeline` 按时间升序展示，
+     每条带动作/结果标签/目标/失败原因 + 输入上下文 JSON（复用详情的 `pretty()`，不用 `v-html`）。
+  ③ 测试：`AgentDecisionLogMapperSqlTest` +1（升序 / LIMIT / 参数绑定 / 不得 `date_format` / 复用详情列片段）；
+     浏览器脚本 +5 项断言（标题带请求号、至少 1 条、动作可读、带上下文、无控制台错误）。
+
+- **实测**：`mvn -pl dkd-admin -am test` **76 passed**；真库接口验证：
+  `requestId=acceca4a…` → 1 行（`chat.respond`，含 79 字符上下文）；
+  多留痕样例 `verify-assistant-diagnosis` → **13 行且严格升序**（198→210）；空 `requestId` → `code=500` + 中文原因；
+  浏览器 **19/19**。
+
+- **过程中的两个真发现（都属“环境/工具陷阱”，不是产品缺陷）**：
+  1. **Element Plus 弹窗关闭后 DOM 仍保留**（§十 10.6 坑 4）又咬了一次：链路标题断言先命中了
+     已关闭的「详情」弹窗标题，必须限定 `.el-dialog:visible` 才拿到正确的那个。
+  2. **验收脚本把 `X-Request-Id` 写死常量**：于是审计页的「链路」把**多次请求**串成一条（实测 13 行）。
+     `X-Request-Id` 的语义是“一次请求一个”，已改成 `f"verify-assistant-xxx-{uuid4[:8]}"`——
+     否则这个新功能在验收环境里展示的正是它要避免的那种“看起来像链路、其实不是”的结果。
+
+- **未做（不隐瞒）**：链路视图的**导出**、以及跨 `request_id` 的「同一天同一设备的所有决策」聚合视图未做
+  （当前可用「筛选 + 链路」凑合）；截图仍未逐像素视觉评审（执行环境不支持读图）。

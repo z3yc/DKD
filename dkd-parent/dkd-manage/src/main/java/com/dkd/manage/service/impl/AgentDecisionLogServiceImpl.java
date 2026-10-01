@@ -36,4 +36,10 @@ public class AgentDecisionLogServiceImpl implements IAgentDecisionLogService
     {
         return agentDecisionLogMapper.selectAgentDecisionLogById(id);
     }
+
+    @Override
+    public List<AgentDecisionLog> selectTraceByRequestId(String requestId)
+    {
+        return agentDecisionLogMapper.selectAgentDecisionLogTrace(requestId);
+    }
 }

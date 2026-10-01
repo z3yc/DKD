@@ -132,4 +132,23 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         where id = #{id} and del_flag = '0'
     </select>
 
+    <!--
+      按 request_id 取整条链路（审计“回放”的最后一公里）。
+
+      三个刻意的取舍：
+
+      1. **升序**（order by id asc）：列表是倒序分页，会把同一条链路的先后顺序打反；
+         而审计要回答的正是“先发生了什么、然后怎么样”（放行 → 回调 → 回写）。
+      2. **带两个 JSON 上下文**：一条链路通常只有 1~3 行，带上才能一眼看完整个决策，
+         不必逐条点详情（与列表“不带大 JSON”的取舍并不矛盾：这里的行数有上限）。
+      3. **仍然 LIMIT**：request_id 是外部可影响的字符串（网关注入 + 定时任务构造），
+         不能假设“一条链路一定只有几行”——无界查询在单主库上是红线（AGENTS §10）。
+    -->
+    <select id="selectAgentDecisionLogTrace" parameterType="String" resultMap="AgentDecisionLogResult">
+        <include refid="selectAgentDecisionLogDetailVo"/>
+        where request_id = #{requestId} and del_flag = '0'
+        order by id asc
+        limit 50
+    </select>
+
 </mapper>

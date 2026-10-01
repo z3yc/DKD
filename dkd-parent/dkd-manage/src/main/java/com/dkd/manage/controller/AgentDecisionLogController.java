@@ -7,11 +7,13 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.dkd.common.core.controller.BaseController;
 import com.dkd.common.core.domain.AjaxResult;
 import com.dkd.common.core.page.TableDataInfo;
+import com.dkd.common.utils.StringUtils;
 import com.dkd.manage.domain.AgentDecisionLog;
 import com.dkd.manage.service.IAgentDecisionLogService;
 
@@ -63,5 +65,25 @@ public class AgentDecisionLogController extends BaseController
     public AjaxResult getInfo(@PathVariable("id") Long id)
     {
         return AjaxResult.success(agentDecisionLogService.selectAgentDecisionLogById(id));
+    }
+
+    /**
+     * 按 {@code X-Request-Id} 取整条链路（**升序**），用于“这一次请求到底发生了什么”。
+     *
+     * <p>与列表按 {@code requestId} 过滤的区别：列表是**倒序 + 分页**，看链路时顺序是反的、
+     * 而且需要翻页；审计要回答的恰恰是先后顺序（放行 → 回调建单 → 回写状态）。
+     *
+     * <p>为什么显式校验 {@code requestId} 非空：它是查询条件，空值会退化成“取最近的 50 条留痕”，
+     * 那看起来像一个“链路”，实际上与本次请求无关——这种查询比报错危险。
+     */
+    @PreAuthorize("@ss.hasPermi('manage:agentAudit:query')")
+    @GetMapping("/trace")
+    public AjaxResult trace(@RequestParam(value = "requestId", required = false) String requestId)
+    {
+        if (StringUtils.isEmpty(requestId))
+        {
+            return AjaxResult.error("requestId 不能为空（按请求号串联留痕）");
+        }
+        return AjaxResult.success(agentDecisionLogService.selectTraceByRequestId(requestId.trim()));
     }
 }

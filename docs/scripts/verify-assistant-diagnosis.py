@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
 from pathlib import Path
 
 _AGENT_ROOT = Path(__file__).resolve().parents[2] / "dkd-agent"
@@ -74,7 +75,13 @@ async def ask(client: httpx.AsyncClient, question: str, *, scene: int = SCENE_DI
         "POST",
         f"{AGENT_BASE}/agent/chat",
         json={"message": question, "scene": scene},
-        headers={"X-Agent-User": "1", "X-Request-Id": "verify-assistant-diagnosis"},
+        headers={
+            "X-Agent-User": "1",
+            # request_id **每次调用唯一**：`X-Request-Id` 的语义是“一次请求一个”；
+            # 写死常量会让审计页的「按 request_id 串联链路」把多次请求混成一条
+            # （实测 13 行，既看不出顺序也不是想留下的证据）。
+            "X-Request-Id": f"verify-assistant-diagnosis-{uuid.uuid4().hex[:8]}",
+        },
         timeout=240.0,
     ) as resp:
         event = ""
