@@ -239,7 +239,7 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | **65 files already formatted** |
-| `uv run pytest` | **343 passed / 14 deselected**（累计本轮 **+23**：助手工具与提示词契约 4 + SSE 存储类分类 2 + 2-1 异常检测 5 + 2-2 规则检索 6 + 场景工具一致性/场景绑定 5 + 其它 1）；`ruff check`/`format` 全过。覆盖率数字不逐轮抄写，新分支的真库覆盖由下面的**真环境脚本**承担 |
+| `uv run pytest` | **354 passed / 14 deselected**（V2.16 再 +11：2-4 结论组装）（累计本轮 **+23**：助手工具与提示词契约 4 + SSE 存储类分类 2 + 2-1 异常检测 5 + 2-2 规则检索 6 + 场景工具一致性/场景绑定 5 + 其它 1）；`ruff check`/`format` 全过。覆盖率数字不逐轮抄写，新分支的真库覆盖由下面的**真环境脚本**承担 |
 | `mvn -pl dkd-admin -am test` | **Tests run: 75, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 10 / TaskCreate 6 / AgentTask 10 / ReportMapperSql 5 / AgentDecisionLogMapperSql 4 / **TaskServiceCreateConflict 6**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `uv run ruff check` / `ruff format --check` | All checks passed；**65 files** already formatted |
 | `npm run build:prod`（**本轮新增前端交付**） | exit 0（仅既有 chunk 体积告警）；新增 `views/manage/restock/**` 已按路由分包（`RestockAdjustDialog` / `RestockReasonDialog` 各自成 chunk） |
@@ -247,7 +247,7 @@
 | M2 验收载体（**V2.12 新增**） | `docs/scripts/verify-1-13-m2-acceptance.py`：只读相 **10/10 PASS**（11 台设备 / 3 区域 / 当日计划 3 条 / 数量夹取断言）；`--confirm-write` **15/15 PASS**（真建 1 张 → 幂等复点不建第二张 → 写护栏“新增 1 == 成功 1” → `--rollback-task` 软取消）；**「10 台」本机不可能达成**（`BLOCKED`，前置 FIX-6） |
 | 1-14 双跑对比（**V2.12 新增**） | `docs/scripts/compare-1-14-rule-vs-baseline.py`（只读）口径验证通过；**关键发现：偏差 +212% 的根因是 FIX-5 容量口径**，不是算法——见 `docs/agent-restock-1-14-comparison-caliber.md` |
 | 助手真库端到端（**V2.12 复跑**） | `docs/scripts/verify-assistant-tools.py` **16/16 PASS**（成本优化后无回归）；浏览器 `assistant-mode-hint-check.cjs` **llm 8/8 / echo 7/7**；`restock-workbench-browser-check.cjs` **30/30**（含写入护栏 5→5）、`agent-audit-browser-check.cjs` **14/14**、`agent-assistant-browser-check.cjs` **10/10** |
-| 诊断场景真库 + 真 LLM（**V2.13 新增**） | `docs/scripts/verify-assistant-diagnosis.py` **22/22**（工具直连 9 + 端到端 10 + 不写护栏 3）：异常条数与独立 SQL 一致；历史工单命中 2 条、**可用 0 条**且回复明说“没有一条能当故障现象用”；模糊指代列出 8 台候选且**零编造编号**；建单被拒且 `tb_task` 32→32 |
+| 诊断场景真库 + 真 LLM（**V2.13 新增；V2.16 扩到工具直连 17 项**） | `docs/scripts/verify-assistant-diagnosis.py`：工具直连 **17/17**（含 2-4 结构化结论的 8 项断言：证据条数与库一致 / 每条带来源 / 置信度按规则 / 未知项含“日志未采集” / **无病因字段** / 动作指向真实入口 / mustSay）；端到端**当日 BLOCKED**（见下）：异常条数与独立 SQL 一致；历史工单命中 2 条、**可用 0 条**且回复明说“没有一条能当故障现象用”；模糊指代列出 8 台候选且**零编造编号**；建单被拒且 `tb_task` 32→32 |
 | 诊断场景浏览器（**V2.13 新增**） | `docs/scripts/assistant-diagnosis-browser-check.cjs` **15/15**：切场景清会话、欢迎语不越权、快捷问题均可答、异常问答带真值、建单被拒 + **数库护栅 32→32** |
 | 端到端（**2026-10-01 新增**） | `docs/scripts/verify-checkpoint-pg.py` **--phase all 18/18 PASS**（含 5 项越权拒绝路径）；**跨进程** write/read 两独立进程 **3/3 PASS**；服务级 `python -m app` → `/health` `checkpoint_backend=postgres`/`checkpoint_open=true`；真实 SSE 会话落 PG 后已清理 |
 | 前端真浏览器（**2026-10-01 新增，FIX-12**） | `docs/scripts/restock-workbench-browser-check.cjs` 在**全栈真环境**下 **29/29 PASS**（菜单/骨架/真实数据 3 行/依据展开/弹窗两模式互斥/原因必填拦截/筛选生效/暂停恢复闭环/控制台 0 错误）；截图 `docs/evidence/restock-workbench-fix12.png`、`restock-paused-fix12.png`。依赖装在项目外（`playwright-core`，AGENTS 禁止擅自引入仓库依赖） |
@@ -379,7 +379,8 @@
 · **2-1** 异常检测只读工具（订单异常/库存异常变动）+ 单测 5 + 真库 live 2（真库识别卡单、0 误报）；
 · **2-2** 历史维修工单**规则库**检索（三级降级 + `phenomenon_usable` 诚实标记）+ 单测 6 + live 2；
 · **2-3 的一部分** 设备实体消歧 `find_devices` + **按场景挂载工具**（补货 2 / 诊断 3）+ 提示词-工具一致性断言；端到端 **22/22**（诊断场景真库 + 真 LLM）与浏览器 **15/15**；
-**未做**：2-3 的多轮问诊循环、2-4 结构化结论（置信度排序）、2-5~2-9 |
+**未做**：2-3 的多轮问诊循环、2-5~2-9；
+· **2-4（结构化结论）已落地**：`app/services/diagnosis.py`（纯函数组装）+ 工具 `build_device_diagnosis`——只输出**证据 / 未知项 / 平台动作**与**由证据强度按固定规则算出**的 `confidence`，**刻意没有病因字段**（无知识库就不产出病因，FIX-22）；单测 11 项 + 真库工具直连 17/17 |
 | Phase 3（Copilot + 收尾，3-1~3-10） | M3 验收通过；且 3-4 受控 NL2SQL 需先有 3-2 评测集 | ⏳ 未开工 |
 | Phase 4（上线收尾，4-1~4-4） | M4 验收通过；4-2 上线评审需 §八 全部 🔴 项关闭 | ⏳ 未开工 |
 
@@ -672,7 +673,11 @@ cd dkd-vue && npm run build:prod
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` **V1.2**）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0（已定稿）**。*
 
-*版本：**V2.15（2026-10-01，3-9 最后一相自包含 + 一处“假绿”修正）**。本次变更：
+*版本：**V2.16（2026-10-01，2-4 结构化诊断结论 + 一次被配额拦住的诚实记录）**。本次变更：
+① **2-4 落地**（`app/services/diagnosis.py` + 工具 `build_device_diagnosis`）：结构化输出**证据 / 未知项 / 平台动作 / confidence**，其中 `confidence` 由证据强度按固定规则算出（可单测可回归），**刻意不含病因字段**——本平台没有结构化故障知识库（FIX-22），给“病因排序”就是编领域知识；
+② 单测 **+11**（`tests/test_diagnosis.py`：置信度规则 / 未知项 / 反面断言“不得出现病因字段” / camelCase 别名）；真库工具直连 **17/17**；
+③ **诚实记录**：当日真 LLM 端到端**被 0-12 的每日 token 配额拦住**（201136/200000，被这一整天的验收跑满）——已把“未验到”与“失败/通过”分开：脚本报 `BLOCKED` 且退出码 **2**，并写明复跑条件；runbook 补「退出码约定」（别用“调高配额”让报告变绿）；
+④ 门禁：ruff 全过 / pytest **354 passed**。上一版如下。
 ① `verify-3-9-drills.py --phase python-down --auto-manage-service`：脚本自己**停 :8090 → 经 Java 网关验降级帧 → 用 `python -m app` 重启并等 `/health`**（默认关闭，不擅自停别人的进程）；
 ② **修正一处长期“假绿”**：该相位原本在 Python 已停时**直连 :8090 发对话**，必然 `httpx.ConnectError` 把脚本打挂——也就是说它此前只验到了网关状态上报，**降级帧从未被这个脚本验过**；改为经 Java 网关观察后补 3 项断言（`degrade=true` / 文案指向智能体服务 / `finish_reason=degrade`），现 **7/7**；
 ③ 五相全绿：concurrent 4/4 · python-down 7/7 · pg-recover 4/4 · sqlite-corrupt 7/7 · slow-query 8/8；
@@ -1243,3 +1248,39 @@ cd dkd-vue && npm run build:prod
 
 - **§十 10.2b 的「仍可立刻开工」清单现在清零**：剩余项要么卡在外部输入（FIX-5/6/7/22），
   要么属于下一步的 Phase 2 设计（2-3 多轮问诊、2-4 结构化结论）。
+
+### 2026-10-01 开发进度补记（V2.16 · 2-4 结构化诊断结论 + 被配额拦住的一天）
+
+- **交付：2-4 结构化诊断结论**（`app/services/diagnosis.py` + 工具 `build_device_diagnosis`）
+  - **纯函数组装**（`compose_diagnosis(profile, order_anomalies, inventory_anomalies, history, inflight, stock, window)`）：
+    不连库、不看时钟 → 口径可单测、可回归；取数仍由工具层负责（白名单/分批/超时三道护栏在那里）。
+  - 输出四样：`evidence[]`（每条带**来源表与口径**，可回库对账）、`unknowns[]`（平台观测不到的部分**显式列出**）、
+    `recommendedActions[]`（**只指向平台真实入口**：工单管理/退款核对/留痕回填）、`confidence` + `confidenceBasis`。
+  - **置信度是证据强度的确定性函数**（写在本文件里、可单测）：
+    `vend_failed`（已扣款未出货）或 ≥2 条异常或 ≥1 条库存异常 → high；恰好 1 条订单异常 → medium；
+    0 条 → none（并**明说“没检出 ≠ 设备正常”**）。
+  - **刻意没有 `candidateCauses`**：本平台维修工单只有备注字段（FIX-22 实测 `111`×4 + `后台工作人员取消`×1），
+    没有任何可检索的故障原因/处置。在这种数据上给“病因排序”就是编造领域知识——比“没有结论”危险得多。
+    这条用**反射断言**钉住（`test_conclusion_has_no_candidate_causes_field`），不写在注释里。
+  - 字段名 snake_case + `serialization_alias`（出口 camelCase）：既满足前端契约，也不触发 ruff 的 N815。
+
+- **验证（实跑）**：
+  - 单测 **+11**（`tests/test_diagnosis.py`）：置信度四档规则 / 历史不可用进未知项 / 容量不一致进未知项 /
+    动作只指向真实入口且不含技术处置 / camelCase 别名 / **不得出现病因字段**；
+  - 真库工具直连 **17/17**（`verify-assistant-diagnosis.py --phase tools`）：证据 10 条 == 库中异常 10 条、
+    `confidence=high` 且 basis 可读、未知项含“库存日志未采集”与 FIX-5 容量不一致、动作含工单管理入口；
+  - 门禁：`ruff` 全过 / `pytest` **354 passed**（+11）。
+
+- **诚实记录：真 LLM 端到端今天**没验到**——被 0-12 的每日 token 配额拦住**（`201136/200000`）。
+  这是**成本护栏在正常工作**（今天几轮真库 e2e 验收把 20 万 token 配额跑满了），不是能力失败。
+  处置：脚本把「未验到」与「失败/通过」**分开**——命中 `code=429`/“token 已达上限”时打印
+  `⛔ … 未验到（未通过≠失败≠通过）`、计入 `BLOCKED`、**退出码 2**（0=全绿 / 1=有失败 / 2=有未验到）。
+  为什么较真这个：如果不区分，几天之内团队就会开始用“调高配额”让报告变绿，而那条护栏正是为了防成本失控。
+  runbook 已补「退出码约定」。复跑条件：次日重跑，或临时调高
+  `.env` 的 `DKD_AGENT_TOKEN_DAILY_LIMIT_PER_USER`（**仅用于验收**）。
+
+- **未做（不隐瞒）**：
+  ① 2-4 的**前端渲染**（置信度进度条）未做：结论目前经助手文字转述，前端要画进度条需要把结构化 JSON
+     以新帧型透出（SSE 协议 + 前端卡片，属 2-6）；
+  ② 2-3 的**多轮问诊循环**未做；
+  ③ 真 LLM 的结论问答因配额未验到（工具层已验、模型转述待次日复跑）。

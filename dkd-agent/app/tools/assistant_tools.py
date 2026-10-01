@@ -39,6 +39,7 @@ from app.graphs.restock_decisions import summarize_plan
 from app.graphs.restock_plan_store import SqlPauseStore, SqlPlanStore, plan_from_row
 from app.graphs.restock_state import status_label
 from app.prompts.assistant_chat import tool_names_for_scene
+from app.services.diagnosis import compose_diagnosis
 from app.tools import read_tools
 from app.tools.read_tools import ToolError, default_sales_window
 
@@ -610,6 +611,88 @@ async def _search_device_history(inner_code: str, days: int = DEFAULT_CASE_WINDO
     return _json(payload)
 
 
+class _DiagnosisArgs(BaseModel):
+    inner_code: str = Field(description="售货机编码；未确认时先用 find_devices 定位")
+    days: int = Field(
+        default=DEFAULT_ANOMALY_WINDOW_DAYS, description="异常回看天数（1-3650），默认 90"
+    )
+    case_days: int = Field(
+        default=DEFAULT_CASE_WINDOW_DAYS, description="历史维修单回看天数（1-2000），默认 2000"
+    )
+
+
+async def _build_device_diagnosis(
+    inner_code: str,
+    days: int = DEFAULT_ANOMALY_WINDOW_DAYS,
+    case_days: int = DEFAULT_CASE_WINDOW_DAYS,
+) -> str:
+    """结构化诊断结论（2-4）：**证据 + 未知项 + 平台动作**，不含病因推断。
+
+    为什么要有这个工具（而不是让模型自由发挥）：自由发挥的“病因 + 置信度”无法复核、
+    无法回归，而且本平台没有结构化的故障知识库（FIX-22），任何病因都是编的。
+    这个工具把**能说清的**（证据/未知/动作）结构化，`confidence` 由证据强度按固定规则算出，
+    模型只需如实转述——它因此没有“顺手补一个病因”的空间。
+    """
+    code = (inner_code or "").strip()
+    if not code:
+        return _json({"error": "缺少设备编码（inner_code）"})
+    try:
+        window_days = max(1, min(int(days), 3650))
+        case_window_days = max(1, min(int(case_days), 2000))
+    except (TypeError, ValueError):
+        window_days = DEFAULT_ANOMALY_WINDOW_DAYS
+        case_window_days = DEFAULT_CASE_WINDOW_DAYS
+
+    start, end = read_tools.default_sales_window(days=window_days)
+    case_start, case_end = read_tools.default_case_window(days=case_window_days)
+    try:
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            profile = await read_tools.get_machine_profile(session, code)
+            if profile is None:
+                return _json({"error": f"未找到设备 {code}（编码是否正确？）"})
+            orders = await read_tools.list_order_anomalies(
+                session, inner_codes=[code], start=start, end=end
+            )
+            inventory = await read_tools.list_inventory_anomalies(
+                session, inner_codes=[code], start=start, end=end
+            )
+            history = await read_tools.search_history_cases(
+                session, inner_code=code, start=case_start, end=case_end, with_anomalies=False
+            )
+            inflight = await read_tools.list_inflight_tasks(session, inner_codes=[code])
+            stock = await read_tools.list_channel_stock(session, inner_codes=[code])
+    except read_tools.ToolError as exc:
+        logger.warning("助手工具 build_device_diagnosis 被拒/超时：%s", exc)
+        return _json({"error": f"诊断取数被拒或超时：{exc}"})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("助手工具 build_device_diagnosis 失败：%s", type(exc).__name__)
+        return _json({"error": f"诊断取数失败（{type(exc).__name__}）"})
+
+    conclusion = compose_diagnosis(
+        profile=profile,
+        order_anomalies=orders,
+        inventory_anomalies=inventory,
+        history=history,
+        inflight=inflight,
+        stock=stock,
+        window={
+            "anomalyDays": window_days,
+            "anomalyStart": start.isoformat(),
+            "anomalyEnd": end.isoformat(),
+            "caseDays": case_window_days,
+        },
+    )
+    payload: dict[str, Any] = conclusion.model_dump(mode="json", by_alias=True)
+    payload["mustSay"] = (
+        "**本结论不包含病因推断**（平台没有结构化的故障知识库，FIX-22）："
+        "只能转述 evidence / unknowns / recommendedActions 与 confidenceBasis，"
+        "**不得自行补一个“可能原因”或“处置步骤”**；"
+        "`unknowns` 必须一并告知用户（否则“没检出异常”会被理解成“设备没问题”）。"
+    )
+    return _json(payload)
+
+
 def build_diagnosis_tools() -> list[StructuredTool]:
     """诊断场景（scene=3）的只读工具集（2-1/2-2/2-3）。
 
@@ -634,6 +717,18 @@ def build_diagnosis_tools() -> list[StructuredTool]:
                 "库存无单扣减/账实不符。问“这台机器出了什么问题/为什么不出货/有没有异常”时用它。"
             ),
             args_schema=_AnomalyArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_build_device_diagnosis,
+            name="build_device_diagnosis",
+            description=(
+                "生成某台设备的结构化诊断结论：证据清单（订单/库存异常、在途工单、历史维修单）、"
+                "**未知项**（平台观测不到的部分）、可执行的平台动作、"
+                "以及由证据强度算出的 confidence。"
+                "需要“这台机器到底怎么回事/给我一个结论”时用它——它**不含病因推断**（平台无故障知识库），"
+                "不要在此基础上自行编造原因或处置步骤。"
+            ),
+            args_schema=_DiagnosisArgs,
         ),
         StructuredTool.from_function(
             coroutine=_search_device_history,

@@ -62,6 +62,7 @@ TOOL_NAMES_BY_SCENE: dict[int, tuple[str, ...]] = {
         "find_devices",
         "list_device_anomalies",
         "search_device_history",
+        "build_device_diagnosis",
         "get_machine_inventory",
         "list_inflight_work_orders",
     ),

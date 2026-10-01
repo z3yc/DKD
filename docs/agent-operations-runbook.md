@@ -215,8 +215,21 @@ DKD_AGENT_ENABLED=false   # 网关层：/agent/status 报 enabled=false；对话
 | `docs/scripts/verify-1-13-m2-acceptance.py` | M2「≥10 台真机全闭环」一键验收 + 报告（**默认只读**） | 只读 10/10；`--confirm-write` 15/15（已回退） |
 | `docs/scripts/compare-1-14-rule-vs-baseline.py` | 规则版 vs 基线引擎建议量双跑对比 + 3-8 三项指标（只读） | 口径验证通过（n=2，偏差根因为 FIX-5） |
 | `docs/scripts/verify-assistant-tools.py` | 助手只读工具真库取数 + 端到端 + **不写护栏** | 16/16 |
-| `docs/scripts/verify-assistant-diagnosis.py` | 诊断场景（scene=3）：工具直连 + 真 LLM 端到端（数字来自库 / 无证据时不说有证据）+ 不写护栏 | 22/22（9+10+3） |
+| `docs/scripts/verify-assistant-diagnosis.py` | 诊断场景（scene=3）：工具直连 **17 项**（含 2-4 结构化结论）+ 真 LLM 端到端 + 不写护栏 | 工具直连 **17/17**；端到端**当日 BLOCKED**（见下「配额」） |
 | `docs/scripts/assistant-diagnosis-browser-check.cjs` | 诊断场景**浏览器**验收：切场景清会话、欢迎语不越权、快捷问题可答、异常问答带真值、建单被拒 + **数库护栅** | 15/15 |
+
+### 6.3 退出码约定（2026-10-01 新增，务必区分“未验到”）
+
+| 退出码 | 含义 | 怎么处理 |
+| --- | --- | --- |
+| 0 | 全部通过 | — |
+| 1 | 有断言 FAIL | 当缺陷处理 |
+| **2** | **有项“未验到”（BLOCKED）** | **不是通过也不是失败**：被环境/配额拦住，需换个条件复跑 |
+
+`verify-assistant-diagnosis.py` 已按此实现：命中 **当日 token 配额熔断**（`code=429` / “token 已达上限”）时
+报 `BLOCKED` 而不是一堆 `FAIL`，并打印复跑方式。**为什么必须分开**：本项目的每次验收都会真调 LLM，
+一天跑几轮就会把每日配额（默认 20 万 token/用户）跑满——若把“护栏拦住了 LLM”报成“能力失败”，
+几天之后团队就会开始用“调高配额”来让报告变绿，那正好毁掉这条成本护栏。
 
 ### 7.0 一条来自实际踩坑的断言纪律（2026-10-01）
 

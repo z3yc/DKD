@@ -131,6 +131,7 @@ def test_assistant_tools_are_read_only():
         "find_devices",
         "list_device_anomalies",
         "search_device_history",
+        "build_device_diagnosis",
     }, "工具清单变了就要同步这份断言（它是“能力面”的唯一清单）"
     forbidden = ("create", "confirm", "adjust", "skip", "pause", "resume", "update", "delete")
     for name in names:
@@ -447,7 +448,12 @@ def test_scenes_without_tools_say_so_in_prompt():
 def test_diagnosis_scene_gets_diagnosis_tools_not_restock_plans():
     """场景 3 拿到的是诊断工具（消歧/异常/历史），不是补货清单工具。"""
     names = {t.name for t in tools_for_scene(SCENE_DIAGNOSE)}
-    assert {"find_devices", "list_device_anomalies", "search_device_history"} <= names
+    assert {
+        "find_devices",
+        "list_device_anomalies",
+        "search_device_history",
+        "build_device_diagnosis",
+    } <= names
     assert "list_restock_suggestions" not in names, (
         "诊断场景不需要补货清单（省 schema token，也少干扰）"
     )

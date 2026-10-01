@@ -143,6 +143,14 @@ Python 侧日志与 `agent_decision_log.request_id` 都带它。**排障时先�
 | `find_devices` | 按**口述线索**定位设备：编号精确 → 编号前缀 → 点位名 → 地址（如“五道口”） | 带 `matchReason`；多台命中时给 `hint` 要求用户确认；**一条都没有时明确禁止模型自己编号** |
 | `list_device_anomalies` | 某设备近 N 天（默认 90，上限 3650）的异常：卡单（`status=1` 超阈值）、出货失败未退款（`status=3` 且 `pay_status∈{1,2}`）、库存无单扣减/账实不符 | 带 `byKind` 分组计数、`caliber`、`dataWarning`（`tb_inventory_log` 为空时“0 条 ≠ 没问题”）；窗口被夹取时给 `windowClampedFromDays` |
 | `search_device_history` | 历史维修工单检索（**规则库**，不是语义检索）：`same_device → same_model → same_region` 三级降级 | 每条带 `phenomenonUsable`（描述能不能当故障现象）与 `confidence`+`confidenceBasis`；无可用案例时给 `noEvidenceHint` + `mustSay`（提示词要求必须照做） |
+| `build_device_diagnosis` | **结构化诊断结论**（2-4）：证据清单 + 未知项 + 可执行的平台动作 + 由证据强度算出的 `confidence` | **刻意没有病因字段**（本平台无结构化故障知识库，FIX-22）：`evidence[]` 每条带来源表与口径、`unknowns[]` 显式列出平台观测不到的部分（如库存日志未采集）、`recommendedActions[]` 只指向平台真实入口；`confidenceBasis` 说明置信度源自哪几条证据。附带 `mustSay` 要求模型不得自行补病因/处置步骤 |
+
+> ⚠️ **为什么结论里没有“病因/可能原因”**：本平台维修工单只有备注字段（FIX-22 实测：5 条维修单描述是
+> `111`/`后台工作人员取消`），**没有任何可检索的故障原因/处置知识**。在这种数据上给“病因排序”就是编领域知识。
+> 因此 `build_device_diagnosis` 只输出**可复核的三样**（证据 / 未知 / 平台动作）+ 由规则算出的 `confidence`；
+> 等 FIX-22 落地（结构化现象/原因/处置或厂商故障码表）之后，才会在这里按证据匹配案例。
+> ⚠️ `confidence` 的档位对应前端进度条刻度（high/medium/low/none），**它是证据强度的刻度，不是概率**——
+> 所以前端必须同时展示 `confidenceBasis`，否则“55%”会被读成“55% 的概率是这个原因”。
 
 > ⚠️ 诊断场景的**诚实契约比能力本身重要**：本平台维修工单只有备注字段（FIX-22），
 > 实测 5 条维修单的描述是 `111`×4 + `后台工作人员取消`×1——**没有一条是故障现象**。
