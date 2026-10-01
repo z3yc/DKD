@@ -48,6 +48,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   // 发一句（用报障里的原话，确保是同一个场景）
   await page.fill('.chat-input input', '先看紧急的')
   await page.locator('.chat-input button', { hasText: '发送' }).click({ timeout: 10000 })
+  // 工具轮次占位（§十 任务 6）：助手调只读工具时中间那几秒**不产生 delta 帧**，
+  // 若前端不显示占位，用户看到的就是一个空白气泡（无法区分“在查库”与“卡死”）。
+  // 只在 llm 模式断言：echo 模式没有工具轮次，占位只一闪而过，断言会变成 flaky。
+  const queryingSeen = await page
+    .waitForSelector('.msg.assistant .querying', { timeout: 20000 })
+    .then(() => true)
+    .catch(() => false)
   // 等回复落地（流式结束：光标消失）
   await page.waitForSelector('.msg.assistant .caret', { state: 'detached', timeout: 60000 }).catch(() => {})
   await sleep(1200)
@@ -73,6 +80,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
     ok(/模型：\S+/.test(modelText), `模型名按**服务端实际返回**显示：${modelText}`)
     ok(!/\[echo\]/.test(reply), `回复不再带 [echo] 前缀：${reply.slice(0, 50)}`)
     ok(reply.length > 0, '回复非空')
+    ok(queryingSeen, '工具轮次期间出现「正在查询数据…」占位（气泡不再空白几秒）')
   }
 
   await page.screenshot({ path: `f:/tmp/assistant-mode-${EXPECT}.png`, fullPage: false })

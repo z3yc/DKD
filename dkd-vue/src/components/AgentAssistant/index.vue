@@ -73,7 +73,16 @@
           <div class="bubble">
             <template v-if="msg.role === 'user'">{{ msg.content }}</template>
             <template v-else>
-              <span v-html="renderMarkdown(msg.content)"></span>
+              <!--
+                工具轮次占位（2026-10-01 新增，§十 任务 6）。
+                为什么必须有：助手挂上只读工具后，一次「先看紧急的」要经历
+                「模型决定调工具 → 真查库 → 模型再作答」两步，而**工具轮次不产生 delta 帧**
+                （见 app/graphs/chat_graph.py：命中 tool_calls 那一轮 reply 置空）。
+                于是气泡会空白几秒 —— 用户无法区分“正在查数据”与“卡死了”。
+                这里给出明确占位；caret 仍然保留，保持既有流式观感与 .cjs 验收脚本的锚点不变。
+              -->
+              <span v-if="msg.streaming && !msg.content" class="querying">正在查询数据…</span>
+              <span v-else v-html="renderMarkdown(msg.content)"></span>
               <span v-if="msg.streaming" class="caret">▌</span>
             </template>
             <div v-if="msg.error" class="bubble-err">{{ msg.error }}</div>
@@ -521,6 +530,24 @@ onBeforeUnmount(stop)
 
     .caret {
       color: #409eff;
+    }
+
+    /* 工具轮次占位：与正文区分开（灰色 + 呼吸感），且不带光标闪动，避免被当成“正在打字” */
+    .querying {
+      color: #909399;
+      font-size: 12px;
+      animation: agent-querying-pulse 1.2s ease-in-out infinite;
+    }
+
+    @keyframes agent-querying-pulse {
+      0%,
+      100% {
+        opacity: 0.45;
+      }
+
+      50% {
+        opacity: 1;
+      }
     }
 
     .bubble-err {
