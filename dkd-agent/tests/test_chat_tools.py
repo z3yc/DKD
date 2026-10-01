@@ -523,3 +523,115 @@ async def test_graph_binds_only_the_scene_toolset(monkeypatch, tmp_path):
             assert expected_absent not in bound, f"场景 {scene} 多绑了 {expected_absent}：{bound}"
     finally:
         await store.close()
+
+
+# ------------------------------------------------------------------------------------
+# 2-4 的前端契约：结构化结论随 done 帧下发（且只在真的调了该工具时才有）
+# ------------------------------------------------------------------------------------
+
+
+async def test_done_frame_carries_diagnosis_conclusion(monkeypatch, tmp_path):
+    """本轮调了 `build_device_diagnosis` → done 帧必须带上结构化结论（前端据此画置信度条）。
+
+    为什么单独测这条：它是**跨层契约**（Python 工具返回值 → SSE 帧 → 前端卡片），
+    最容易的坏法是“工具改了字段名/结构，前端那条进度条静默消失”——没有报错、没人发现。
+    """
+    payload = {
+        "innerCode": "A1000001",
+        "confidence": "high",
+        "confidenceBasis": "存在 2 条订单异常",
+        "cannotConclude": False,
+        "unknowns": ["库存日志未采集"],
+        "recommendedActions": ["在「设备管理 → 工单管理」新建维修工单"],
+        "evidence": [{"kind": "order_anomaly:paid_not_vended", "severity": "medium"}],
+        "caliber": "只由平台已采集的数据得出",
+    }
+    fake = _ToolCallingFake(
+        messages=iter(
+            [
+                _tool_call("build_device_diagnosis", {"inner_code": "A1000001"}),
+                AIMessage(content="结论如上。"),
+            ]
+        )
+    )
+    monkeypatch.setattr(chat_graph, "build_chat_model", lambda *a, **kw: fake)
+
+    store = SqliteCheckpointStore(tmp_path / "cp-conclusion.db")
+    saver = await store.open()
+    try:
+        # 工具名必须与模型请求的一致（默认桩叫 get_machine_inventory，名字错就捞不到结论）
+        graph = build_chat_graph(
+            checkpointer=saver,
+            use_llm=True,
+            tools=[_stub_tool(name="build_device_diagnosis", result=json.dumps(payload))],
+        )
+        config = {"configurable": {"thread_id": "t-conclusion"}}
+        # ainvoke 返回最终 state（dict）；别写 .values（那是 dict.values 方法）
+        state = await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "给个结论"}], "scene": SCENE_DIAGNOSE},
+            config=config,
+        )
+    finally:
+        await store.close()
+
+    from app.api.chat import _extract_conclusion
+
+    conclusion = _extract_conclusion(state.get("messages"))
+    assert conclusion is not None, "调了诊断工具却没提取到结论"
+    assert conclusion["confidence"] == "high"
+    assert conclusion["unknowns"] and conclusion["recommendedActions"]
+    # 没调该工具时严格为 None（前端据此决定要不要渲染卡片）
+    assert _extract_conclusion([AIMessage(content="普通回答")]) is None
+
+
+def test_conclusion_extraction_is_defensive():
+    """提取函数必须容错：非法 JSON / 缺 confidence / 超长 → None（宁可不渲染，也不给半个结论）。"""
+    from langchain_core.messages import ToolMessage
+
+    from app.api.chat import (
+        _CONCLUSION_TOOL,
+        _MAX_RAW_CONCLUSION_CHARS,
+        _extract_conclusion,
+    )
+
+    def tool_msg(text: str) -> ToolMessage:
+        return ToolMessage(content=text, name=_CONCLUSION_TOOL, tool_call_id="c1")
+
+    assert _extract_conclusion([]) is None
+    assert _extract_conclusion([tool_msg("not json")]) is None
+    assert _extract_conclusion([tool_msg('{"foo": 1}')]) is None, "缺 confidence 不算结论"
+    assert _extract_conclusion([tool_msg("x" * (_MAX_RAW_CONCLUSION_CHARS + 1))]) is None, (
+        "超长不下发"
+    )
+    low = _extract_conclusion([tool_msg('{"confidence": "low"}')])
+    assert low and low["confidence"] == "low"
+
+    # 真实量级：10 条证据各带 detail 约 5~6KB —— 必须仍然能下发**投影**，
+    # 这是实测踩过的坑（初版给原始内容设了 4000 字符护栏，卡片因此静默不渲染）
+    big = {
+        "confidence": "high",
+        "confidenceBasis": "存在 10 条订单异常",
+        "innerCode": "A1000001",
+        "evidence": [
+            {
+                "kind": "order_anomaly:paid_not_vended",
+                "severity": "medium",
+                "summary": "订单卡在支付完成未出货（很长的中文说明，真实数据里还有订单号与时长）"
+                * 12,
+                "source": "tb_order（口径：status=1 超过阀值未出货）",
+                "detail": {"orderNo": f"NO-{i}", "ageMinutes": 1600000, "payStatus": 1},
+            }
+            for i in range(10)
+        ],
+        "unknowns": ["库存日志未采集"],
+        "recommendedActions": ["在「设备管理 → 工单管理」新建维修工单"],
+    }
+    raw = tool_msg(json.dumps(big, ensure_ascii=False))
+    assert len(raw.content) > 4000, "构造的样本要真的超过初版护栏，否则测不出这个 bug"
+    projected = _extract_conclusion([raw])
+    assert projected is not None, "真实量级的结论必须能被投影下发"
+    assert projected["evidenceCount"] == 10
+    assert projected["evidenceKinds"] == ["order_anomaly:paid_not_vended"]
+    # **投影里不得出现逐条 detail**：那是给模型看的，不该进 done 帧（帧体量 + 前端也不需要）
+    assert "detail" not in json.dumps(projected)
+    assert len(json.dumps(projected, ensure_ascii=False)) < 2000, "投影必须体量有界"

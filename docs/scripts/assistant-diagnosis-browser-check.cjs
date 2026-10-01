@@ -13,7 +13,8 @@
  *   2) 欢迎语只承诺已实现的能力（不再出现“帮你建维修工单”这类写操作承诺）；
  *   3) 快捷问题条里的问题都是**真能回答**的（不含“暂停自动分析/建工单/销量排行”）；
  *   4) 问「A1000001 近五年有异常吗？」→ 回复里出现只有查库才知道的事实（异常条数或订单号）；
- *   5) 让助手建维修工单 → 拒绝 + 引导到人工入口（控制台无错误），并**数库**确认工单总数未增加
+ *   5) 要“诊断结论”→ 渲染结构化结论卡片（置信度条 / 未知项 / 动作，2-4 的前端契约）；
+ *   6) 让助手建维修工单 → 拒绝 + 引导到人工入口（控制台无错误），并**数库**确认工单总数未增加
  *      （文本匹配区分不了“拒绝时的引用”与“真的声称”，所以判据是库不是话术）。
  *
  * 用法：
@@ -117,7 +118,26 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   ok(/异常|卡单|出货失败/.test(reply), '回复在讲异常')
   ok(/\d/.test(reply), '回复带具体数字（不是“请稍后”）')
 
-  // ---- 5) 红线：让它建维修工单 ----
+  // ---- 5) 结构化结论卡片（2-4：置信度条 + 未知项 + 动作）----
+  // 窗口必须写进问题里：工具默认 90 天，本机历史数据在 2023 年 → 短窗口会得到“无异常证据”，
+  // 那时结论卡片虽然也会出现，但渲染分支不同（不可能走到“有证据”的那种）。
+  const reply3 = await ask(`${DEVICE} 近五年到底是什么问题？给我一个诊断结论`)
+  console.log(`  → 结论回复节选：${reply3.replace(/\s+/g, ' ').slice(0, 110)}`)
+  const card = page.locator('.msg.assistant .conclusion').last()
+  const cardVisible = await card.isVisible().catch(() => false)
+  ok(cardVisible, '结论卡片已渲染（done 帧带 conclusion 时前端必须画出来）')
+  if (cardVisible) {
+    const cardText = ((await card.textContent()) || '').replace(/\s+/g, ' ')
+    ok(/诊断结论（结构化）/.test(cardText), `卡片标题正确：${cardText.slice(0, 50)}`)
+    ok(/证据充分|证据有限|证据不足|无异常证据/.test(cardText), `置信度档位可读：${cardText.slice(0, 60)}`)
+    ok((await card.locator('.el-progress').count()) >= 1, '渲染了置信度进度条')
+    ok(/未知项/.test(cardText), '卡片包含「未知项」（必须一并告知，否则“没检出”会被误读）')
+    ok(/不是概率/.test(cardText), '卡片写明置信度不是概率（防止误读）')
+    ok(/可执行动作/.test(cardText), '卡片包含「可执行动作」')
+    await page.screenshot({ path: path.join(os.tmpdir(), 'assistant-diagnosis-conclusion.png'), fullPage: false })
+  }
+
+  // ---- 6) 红线：让它建维修工单 ----
   const before = taskCount()
   const reply2 = await ask(`${DEVICE} 这台机器有问题，帮我建一个维修工单`)
   console.log(`  → 建单回复节选：${reply2.replace(/\s+/g, ' ').slice(0, 120)}`)

@@ -145,6 +145,22 @@ Python 侧日志与 `agent_decision_log.request_id` 都带它。**排障时先�
 | `search_device_history` | 历史维修工单检索（**规则库**，不是语义检索）：`same_device → same_model → same_region` 三级降级 | 每条带 `phenomenonUsable`（描述能不能当故障现象）与 `confidence`+`confidenceBasis`；无可用案例时给 `noEvidenceHint` + `mustSay`（提示词要求必须照做） |
 | `build_device_diagnosis` | **结构化诊断结论**（2-4）：证据清单 + 未知项 + 可执行的平台动作 + 由证据强度算出的 `confidence` | **刻意没有病因字段**（本平台无结构化故障知识库，FIX-22）：`evidence[]` 每条带来源表与口径、`unknowns[]` 显式列出平台观测不到的部分（如库存日志未采集）、`recommendedActions[]` 只指向平台真实入口；`confidenceBasis` 说明置信度源自哪几条证据。附带 `mustSay` 要求模型不得自行补病因/处置步骤 |
 
+### `done` 帧的 `conclusion`（2-4 的前端契约）
+
+当本轮真的调用了 `build_device_diagnosis` 时，`done` 帧带一个 **`conclusion` 投影**（否则严格为 `null`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `innerCode` / `confidence` / `confidenceBasis` / `cannotConclude` | 设备与置信度档位（+**依据**，前端必须一起显示） |
+| `unknowns[]` / `recommendedActions[]` | 未知项与平台动作（各≤10 条） |
+| `evidenceCount` / `evidenceKinds[]` | **只给条数与类型**：逐条证据（含 `detail`）是给模型看的，不进帧 |
+| `caliber` | 口径 |
+
+> 为什么发**投影**而不是原样转发：实测原始结论约 5~6KB（10 条证据各带 detail），
+> 初版设的 4000 字符护栏把整条结论丢掉 → **卡片静默不渲染**（接口 200、回复正常、只差卡片）。
+> done 帧还要经 Java 网关逐字节转发，帧越大越容易被拖慢/截断。
+> 单测锁了两条：**投影里不得出现 `detail`**、**投影 < 2000 字符**。
+
 > ⚠️ **为什么结论里没有“病因/可能原因”**：本平台维修工单只有备注字段（FIX-22 实测：5 条维修单描述是
 > `111`/`后台工作人员取消`），**没有任何可检索的故障原因/处置知识**。在这种数据上给“病因排序”就是编领域知识。
 > 因此 `build_device_diagnosis` 只输出**可复核的三样**（证据 / 未知 / 平台动作）+ 由规则算出的 `confidence`；

@@ -98,7 +98,9 @@ def _chunks(text: str) -> list[str]:
     return [text[i : i + _CHUNK] for i in range(0, len(text), _CHUNK)] or [""]
 
 
-async def _load_turn_from_checkpoint(graph: object, config: dict) -> tuple[str, int, str | None]:
+async def _load_turn_from_checkpoint(
+    graph: object, config: dict
+) -> tuple[str, int, str | None, dict | None]:
     """断线重连：从 checkpoint 读回上一轮回复、历史长度与实际模型（不重跑图，避免重复追加上下文）。
 
     为什么连模型一起读回：meta/done 帧要如实标注本轮是不是走了真 LLM（`mode`），
@@ -111,6 +113,9 @@ async def _load_turn_from_checkpoint(graph: object, config: dict) -> tuple[str, 
         str(values.get("reply", "")),
         len(values.get("messages", [])),
         (str(model) if model else None),
+        # 续传不重跑图，结论只能从 checkpoint 的消息里取（与正常路径同一套提取函数，
+        # 避免“续传看到的是另一种结论”这种只有断线时才暴露的偏差）
+        _extract_conclusion(values.get("messages")),
     )
 
 
@@ -124,6 +129,68 @@ def _mode_of(model: str | None) -> str:
     return "echo" if not model or model == "echo" else "llm"
 
 
+# ----------------------------------------------------------------------------------
+# 结构化诊断结论随 done 帧下发（2-4 的“前端可渲染置信度条”）
+# ----------------------------------------------------------------------------------
+#
+# 为什么从本轮 `messages` 里捞、而不是新增 graph state 字段：0-13 冻结了 state schema
+# （新增字段要走兼容性评审），而 `ToolMessage` 本来就在 messages 里，且只在配了工具时出现。
+# 只取**最后一个**结论（多轮工具调用时以最终那次为准）。
+#
+# ⚠️ 发给前端的是**投影**，不是原样转发（实测教训：10 条证据各带 detail 的原始结论约 5~6KB，
+# 超过了初版的 4000 字符护栏 → 结论卡片静默不渲染）。为什么不把裁剪放前端：
+# done 帧要经 Java 网关逐字节转发，帧越大越容易在链路上被拖慢/截断；而逐条证据（含 detail）
+# 是**给模型看的**，卡片只需要档位/依据/未知项/动作与证据条数。所以在这里投影，并在测试里
+# 断言“detail 不得出现在帧里”。
+_CONCLUSION_TOOL = "build_device_diagnosis"
+# 输入侧护栏：ToolMessage 超过这个长度就不解析（防止把整坨内容塞进 done 帧）
+_MAX_RAW_CONCLUSION_CHARS = 20000
+# 投影里的列表上限（卡片是给人扫读的，不是完整报告）
+_MAX_PROJECTED_ITEMS = 10
+
+
+def _compact_conclusion(payload: dict) -> dict:
+    """把工具返回的完整结论投影成**给前端卡片用的字段**（顺序稳定、体量有界）。"""
+    evidence = [e for e in (payload.get("evidence") or []) if isinstance(e, dict)]
+    return {
+        "innerCode": payload.get("innerCode"),
+        "confidence": payload.get("confidence"),
+        "confidenceBasis": payload.get("confidenceBasis"),
+        "cannotConclude": payload.get("cannotConclude"),
+        "unknowns": [str(u) for u in (payload.get("unknowns") or [])][:_MAX_PROJECTED_ITEMS],
+        "recommendedActions": [str(a) for a in (payload.get("recommendedActions") or [])][
+            :_MAX_PROJECTED_ITEMS
+        ],
+        "evidenceCount": len(evidence),
+        "evidenceKinds": sorted({str(e.get("kind")) for e in evidence})[:_MAX_PROJECTED_ITEMS],
+        "caliber": payload.get("caliber"),
+    }
+
+
+def _extract_conclusion(messages: object) -> dict | None:
+    """取本轮最后一次 `build_device_diagnosis` 的结论（没有/不可用 → None）。
+
+    三种情况都返回 None，宁可不渲染也不给半个结论：本轮没调该工具 / 内容不是合法 JSON /
+    缺 `confidence`（说明不是本工具的返回）。
+    """
+    for msg in reversed(list(messages or [])):  # type: ignore[arg-type]
+        if getattr(msg, "name", None) != _CONCLUSION_TOOL:
+            continue
+        content = getattr(msg, "content", "")
+        text = content if isinstance(content, str) else str(content)
+        if len(text) > _MAX_RAW_CONCLUSION_CHARS:
+            logger.info("诊断结论原始内容过长（%s 字符），本轮不下发结论卡片", len(text))
+            return None
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(payload, dict) and "confidence" in payload:
+            return _compact_conclusion(payload)
+        return None
+    return None
+
+
 class _TurnOutcome:
     """一轮生成的收尾信息（流式期间逐步填充，供 done 帧与留痕/计量共用）。
 
@@ -132,7 +199,15 @@ class _TurnOutcome:
     用带 __slots__ 的小类比 dict 更不容易写错字段名。
     """
 
-    __slots__ = ("reply", "streamed", "history_len", "model", "tokens_in", "tokens_out")
+    __slots__ = (
+        "reply",
+        "streamed",
+        "history_len",
+        "model",
+        "tokens_in",
+        "tokens_out",
+        "conclusion",
+    )
 
     def __init__(self) -> None:
         self.reply = ""
@@ -141,6 +216,8 @@ class _TurnOutcome:
         self.model: str | None = None
         self.tokens_in = 0
         self.tokens_out = 0
+        # 结构化诊断结论（2-4）：仅当本轮调用了 build_device_diagnosis 时非空
+        self.conclusion: dict | None = None
 
 
 def _chunk_text(token: object) -> str:
@@ -201,6 +278,7 @@ async def _stream_graph_tokens(
     outcome.model = str(model) if model else None
     outcome.tokens_in = int(final_state.get("tokens_in", 0) or 0)
     outcome.tokens_out = int(final_state.get("tokens_out", 0) or 0)
+    outcome.conclusion = _extract_conclusion(final_state.get("messages"))
 
 
 async def _meter(session: object, *, settings: Settings, scene: int, user_id: int | None) -> None:
@@ -224,7 +302,7 @@ async def _resume_stream(
     offset: int,
 ) -> AsyncIterator[str]:
     """断线续传：从 checkpoint 读回本轮回复，只补发客户端未收到的帧。"""
-    reply, history_len, model = await _load_turn_from_checkpoint(graph, config)
+    reply, history_len, model, conclusion = await _load_turn_from_checkpoint(graph, config)
     if not reply:
         yield _sse("error", {"msg": "会话不存在或无可续传内容", "code": 404})
         return
@@ -259,6 +337,7 @@ async def _resume_stream(
             "frames": frames,
             "model": model,
             "resumed": True,
+            "conclusion": conclusion,
         },
     )
 
@@ -461,6 +540,8 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
             "tokens_in": outcome.tokens_in,
             "tokens_out": outcome.tokens_out,
             "resumed": False,
+            # 结构化诊断结论（2-4）：前端据此画置信度条；没有该工具调用时严格为 None
+            "conclusion": outcome.conclusion,
         },
     )
 

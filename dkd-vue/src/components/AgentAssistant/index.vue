@@ -85,6 +85,43 @@
               <span v-else v-html="renderMarkdown(msg.content)"></span>
               <span v-if="msg.streaming" class="caret">▌</span>
             </template>
+            <!--
+              结构化诊断结论（2-4）：来自 done 帧的 `conclusion` 字段（后端只在真调了
+              `build_device_diagnosis` 时才带）。**置信度是证据强度刻度、不是概率**，
+              所以卡片必须同时显示依据与未知项——只画一条进度条会让人以为“这是病因的概率”。
+            -->
+            <div v-if="msg.conclusion" class="conclusion">
+              <div class="conclusion-head">
+                <b>诊断结论（结构化）</b>
+                <span class="conf-badge">{{ confidenceLabel(msg.conclusion.confidence) }}</span>
+              </div>
+              <el-progress
+                :percentage="confidencePercent(msg.conclusion.confidence)"
+                :stroke-width="8"
+                :show-text="false"
+                class="conf-bar"
+              />
+              <div class="conclusion-basis">{{ msg.conclusion.confidenceBasis || '—' }}</div>
+              <div v-if="(msg.conclusion.unknowns || []).length" class="conclusion-block">
+                <div class="t">未知项（必须一并告知）</div>
+                <ul>
+                  <li v-for="(item, i) in msg.conclusion.unknowns" :key="i">{{ item }}</li>
+                </ul>
+              </div>
+              <div v-if="(msg.conclusion.recommendedActions || []).length" class="conclusion-block">
+                <div class="t">可执行动作</div>
+                <ul>
+                  <li v-for="(item, i) in msg.conclusion.recommendedActions" :key="i">{{ item }}</li>
+                </ul>
+              </div>
+              <div class="conclusion-foot">
+                证据 {{ msg.conclusion.evidenceCount || 0 }} 条
+                <span v-if="(msg.conclusion.evidenceKinds || []).length" class="muted">
+                  （{{ (msg.conclusion.evidenceKinds || []).join(' / ') }}）
+                </span>
+                · <span class="muted">置信度 = 证据强度刻度，不是概率；本结论不含病因推断</span>
+              </div>
+            </div>
             <div v-if="msg.error" class="bubble-err">{{ msg.error }}</div>
           </div>
         </div>
@@ -200,6 +237,30 @@ function close() {
   agentStore.close()
 }
 
+/**
+ * 置信度 → 进度条刻度（**刻度不是概率**）。
+ *
+ * 为什么单独映射而不是直接用后端字段：后端给的是语义档位（high/medium/low/none），
+ * 百分比只用于画条；把映射放在一处并在卡片上写明“尺度不是概率”，
+ * 免得以后有人把它当概率展示。
+ */
+const CONFIDENCE_SCALE = { high: 80, medium: 55, low: 30, none: 0 }
+const CONFIDENCE_LABEL = {
+  high: '证据充分',
+  medium: '证据有限',
+  low: '证据不足',
+  none: '无异常证据'
+}
+
+function confidencePercent(value) {
+  const hit = CONFIDENCE_SCALE[value]
+  return hit === undefined ? 0 : hit
+}
+
+function confidenceLabel(value) {
+  return CONFIDENCE_LABEL[value] || String(value || '—')
+}
+
 function renderMarkdown(text) {
   if (!text) return ''
   // 必须经过 DOMPurify（AGENTS §2.2/§7.7：v-html 只允许渲染 sanitize 后的内容）
@@ -215,7 +276,7 @@ function scrollToBottom() {
 
 function pushMessage(role, content) {
   messageSeq += 1
-  const msg = { id: messageSeq, role, content, streaming: false, error: '' }
+  const msg = { id: messageSeq, role, content, streaming: false, error: '', conclusion: null }
   messages.value.push(msg)
   return msg
 }
@@ -274,6 +335,8 @@ function handleFrame(frame, assistantMsg) {
   } else if (frame.event === 'done') {
     // 模型名只在 done 帧才有（服务端按**实际返回**的模型回填，不按配置猜）
     if (data.model) turnModel.value = data.model
+    // 结构化诊断结论（2-4）：服务端只在真调了诊断工具时带，否则严格为 null
+    if (data.conclusion) assistantMsg.conclusion = data.conclusion
     if (data.mode && !turnMode.value) turnMode.value = data.mode
   } else if (frame.event === 'error') {
     assistantMsg.error = data.msg || '智能体返回错误'
@@ -553,6 +616,72 @@ onBeforeUnmount(stop)
 
       50% {
         opacity: 1;
+      }
+    }
+
+    /* 结论卡片：与正文区分（浅色底 + 左侧色条），并与气泡的 markdown 内容分隔 */
+    .conclusion {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: #f8fafc;
+      border: 1px solid #e4e7ed;
+      border-left: 3px solid #409eff;
+
+      .conclusion-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+
+      .conf-badge {
+        padding: 1px 8px;
+        border-radius: 10px;
+        background: #ecf5ff;
+        color: #409eff;
+        font-size: 11px;
+      }
+
+      .conf-bar {
+        margin-bottom: 4px;
+      }
+
+      .conclusion-basis {
+        font-size: 12px;
+        color: #606266;
+        line-height: 1.6;
+      }
+
+      .conclusion-block {
+        margin-top: 6px;
+
+        .t {
+          font-size: 12px;
+          color: #303133;
+          font-weight: 600;
+          margin-bottom: 2px;
+        }
+
+        ul {
+          margin: 0;
+          padding-left: 18px;
+
+          li {
+            font-size: 12px;
+            color: #606266;
+            line-height: 1.6;
+          }
+        }
+      }
+
+      .conclusion-foot {
+        margin-top: 6px;
+        padding-top: 4px;
+        border-top: 1px dashed #e4e7ed;
+        font-size: 11px;
+        color: #909399;
       }
     }
 

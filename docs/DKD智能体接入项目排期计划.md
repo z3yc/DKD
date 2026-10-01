@@ -239,7 +239,7 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | **65 files already formatted** |
-| `uv run pytest` | **354 passed / 14 deselected**（V2.16 再 +11：2-4 结论组装）（累计本轮 **+23**：助手工具与提示词契约 4 + SSE 存储类分类 2 + 2-1 异常检测 5 + 2-2 规则检索 6 + 场景工具一致性/场景绑定 5 + 其它 1）；`ruff check`/`format` 全过。覆盖率数字不逐轮抄写，新分支的真库覆盖由下面的**真环境脚本**承担 |
+| `uv run pytest` | **356 passed / 14 deselected**（V2.16 +11 结论组装；V2.18 +2 done 帧结论契约）（累计本轮 **+23**：助手工具与提示词契约 4 + SSE 存储类分类 2 + 2-1 异常检测 5 + 2-2 规则检索 6 + 场景工具一致性/场景绑定 5 + 其它 1）；`ruff check`/`format` 全过。覆盖率数字不逐轮抄写，新分支的真库覆盖由下面的**真环境脚本**承担 |
 | `mvn -pl dkd-admin -am test` | **Tests run: 75, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 10 / TaskCreate 6 / AgentTask 10 / ReportMapperSql 5 / AgentDecisionLogMapperSql 4 / **TaskServiceCreateConflict 6**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `uv run ruff check` / `ruff format --check` | All checks passed；**65 files** already formatted |
 | `npm run build:prod`（**本轮新增前端交付**） | exit 0（仅既有 chunk 体积告警）；新增 `views/manage/restock/**` 已按路由分包（`RestockAdjustDialog` / `RestockReasonDialog` 各自成 chunk） |
@@ -248,7 +248,7 @@
 | 1-14 双跑对比（**V2.12 新增**） | `docs/scripts/compare-1-14-rule-vs-baseline.py`（只读）口径验证通过；**关键发现：偏差 +212% 的根因是 FIX-5 容量口径**，不是算法——见 `docs/agent-restock-1-14-comparison-caliber.md` |
 | 助手真库端到端（**V2.12 复跑**） | `docs/scripts/verify-assistant-tools.py` **16/16 PASS**（成本优化后无回归）；浏览器 `assistant-mode-hint-check.cjs` **llm 8/8 / echo 7/7**；`restock-workbench-browser-check.cjs` **30/30**（含写入护栏 5→5）、`agent-audit-browser-check.cjs` **14/14**、`agent-assistant-browser-check.cjs` **10/10** |
 | 诊断场景真库 + 真 LLM（**V2.13 新增；V2.17 全部转绿**） | `docs/scripts/verify-assistant-diagnosis.py --phase all`：**34/34 PASS**（工具直连 17 + 真 LLM 端到端 14 + 不写护栏 3）。其中 2-4 结论的端到端实测回复：「本结论不包含病因推断——平台没有结构化的故障原因/处置知识库，我只能给你证据、未知项和平台侧可执行动作。置信度 high（依据是订单/库存状态本身的事实，而非推断）」；工具直连含 8 项结论契约断言（证据条数与库一致 / 每条带来源 / 置信度按规则 / 未知项含“日志未采集” / **无病因字段** / 动作指向真实入口 / mustSay）：异常条数与独立 SQL 一致；历史工单命中 2 条、**可用 0 条**且回复明说“没有一条能当故障现象用”；模糊指代列出 8 台候选且**零编造编号**；建单被拒且 `tb_task` 32→32 |
-| 诊断场景浏览器（**V2.13 新增**） | `docs/scripts/assistant-diagnosis-browser-check.cjs` **15/15**：切场景清会话、欢迎语不越权、快捷问题均可答、异常问答带真值、建单被拒 + **数库护栅 32→32** |
+| 诊断场景浏览器（**V2.13 新增；V2.18 加结论卡片断言 → 22/22**） | `docs/scripts/assistant-diagnosis-browser-check.cjs` **22/22**：切场景清会话、欢迎语不越权、快捷问题均可答、异常问答带真值、**结构化结论卡片（置信度条 + 未知项 + 动作 + “不是概率”说明）**、建单被拒 + **数库护栅 32→32** |
 | 端到端（**2026-10-01 新增**） | `docs/scripts/verify-checkpoint-pg.py` **--phase all 18/18 PASS**（含 5 项越权拒绝路径）；**跨进程** write/read 两独立进程 **3/3 PASS**；服务级 `python -m app` → `/health` `checkpoint_backend=postgres`/`checkpoint_open=true`；真实 SSE 会话落 PG 后已清理 |
 | 前端真浏览器（**2026-10-01 新增，FIX-12**） | `docs/scripts/restock-workbench-browser-check.cjs` 在**全栈真环境**下 **29/29 PASS**（菜单/骨架/真实数据 3 行/依据展开/弹窗两模式互斥/原因必填拦截/筛选生效/暂停恢复闭环/控制台 0 错误）；截图 `docs/evidence/restock-workbench-fix12.png`、`restock-paused-fix12.png`。依赖装在项目外（`playwright-core`，AGENTS 禁止擅自引入仓库依赖） |
 | 审计页真浏览器（**2026-10-01 新增，任务 3-7；V2.14 补齐「按 request_id 链路」→ 19/19**） | `docs/scripts/agent-audit-browser-check.cjs` **19/19 PASS**：菜单/只读提示条/**无写操作按钮（断言）**/110 条真实留痕/场景与结果中文标签/筛选 110→109 且不再出现其它场景/详情回放 JSON 已格式化缩进/控制台 0 错误；截图 `docs/evidence/agent-audit-3-7.png`、`agent-audit-detail-3-7.png` |
@@ -380,7 +380,7 @@
 · **2-2** 历史维修工单**规则库**检索（三级降级 + `phenomenon_usable` 诚实标记）+ 单测 6 + live 2；
 · **2-3 的一部分** 设备实体消歧 `find_devices` + **按场景挂载工具**（补货 2 / 诊断 3）+ 提示词-工具一致性断言；端到端 **22/22**（诊断场景真库 + 真 LLM）与浏览器 **15/15**；
 **未做**：2-3 的多轮问诊循环、2-5~2-9；
-· **2-4（结构化结论）已落地**：`app/services/diagnosis.py`（纯函数组装）+ 工具 `build_device_diagnosis`——只输出**证据 / 未知项 / 平台动作**与**由证据强度按固定规则算出**的 `confidence`，**刻意没有病因字段**（无知识库就不产出病因，FIX-22）；单测 11 项 + 真库工具直连 17/17 |
+· **2-4（结构化结论）端到端完成**：`app/services/diagnosis.py`（纯函数组装）+ 工具 `build_device_diagnosis` + **前端置信度条卡片**（done 帧带 `conclusion` 投影）——只输出**证据 / 未知项 / 平台动作**与**由证据强度按固定规则算出**的 `confidence`，**刻意没有病因字段**（无知识库就不产出病因，FIX-22）；单测 13 项 + 真库工具直连 17/17 + 浏览器 **22/22** |
 | Phase 3（Copilot + 收尾，3-1~3-10） | M3 验收通过；且 3-4 受控 NL2SQL 需先有 3-2 评测集 | ⏳ 未开工 |
 | Phase 4（上线收尾，4-1~4-4） | M4 验收通过；4-2 上线评审需 §八 全部 🔴 项关闭 | ⏳ 未开工 |
 
@@ -673,7 +673,11 @@ cd dkd-vue && npm run build:prod
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` **V1.2**）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0（已定稿）**。*
 
-*版本：**V2.17（2026-10-01，配额上调后把 V2.16 的 BLOCKED 跑成绿 + 两处断言修正）**。本次变更：
+*版本：**V2.18（2026-10-01，2-4 打通到前端：结论卡片 + done 帧投影）**。本次变更：
+① **done 帧带 `conclusion`（投影）**：后端从本轮 `messages` 里取最后一次 `build_device_diagnosis` 的结果**投影**成前端卡片需要的字段（innerCode/confidence/confidenceBasis/cannotConclude/unknowns/recommendedActions/evidenceCount/evidenceKinds/caliber）；续传路径同样带（同一提取函数，避免只见于断线）；
+② **前端结论卡片**：置信度进度条 + 依据 + 未知项 + 可执行动作，并**写明“置信度是证据强度刻度、不是概率”**；
+③ **实测验到一个自己的坑**：初版给原始结论设了 4000 字符护栏，而真实结论（10 条证据各带 detail）约 5~6KB → **卡片静默不渲染**。修法不是调大护栏，而是**发投影**（逐条 detail 是给模型看的，前端只要条数），并在单测里断言「投影里不得出现 detail」「投影 < 2000 字符」；
+④ 门禁：ruff 全过 / pytest **356 passed**（+2）/ 浏览器诊断场景 **22/22**。上一版如下。
 ① **V2.16 记录的「端到端未验到」已复跑转绿**：`verify-assistant-diagnosis.py --phase all` **34/34 PASS**（工具直连 17 + 端到端 14 + 不写护栏 3），2-4 的结构化结论在真模型上实测符合契约（主动声明“不含病因推断”、给证据/未知项/动作与置信度依据）；
 ② **修正两处自己的错误**：(a) 该脚本的结论提问没写窗口——模型按工具默认 90 天查（本机数据在 2023 年 → 0 条），如实答“无法给出病因、也不能判定设备正常”，**那是正确行为**，失败的是断言（期望 1825 天窗口的真值），已把窗口写进问题；(b) 文档/脚本里把配额开关写成了 `DKD_AGENT_TOKEN_DAILY_LIMIT_PER_USER`，真名是 `DKD_AGENT_TOKEN_LIMIT_PER_USER`（照抄会设不上而不报错）——已全仓改正；
 ③ 本机 `.env` 配额按负责人要求上调为 **200 万/用户、2000 万/全局**（原走代码默认 20 万/200 万，一天几轮真库 e2e 就会跑满）；**代码与 `.env.example` 的保守默认未动**（生产成本护栏不受影响）；
@@ -1289,3 +1293,32 @@ cd dkd-vue && npm run build:prod
   ② 2-3 的**多轮问诊循环**未做；
   ③ 真 LLM 的结论问答因配额未验到（工具层已验、模型转述待次日复跑）。
      **→ 同日已复跑转绿（V2.17）**：配额上调后 `--phase all` **34/34 PASS**；实测结论回复主动声明“不含病因推断”，并给出证据、未知项、动作与置信度依据。
+
+### 2026-10-01 开发进度补记（V2.18 · 2-4 打通到前端：结论卡片 + done 帧投影）
+
+- **交付**：
+  ① **后端**：`done` 帧新增 `conclusion`（**投影**，不是原样转发），来源是本轮 `messages` 里最后一次
+     `build_device_diagnosis` 的 ToolMessage（不新增 graph state 字段——0-13 冻结了 schema，而 ToolMessage 本来就在 messages 里）；
+     续传路径也带（与正常路径同一个提取函数，避免“断线时的结论长得不一样”）。
+  ② **前端**：助手气泡里渲染结论卡片——置信度进度条（high 80 / medium 55 / low 30 / none 0）、依据、
+     **未知项**（必须一并告知）、可执行动作，并写明“置信度 = 证据强度刻度，不是概率；本结论不含病因推断”。
+  ③ 测试：`tests/test_chat_tools.py` **+2**（done 帧契约、提取函数的容错与投影断言）；浏览器脚本 **+7** 项断言。
+
+- **本轮踩到的坑（值得单独记）**：初版 `_extract_conclusion` 给原始结论设了 **4000 字符护栏**，
+  而真实结论（10 条证据各带 `detail`）约 **5~6KB** → 护栏把结论整条丢掉，**前端卡片静默不渲染**：
+  没有报错、没有日志（只记了一条 info）、接口 200、回复文字也正常——典型的“看起来都好，功能不在”。
+  - **修法不是调大护栏**（调大了只是把问题推到下一次数据变多），而是**发投影**：
+    卡片刻度只需要 `confidence/依据/未知项/动作/证据条数`，逐条证据（含 detail）是**给模型看的**。
+  - 并在单测里把两条契约钉住：**投影里不得出现 `detail`**；**投影 JSON < 2000 字符**。
+  - 附带一条纪律：**护栏上限必须用真实数据量级验证**——构造样本时我按“估算的 4KB”造，实际只造出 2.6KB，
+    断言直接红了；这也说明“凭估算定上限”本身就是不可靠的。
+
+- **实测**：
+  - `verify-assistant-diagnosis.py --phase all` **34/34**（工具直连 17 + 端到端 14 + 不写护栏 3）；
+  - `assistant-diagnosis-browser-check.cjs` **22/22**（含 7 项链路/卡片断言；数库护栅 32→32）；
+  - `pytest` **356 passed**；`ruff` 全过；前端 `build:prod` exit 0。
+
+- **未做（不隐瞒）**：
+  ① **2-3 多轮问诊循环**未做（当前每个问题独立取数，不追问、不维护“正在诊断哪台设备”的状态）；
+  ② 结论卡片的**证据明细展开**未做（只显示条数与类型；逐条要展开需再做一次按 id 的详情取数）；
+  ③ 截图未经逐像素视觉评审（执行环境不支持读图，断言都在 DOM 层）。
