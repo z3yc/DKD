@@ -247,3 +247,96 @@ async def test_live_inventory_anomalies_executes_on_empty_table():
         )
     print(f"[anomaly] 库存异常 {len(found)} 条（该表本机 0 行，构造样本见单测）")  # noqa: T201
     assert found == [], "空表应返回空列表；有数据时也由同一套 SQL 判定"
+
+
+# --------------------------------------------------------------------------------------
+# 任务 2-2：历史维修工单规则检索（真库）
+# --------------------------------------------------------------------------------------
+
+
+async def test_live_history_cases_are_real_and_honest():
+    """真库：结果必须逐字来自 DB；且本机“可用案例 = 0”时必须给保守提示。
+
+    这条用例同时防住一个**已经真实发生过的错误**：2-7 抽样脚本曾把 `product_type_id=1`
+    （投放工单）当成维修工单，于是把 8 条投放工单当作“故障案例”。所以这里除了“不得编造”，
+    还要断言**返回的每一条都是真正的维修工单（product_type_id = 3）**。
+    """
+    from sqlalchemy import bindparam
+
+    codes = await _sample_inner_codes(limit=1)
+    async with get_sessionmaker()() as session:
+        result = await read_tools.search_history_cases(
+            session, inner_code=codes[0], start=datetime(2000, 1, 1), end=datetime.now()
+        )
+
+    print(  # noqa: T201 —— live 抽样的验收证据输出（需 -s 查看）
+        f"[cases] 设备 {codes[0]}：命中 {result.total_cases} 条，"
+        f"可用 {result.usable_case_count} 条，匹配分布={result.matched_by_counts}"
+    )
+
+    if result.cases:
+        ids = tuple(case.task_id for case in result.cases)
+        async with get_sessionmaker()() as session:
+            rows = (
+                (
+                    await session.execute(
+                        text(
+                            "select task_id, `desc`, product_type_id from tb_task "
+                            "where task_id in :ids"
+                        ).bindparams(bindparam("ids", expanding=True)),
+                        {"ids": ids},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        db = {int(r["task_id"]): r for r in rows}
+        assert set(db) == set(ids), "不得返回库里不存在的工单（编造证据）"
+        for case in result.cases:
+            row = db[case.task_id]
+            assert (case.phenomenon or "") == (row["desc"] or ""), (
+                f"工单 {case.task_id} 的现象文本必须与库中原样一致（不得改写/润色/编造）"
+            )
+            assert int(row["product_type_id"]) == read_tools.REPAIR_PRODUCT_TYPE_ID == 3, (
+                f"工单 {case.task_id} 的 product_type_id={row['product_type_id']}，"
+                "不是维修工单——返回非维修工单就是把流程/投放单当成了故障案例"
+            )
+
+    # 本机既有事实：维修工单描述全是占位符/流程备注（'111'×4 + '后台工作人员取消'）
+    # → 可用案例必须为 0，且必须给出“不可据此下诊断结论”的保守提示（FIX-22 的降级落地）
+    assert result.usable_case_count == 0, (
+        "本机维修工单描述均不可用；若这里变成 >0，说明 phenomenon_usable 的判定被放松了"
+        f"（实际：{[c.phenomenon for c in result.cases]}）"
+    )
+    assert result.no_evidence_hint, "全部不可用时必须给出提示，否则调用方会把“有工单”当成“有证据”"
+    assert "没有一条可用作故障现象" in result.no_evidence_hint
+    assert "规则库检索（非语义检索）" in result.caliber, "口径必须随行（否则会被当成语义检索结果）"
+
+
+async def test_live_history_cases_falls_back_to_model_or_region():
+    """设备本身没有维修单时，必须降级到同型号/同区域，而不是直接返回空。"""
+    async with get_sessionmaker()() as session:
+        machines = await read_tools.list_operating_machines(session, limit=50)
+    async with get_sessionmaker()() as session:
+        result = await read_tools.search_history_cases(
+            session,
+            inner_code=machines[-1].inner_code,
+            start=datetime(2000, 1, 1),
+            end=datetime.now(),
+        )
+    print(  # noqa: T201 —— live 抽样的验收证据输出（需 -s 查看）
+        f"[cases] 降级检查：设备 {machines[-1].inner_code} 命中 {result.total_cases} 条，"
+        f"分布={result.matched_by_counts}"
+    )
+    # 不假设一定有历史数据（开发库可能为空）；只断言“不抛错 + 匹配级别合法 + 有命中就得有级别”
+    assert all(
+        case.matched_by
+        in (
+            read_tools.CASE_MATCH_SAME_DEVICE,
+            read_tools.CASE_MATCH_SAME_MODEL,
+            read_tools.CASE_MATCH_SAME_REGION,
+        )
+        for case in result.cases
+    )
+    if result.cases:
+        assert result.matched_by_counts, "有命中就必须给出匹配分布（否则无法复核“为什么算相似”）"

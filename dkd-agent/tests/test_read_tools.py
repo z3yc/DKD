@@ -700,3 +700,211 @@ async def test_inventory_anomalies_reject_bad_window():
             end=datetime(2023, 9, 1),
         )
     assert session.calls == []
+
+
+# --------------------------------------------------------------------------------------
+# 任务 2-2：历史维修工单规则检索（降级为规则库，不建向量库）
+# --------------------------------------------------------------------------------------
+
+
+def _case_row(**over: Any) -> dict[str, Any]:
+    row = {
+        "task_id": 527,
+        "task_code": "202303240001",
+        "inner_code": "A1000001",
+        "task_status": 4,
+        "user_name": "张辽",
+        "phenomenon": "111",
+        "create_time": datetime(2023, 3, 24, 10, 41),
+        "update_time": datetime(2023, 3, 24, 10, 41),
+        "region_id": 1,
+        "addr": "河南省-洛阳市-龙门石窟",
+        "region_name": "洛阳市",
+    }
+    row.update(over)
+    return row
+
+
+def _profile_row(**over: Any) -> dict[str, Any]:
+    """`get_machine_profile` 需要的完整行（search_history_cases 会先取设备档案）。"""
+    row = {
+        "vm_id": 80,
+        "inner_code": "A1000001",
+        "addr": "河南省-洛阳市-龙门石窟",
+        "vm_status": 1,
+        "node_id": 2,
+        "node_name": "龙门石窟游客中心",
+        "region_id": 1,
+        "region_name": "洛阳市",
+    }
+    row.update(over)
+    return row
+
+
+def test_phenomenon_usable_rejects_process_notes_and_placeholders():
+    """`phenomenon_usable` 是 2-2 的核心诚实点：把“111”当故障现象讲出来就是编造证据。"""
+    assert not read_tools.phenomenon_usable(None)
+    assert not read_tools.phenomenon_usable("")
+    assert not read_tools.phenomenon_usable("111"), "纯数字是占位符"
+    assert not read_tools.phenomenon_usable("111-222"), "纯数字+分隔符同样是占位符"
+    assert not read_tools.phenomenon_usable("后台工作人员取消"), "流程备注不是故障现象"
+    assert not read_tools.phenomenon_usable("加急"), "口头禅不是故障现象"
+    assert not read_tools.phenomenon_usable("不出货"), "太短（<8 字）无法区分故障"
+    assert read_tools.phenomenon_usable("货道 3-6 付款后不转动，退币正常")
+
+
+def _cases_sql_calls(session: FakeSession) -> list[tuple[str, dict]]:
+    """从调用序列里挑出“候选集”那条 SQL（避免用固定下标，改查询顺序时测试不会假绿）。"""
+    return [(sql, params) for sql, params in session.calls if "as phenomenon" in sql]
+
+
+async def test_history_cases_ladder_precedence_and_no_evidence_hint():
+    """三级降级顺序 + 空命中的“无证据”提示必须一起返回（空列表区分不了“没查”与“没案例”）。
+
+    ⚠️ 顺便锁住一个真库撞出来的坑：**不得用 inner_code 做列对列 join**——
+    两表 collation 不同（utf8mb4_unicode_ci vs utf8mb4_0900_ai_ci），会 ERROR 1267（FIX-25）。
+    所以断言“候选集那条 SQL 里不出现 join tb_vending_machine”。
+    """
+    session = FakeSession(
+        rows_by_call=[
+            [_profile_row()],  # 1 设备档案
+            [{"vm_type_id": 1, "region_id": 1, "vm_type_name": "饮料机"}],  # 2 型号/区域
+            [{"inner_code": "A1000001"}, {"inner_code": "5cy5BdUs"}],  # 3 同型号兄弟设备
+            [  # 4 候选集：同设备 1 + 同型号 1 + 同区域 1
+                _case_row(),
+                _case_row(
+                    task_id=530,
+                    inner_code="5cy5BdUs",
+                    phenomenon="货道 2-1 不出货",
+                    create_time=datetime(2023, 3, 25, 9, 0),
+                ),
+                _case_row(
+                    task_id=531,
+                    inner_code="Ut548Hpf",
+                    phenomenon="后台工作人员取消",
+                    create_time=datetime(2023, 3, 26, 9, 0),
+                ),
+            ],
+            [  # 5 命中设备的型号信息
+                {"inner_code": "A1000001", "vm_type_id": 1, "vm_type_name": "饮料机"},
+                {"inner_code": "5cy5BdUs", "vm_type_id": 1, "vm_type_name": "饮料机"},
+                {"inner_code": "Ut548Hpf", "vm_type_id": 4, "vm_type_name": "果蔬机"},
+            ],
+            [],  # 6 订单异常
+            [],  # 7 库存异常
+        ]
+    )
+    result = await read_tools.search_history_cases(
+        session,
+        inner_code="A1000001",
+        start=datetime(2000, 1, 1),
+        end=datetime(2030, 1, 1),
+    )
+
+    assert [c.matched_by for c in result.cases] == [
+        "same_device",
+        "same_model",
+        "same_region",
+    ], "排序必须是设备 → 型号 → 区域"
+    assert result.matched_by_counts == {"same_device": 1, "same_model": 1, "same_region": 1}
+    assert result.total_cases == 3
+    # 可用案例只有 1 条（'货道 2-1 不出货' 是 8 字且非流程话术）；占位/流程备注必须为 False
+    assert result.usable_case_count == 1
+    assert result.cases[0].phenomenon_usable is False, "'111' 不得被当成故障现象"
+    # 置信度上限被“现象不可用”锁住：同设备但描述不可用 → low，且给出依据
+    assert result.cases[0].confidence == "low"
+    assert "描述不是故障现象" in result.cases[0].confidence_basis
+    assert result.cases[1].confidence == "medium", "同型号 + 可用描述 → medium"
+    assert result.cases[2].confidence == "low", "仅同区域 → low"
+    assert result.cases[2].vm_type_name == "果蔬机", (
+        "命中设备的型号信息要如实带上（不是目标的型号）"
+    )
+    assert result.no_evidence_hint is None, "有可用案例时不该出现“无证据”提示"
+    assert "规则库检索（非语义检索）" in result.caliber
+    assert "phenomenon_usable" in result.caliber
+
+    # 查询条数固定（防止退化成 N+1），且候选集只有一条
+    assert len(session.calls) == 7, (
+        "设备档案 + 型号/区域 + 兄弟设备 + 候选集 + 命中型号 + 2 个异常查询 = 7 条 SQL"
+        f"（固定条数，防止 N+1），实际 {len(session.calls)}"
+    )
+    cases_calls = _cases_sql_calls(session)
+    assert len(cases_calls) == 1, "候选集必须在一条 SQL 里拿到"
+    assert cases_calls[0][1]["repair_type_id"] == read_tools.REPAIR_PRODUCT_TYPE_ID == 3
+    assert "join tb_vending_machine" not in cases_calls[0][0], (
+        "候选集不得 join tb_vending_machine：两表 inner_code 的 collation 不一致（FIX-25）"
+    )
+    # 注意：expanding 参数在 str(TextClause) 里渲染成 __[POSTCOMPILE_x]（不是 :x）——
+    # 这一点在 3-9 的 EXPLAIN 演练里踩过，见排期 §十 10.6 坑 10。
+    assert "t.inner_code in (__[POSTCOMPILE_case_codes])" in cases_calls[0][0]
+    assert session.statements[3]._bindparams["case_codes"].expanding is True
+
+
+async def test_history_cases_no_case_returns_explicit_hint():
+    """一条也没有时必须给出“无证据”提示——而不是让调用方把空列表当成“不需要检查”。"""
+    session = FakeSession(
+        rows_by_call=[
+            [_profile_row()],
+            [{"vm_type_id": 2, "region_id": 9, "vm_type_name": "综合机"}],
+            [{"inner_code": "A1000001"}],
+            [],
+            [],
+            [],
+            [],
+        ]
+    )
+    result = await read_tools.search_history_cases(
+        session, inner_code="A1000001", start=datetime(2000, 1, 1), end=datetime(2030, 1, 1)
+    )
+    assert result.cases == []
+    assert result.total_cases == 0
+    assert result.no_evidence_hint and "没有任何历史维修工单" in result.no_evidence_hint
+    assert "不要拿历史案例凑证据" in result.no_evidence_hint
+
+
+async def test_history_cases_all_unusable_returns_conservative_hint():
+    """查到工单但一条都不可用（本机真实形态）→ 必须明说“不可据此下诊断结论”。"""
+    session = FakeSession(
+        rows_by_call=[
+            [_profile_row()],
+            [{"vm_type_id": 1, "region_id": 1, "vm_type_name": "饮料机"}],
+            [{"inner_code": "A1000001"}],
+            [_case_row()],
+            [{"inner_code": "A1000001", "vm_type_id": 1, "vm_type_name": "饮料机"}],
+            [],
+            [],
+        ]
+    )
+    result = await read_tools.search_history_cases(
+        session, inner_code="A1000001", start=datetime(2000, 1, 1), end=datetime(2030, 1, 1)
+    )
+    assert result.total_cases == 1 and result.usable_case_count == 0
+    assert result.no_evidence_hint and "没有一条可用作故障现象" in result.no_evidence_hint
+    assert "只能当“该设备/该型号有过维修记录”这一点用" in result.no_evidence_hint
+
+
+async def test_history_cases_reject_bad_inputs():
+    session = FakeSession()
+    with pytest.raises(ToolError):
+        await read_tools.search_history_cases(
+            session, inner_code="A", start=datetime(2030, 1, 1), end=datetime(2000, 1, 1)
+        )
+    with pytest.raises(ToolError):
+        await read_tools.search_history_cases(
+            session, start=datetime(2000, 1, 1), end=datetime(2030, 1, 1)
+        )
+    assert session.calls == [], "非法入参不得产生任何 SQL"
+
+
+async def test_history_cases_rejects_non_whitelist_table():
+    """取表必须先过白名单（2-2 也一样，不能因为“日志表”就免检）。"""
+    with pytest.raises(TableNotAllowedError):
+        await read_tools._fetch_all(FakeSession(), "select 1", {}, tables=("tb_secret_table",))
+
+
+async def test_history_cases_default_window_is_bounded_and_ordered():
+    """默认窗口必须有界（单主库上禁止无窗口分析查询），且与 1-2 用同一套半开区间算法。"""
+    start, end = read_tools.default_case_window(days=1095, today=date(2026, 10, 1))
+    assert (end - start).days == 1095
+    assert start < end
+    assert end.date() == date(2026, 10, 1)
