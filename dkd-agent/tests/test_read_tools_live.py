@@ -181,3 +181,69 @@ async def test_live_inflight_tasks_returns_details():
     assert all(task.product_type_id == 2 for task in tasks)
     assert len({task.task_id for task in tasks}) == len(tasks), "同一工单不得重复出现"
     print(f"[sample] 在途补货工单 {len(tasks)} 条，首条渠道={tasks[0].channels}")  # noqa: T201 —— live 抽样的验收证据输出（需 -s 查看）
+
+
+# --------------------------------------------------------------------------------------
+# 任务 2-1：异常检测在真库上的可执行性与“不误报”
+# --------------------------------------------------------------------------------------
+#
+# 这一层能证明的和不能证明的，必须分清（AGENTS §9.3）：
+#   ✅ 能证明：SQL 在真库上可执行（列名/函数/展开参数都对）、真数据上**识别到了**已知异常形态、
+#      正常订单（status=2 出货成功）**没有**被误报；
+#   ❌ 不能证明：`tb_inventory_log` 的异常识别——**该表本机 0 行**，只能靠构造样本（单测）。
+#      所以下面的库存用例只断言“可执行 + 空结果”，并在输出里写明原因。
+
+
+async def test_live_order_anomalies_finds_stale_paid_orders_without_false_positives():
+    """真库：卡单（status=1，2023 年历史数据）会被识别；出货成功的订单不得被误报。"""
+    codes = await _sample_inner_codes(limit=10)
+    async with get_sessionmaker()() as session:
+        found = await read_tools.list_order_anomalies(
+            session,
+            inner_codes=codes,
+            start=WINDOW_START,
+            end=WINDOW_END,
+            stale_minutes=1,
+        )
+
+    print(f"[anomaly] 订单异常 {len(found)} 条；kind 分布={sorted({a.kind for a in found})}")  # noqa: T201
+    assert found, "本库 2023-09 有 10 张 status=1（支付完成未出货）的历史订单，应被识别"
+    assert all(a.kind in ("paid_not_vended", "vend_failed") for a in found)
+    assert all(a.reason for a in found), "每条异常都必须带可复核的理由"
+
+    # 反向断言：出货成功（status=2）的订单绝不能被算成异常
+    async with get_sessionmaker()() as session:
+        ok_rows = await session.execute(
+            text(
+                "select count(*) from tb_order where status = 2 "
+                "and create_time >= :s and create_time < :e"
+            ),
+            {"s": WINDOW_START, "e": WINDOW_END},
+        )
+        ok_count = int(ok_rows.scalar() or 0)
+    flagged_ids = {a.order_id for a in found}
+    async with get_sessionmaker()() as session:
+        ok_id_rows = await session.execute(
+            text(
+                "select id from tb_order where status = 2 "
+                "and create_time >= :s and create_time < :e"
+            ),
+            {"s": WINDOW_START, "e": WINDOW_END},
+        )
+        ok_ids = {int(r[0]) for r in ok_id_rows.all()}
+    print(f"[anomaly] 同期出货成功订单 {ok_count} 条，被误报 {len(flagged_ids & ok_ids)} 条")  # noqa: T201
+    assert not (flagged_ids & ok_ids), "出货成功的订单不得出现在异常结果里（误报比漏报更伤信任）"
+
+
+async def test_live_inventory_anomalies_executes_on_empty_table():
+    """真库：`tb_inventory_log` 当前 0 行 → 只能验证 SQL 可执行且返回空（不得报错）。"""
+    codes = await _sample_inner_codes(limit=5)
+    async with get_sessionmaker()() as session:
+        found = await read_tools.list_inventory_anomalies(
+            session,
+            inner_codes=codes,
+            start=datetime(2000, 1, 1),
+            end=datetime.now(),
+        )
+    print(f"[anomaly] 库存异常 {len(found)} 条（该表本机 0 行，构造样本见单测）")  # noqa: T201
+    assert found == [], "空表应返回空列表；有数据时也由同一套 SQL 判定"

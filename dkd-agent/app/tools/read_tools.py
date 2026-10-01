@@ -594,6 +594,286 @@ async def list_inflight_tasks(
     return tasks
 
 
+# ----------------------------------------------------------------------------------
+# 任务 2-1：异常检测（订单异常 / 库存异常变动）——只读，不改任何东西
+# ----------------------------------------------------------------------------------
+#
+# ## 为什么异常检测要放在 read_tools（而不是新开一个模块）
+#
+# 它和 1-1/1-2 是同一类东西：**“把业务事实读出来、把口径写清楚”**。并且必须复用同一套护栏
+# （表白名单 / 范围比较 / 分批 / 超时），否则就会像 `OrderMapper.xml:44` 那样在分析查询里
+# 把索引列包进函数（AGENTS §10 点名）。少一个取数通道 = 少一处口径漂移。
+#
+# ## 口径来源（AGENTS §9.3：不猜）
+#
+# `tb_order` 列注释（本机 `information_schema` 实测）：
+#   `status`: 0-待支付 / 1-支付完成 / 2-出货成功 / 3-出货失败 / 4-已取消
+#   `pay_status`: 0-未支付 / 1-支付完成 / 2-退款中 / 3-退款完成
+# `tb_inventory_log` 列注释（本机实测，14 列）：
+#   `change_type`: 1销售 2补货 3损耗 4调整 5盘点；`change_amount` 正数增加/负数减少；
+#   `order_id`: 关联订单ID（**销售类型时**才有）；另有 before_stock/after_stock/remark。
+#
+# ⚠️ 本机 `tb_inventory_log` 是**空表（0 行）**，所以库存异常的“识别正确性”只能靠**构造样本**
+# 验证（排期 2-1 的验收标准也正是“构造异常样本验证”），真库上只能验证“SQL 能跑通”（返回 0 行）。
+# 这一点在单测与验收脚本里都要写明，不能因为“跑过没报错”就说库存异常检测已验证。
+
+# 订单状态（`tb_order.status`，口径同上）
+ORDER_STATUS_PAID = 1
+ORDER_STATUS_VEND_FAILED = 3
+# 支付状态（`tb_order.pay_status`）：1-支付完成 2-退款中（都属于“钱还在平台”）
+PAY_STATUS_PAID = 1
+PAY_STATUS_REFUNDING = 2
+
+# 库存变动类型（`tb_inventory_log.change_type`）
+INVENTORY_CHANGE_SALE = 1
+INVENTORY_CHANGE_LOSS = 3
+INVENTORY_CHANGE_ADJUST = 4
+
+# “支付完成但迟迟未出货”的时效阀值（分钟）。
+# 为什么需要阀值而不是“status=1 就算异常”：**status=1 是正常的中转态**
+# （从支付成功到出货完成必经过它，通常几秒），没有阀值会把正在出货的订单全报成异常。
+DEFAULT_PAID_STALE_MINUTES = 10
+
+
+class OrderAnomaly(BaseModel):
+    """订单异常（2-1）：支付成功但未出货的两类形态。
+
+    | kind | 含义 | 判定 |
+    | --- | --- | --- |
+    | `paid_not_vended` | 支付完成但迟迟未出货 | `status=1` 且早于阀值 |
+    | `vend_failed` | 已扣款但出货失败（钱还在平台/退款中） | `status=3` 且 `pay_status in (1,2)` |
+
+    为什么 `status=3` 还要看 `pay_status`：`pay_status=3`（已退款）意味着已经处理完，
+    再报成异常只会制造噪音——而**告警一旦噪音化就没人看了**（AGENTS §6.4 的同一条精神）。
+    """
+
+    kind: str
+    order_id: int
+    order_no: str | None = None
+    inner_code: str | None = None
+    channel_code: str | None = None
+    status: int
+    pay_status: int | None = None
+    amount: int | None = None
+    create_time: datetime | None = None
+    age_minutes: int | None = None
+    reason: str
+
+
+class InventoryAnomaly(BaseModel):
+    """库存异常变动（2-1）：从 `tb_inventory_log` 里找出“账对不上”的行。
+
+    | kind | 含义 | 判定 |
+    | --- | --- | --- |
+    | `deduct_without_order` | **无单扣减** | `change_type=1`、扣减、`order_id` 未命中订单 |
+    | `ledger_mismatch` | 记录自相矛盾：`before + change ≠ after` | 三列均非空且等式不成立 |
+    | `unexplained_deduction` | 损耗/调整扣减未填备注 | `change_type in (3,4)`、扣减、备注为空 |
+
+    “无单扣减”为什么要 `left join tb_order` 而不是只看 `order_id is null`：
+    `order_id` 列注释说“销售类型时”才有，但**填了一个不存在的 ID**（脏数据/跨库导入）同样危险，
+    而且从库存日志这一侧根本分不出来，所以用左连接直接把“命中不到”也归入同一类。
+    """
+
+    kind: str
+    log_id: int
+    vm_id: int
+    inner_code: str | None = None
+    channel_id: int | None = None
+    sku_id: int | None = None
+    change_type: int | None = None
+    change_amount: int | None = None
+    before_stock: int | None = None
+    after_stock: int | None = None
+    order_id: int | None = None
+    operator_name: str | None = None
+    create_time: datetime | None = None
+    reason: str
+
+
+def _order_anomaly_reason(kind: str, row: dict[str, Any]) -> str:
+    """把判定结果写成给运营/诊断看的人话（理由要与阈值一起给出，否则无法复核）。"""
+    if kind == "vend_failed":
+        return (
+            f"订单 {row.get('order_no')} 已支付但出货失败"
+            f"（status=3, pay_status={row.get('pay_status')}），需确认是否已退款或需现场处理"
+        )
+    return (
+        f"订单 {row.get('order_no')} 支付完成已 {row.get('age_minutes')} 分钟仍未出货（status=1），"
+        f"超过 {DEFAULT_PAID_STALE_MINUTES} 分钟阀值，疑似卡单"
+    )
+
+
+async def list_order_anomalies(
+    session: Any,
+    *,
+    inner_codes: Sequence[str],
+    start: datetime,
+    end: datetime,
+    stale_minutes: int = DEFAULT_PAID_STALE_MINUTES,
+    limit: int | None = None,
+) -> list[OrderAnomaly]:
+    """按设备 + 时间窗扫描订单异常（2-1 的读工具）。
+
+    - 时间过滤用**范围比较**（`create_time >= :start and < :end`，半开区间）——与 1-2 一致，
+      禁用 `date_format()`（会把 `idx_order_inner_code_create_time` 的 `create_time` 部分废掉）；
+    - `stale_minutes` 是“多久没出货算卡单”的阀值，**可配**：不同机型/网络环境出货耗时不同，
+      写死会让告警要么漏报要么噪音化；
+    - 只读：不做任何写操作，也不会“自动补单”（处置仍走人工/工作台）。
+    """
+    codes = _normalize_inner_codes(inner_codes)
+    if not codes:
+        return []
+    if end <= start:
+        raise ToolError("end 必须晚于 start（半开区间 [start, end)）")
+    if stale_minutes < 0:
+        raise ToolError("stale_minutes 不能为负")
+    settings = get_settings()
+    found: list[OrderAnomaly] = []
+    for batch in _batched(codes, settings.read_batch_size):
+        rows = await _fetch_all(
+            session,
+            """
+            select o.id as order_id, o.order_no, o.inner_code, o.channel_code,
+                   o.status, o.pay_status, o.amount, o.create_time,
+                   timestampdiff(minute, o.create_time, now()) as age_minutes,
+                   case when o.status = :vend_failed then 'vend_failed'
+                        else 'paid_not_vended' end as kind
+            from tb_order o
+            where o.inner_code in :inner_codes
+              and o.create_time >= :start
+              and o.create_time < :end
+              and (
+                    (o.status = :vend_failed
+                     and coalesce(o.pay_status, 0) in (:pay_paid, :pay_refunding))
+                 or (o.status = :paid
+                     and o.create_time <= :stale_before)
+                  )
+            order by o.create_time desc
+            limit :limit
+            """,
+            {
+                "inner_codes": tuple(batch),
+                "start": start,
+                "end": end,
+                "paid": ORDER_STATUS_PAID,
+                "vend_failed": ORDER_STATUS_VEND_FAILED,
+                "pay_paid": PAY_STATUS_PAID,
+                "pay_refunding": PAY_STATUS_REFUNDING,
+                "stale_before": end - timedelta(minutes=stale_minutes)
+                if end < datetime.now()
+                else datetime.now() - timedelta(minutes=stale_minutes),
+                "limit": limit or settings.read_row_limit,
+            },
+            tables=("tb_order",),
+            expanding=("inner_codes",),
+        )
+        for row in rows:
+            data = dict(row)
+            kind = str(data.pop("kind"))
+            found.append(
+                OrderAnomaly(
+                    kind=kind,
+                    reason=_order_anomaly_reason(kind, data),
+                    **data,
+                )
+            )
+    return found
+
+
+async def list_inventory_anomalies(
+    session: Any,
+    *,
+    inner_codes: Sequence[str],
+    start: datetime,
+    end: datetime,
+    limit: int | None = None,
+) -> list[InventoryAnomaly]:
+    """按设备 + 时间窗扫描库存变动异常（2-1 的读工具）。
+
+    三种形态（判定条件见 `InventoryAnomaly` docstring）：无单扣减 / 记录自相矛盾 / 无说明扣减。
+
+    ⚠️ 真库现状：本机 `tb_inventory_log` **0 行**，所以本函数的正确性靠**构造样本**验证
+    （`tests/test_read_tools.py`）与真库可执行性（返回空）共同覆盖——不能声称“真库验过”。
+    """
+    codes = _normalize_inner_codes(inner_codes)
+    if not codes:
+        return []
+    if end <= start:
+        raise ToolError("end 必须晚于 start（半开区间 [start, end)）")
+    settings = get_settings()
+    found: list[InventoryAnomaly] = []
+    for batch in _batched(codes, settings.read_batch_size):
+        rows = await _fetch_all(
+            session,
+            """
+            select l.id as log_id, l.vm_id, v.inner_code, l.channel_id, l.sku_id,
+                   l.change_type, l.change_amount, l.before_stock, l.after_stock,
+                   l.order_id, l.operator_name, l.create_time,
+                   case
+                     when l.before_stock is not null and l.change_amount is not null
+                          and l.after_stock is not null
+                          and l.before_stock + l.change_amount <> l.after_stock
+                       then 'ledger_mismatch'
+                     when l.change_type = :sale and l.change_amount < 0 and o.id is null
+                       then 'deduct_without_order'
+                     else 'unexplained_deduction'
+                   end as kind
+            from tb_inventory_log l
+            join tb_vending_machine v on v.id = l.vm_id
+            left join tb_order o on o.id = l.order_id
+            where v.inner_code in :inner_codes
+              and l.create_time >= :start
+              and l.create_time < :end
+              and (
+                    (l.before_stock is not null and l.change_amount is not null
+                     and l.after_stock is not null
+                     and l.before_stock + l.change_amount <> l.after_stock)
+                 or (l.change_type = :sale and l.change_amount < 0 and o.id is null)
+                 or (l.change_type in (:loss, :adjust) and l.change_amount < 0
+                     and (l.remark is null or trim(l.remark) = ''))
+                  )
+            order by l.create_time desc
+            limit :limit
+            """,
+            {
+                "inner_codes": tuple(batch),
+                "start": start,
+                "end": end,
+                "sale": INVENTORY_CHANGE_SALE,
+                "loss": INVENTORY_CHANGE_LOSS,
+                "adjust": INVENTORY_CHANGE_ADJUST,
+                "limit": limit or settings.read_row_limit,
+            },
+            tables=("tb_inventory_log", "tb_vending_machine", "tb_order"),
+            expanding=("inner_codes",),
+        )
+        for row in rows:
+            data = dict(row)
+            kind = str(data.pop("kind"))
+            found.append(
+                InventoryAnomaly(kind=kind, reason=_inventory_anomaly_reason(kind, data), **data)
+            )
+    return found
+
+
+def _inventory_anomaly_reason(kind: str, row: dict[str, Any]) -> str:
+    """库存异常的人话理由（把**数字**带上，否则无法人工复核）。"""
+    if kind == "ledger_mismatch":
+        return (
+            f"库存记录自相矛盾：变动前 {row.get('before_stock')} + 变动 {row.get('change_amount')} "
+            f"≠ 变动后 {row.get('after_stock')}（日志 id={row.get('log_id')}）"
+        )
+    if kind == "deduct_without_order":
+        return (
+            f"无单扣减：销售类型扣了 {row.get('change_amount')} 件，但关联不到订单"
+            f"（order_id={row.get('order_id')}，日志 id={row.get('log_id')}）"
+        )
+    return (
+        f"无说明扣减：损耗/调整类扣了 {row.get('change_amount')} 件且未填备注"
+        f"（操作人={row.get('operator_name') or '未记录'}，日志 id={row.get('log_id')}）"
+    )
+
+
 def default_sales_window(*, days: int, today: date | None = None) -> tuple[datetime, datetime]:
     """默认分析窗口：[today-days, today) 的零点，半开区间便于拼接与对账。
 

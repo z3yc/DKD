@@ -515,3 +515,188 @@ async def test_assignee_tables_are_readable_but_not_writable():
     assert_table_allowed("tb_emp")
     with pytest.raises(TableNotAllowedError, match="业务表"):
         assert_table_allowed("tb_emp", writable=True)
+
+
+# --------------------------------------------------------------------------------------
+# 任务 2-1：异常检测（订单异常 / 库存异常变动）
+# --------------------------------------------------------------------------------------
+
+
+def _order_row(**over: Any) -> dict[str, Any]:
+    row = {
+        "order_id": 901,
+        "order_no": "NO-901",
+        "inner_code": "A1000001",
+        "channel_code": "5-6",
+        "status": 1,
+        "pay_status": 1,
+        "amount": 500,
+        "create_time": datetime(2023, 9, 10, 8, 0),
+        "age_minutes": 999,
+        "kind": "paid_not_vended",
+    }
+    row.update(over)
+    return row
+
+
+def _log_row(**over: Any) -> dict[str, Any]:
+    row = {
+        "log_id": 77,
+        "vm_id": 80,
+        "inner_code": "A1000001",
+        "channel_id": 4732,
+        "sku_id": 1,
+        "change_type": 1,
+        "change_amount": -1,
+        "before_stock": 3,
+        "after_stock": 2,
+        "order_id": None,
+        "operator_name": None,
+        "create_time": datetime(2023, 9, 10, 8, 0),
+        "kind": "deduct_without_order",
+    }
+    row.update(over)
+    return row
+
+
+async def test_order_anomalies_flag_two_kinds_and_explain_them():
+    """两类异常都要被识别，且理由里要带**可复核的数字**（订单号 / 时长 / pay_status）。
+
+    为什么理由必须带数字：异常检测的输出会直接进诊断对话与告警，只说“有异常”等于没说——
+    运维无法判断是刚下单的正常中转态还是真的卡单。
+    """
+    session = FakeSession(
+        rows_by_call=[
+            [
+                _order_row(),
+                _order_row(
+                    order_id=902, order_no="NO-902", status=3, pay_status=1, kind="vend_failed"
+                ),
+            ]
+        ]
+    )
+    found = await read_tools.list_order_anomalies(
+        session,
+        inner_codes=["A1000001"],
+        start=datetime(2023, 9, 1),
+        end=datetime(2023, 9, 16),
+    )
+
+    assert [a.kind for a in found] == ["paid_not_vended", "vend_failed"]
+    assert "仍未出货" in found[0].reason and "999" in found[0].reason
+    assert "出货失败" in found[1].reason and "pay_status=1" in found[1].reason
+
+    sql = session.sql_text
+    assert "date_format" not in sql, "时间过滤必须用范围比较（否则索引列被函数包裹）"
+    assert "o.create_time >= :start" in sql and "o.create_time < :end" in sql
+    assert "o.status = :paid" in sql and "o.status = :vend_failed" in sql
+    # 出货失败必须看 pay_status：已退款的（3）不该再报成异常，否则告警会被噪音淹没
+    assert "coalesce(o.pay_status, 0) in (:pay_paid, :pay_refunding)" in sql
+    assert _tables_in(sql) == {"tb_order"}
+    # 展开参数必须显式声明 expanding（历史踩坑：漏了会在真库上 fail）
+    assert session.statements[0]._bindparams["inner_codes"].expanding is True
+
+
+async def test_order_anomalies_stale_threshold_is_configurable():
+    """卡单阈值必须可配且真的进了 SQL 参数（写死会让不同机型要么漏报要么噪音）。"""
+    session = FakeSession(rows_by_call=[[]])
+    await read_tools.list_order_anomalies(
+        session,
+        inner_codes=["A1000001"],
+        start=datetime(2023, 9, 1),
+        end=datetime(2023, 9, 16),
+        stale_minutes=45,
+    )
+    params = session.calls[0][1]
+    assert "stale_before" in params
+
+
+async def test_order_anomalies_reject_bad_inputs():
+    session = FakeSession()
+    with pytest.raises(ToolError):
+        await read_tools.list_order_anomalies(
+            session,
+            inner_codes=["A"],
+            start=datetime(2023, 9, 16),
+            end=datetime(2023, 9, 1),
+        )
+    with pytest.raises(ToolError):
+        await read_tools.list_order_anomalies(
+            session,
+            inner_codes=["A"],
+            start=datetime(2023, 9, 1),
+            end=datetime(2023, 9, 16),
+            stale_minutes=-1,
+        )
+    assert (
+        await read_tools.list_order_anomalies(
+            session, inner_codes=[], start=datetime(2023, 9, 1), end=datetime(2023, 9, 16)
+        )
+        == []
+    )
+    assert session.calls == [], "空入参/非法窗口不得产生任何 SQL"
+
+
+async def test_inventory_anomalies_cover_three_kinds():
+    """三种库存异常都要被识别；理由必须带数字（变动前后 / 日志 id / 操作人）。
+
+    本机 `tb_inventory_log` 是**空表**，所以这里的“构造样本”就是 2-1 验收标准要求的验证方式；
+    真库上只能验证 SQL 可执行（见 `test_read_tools_live.py`）。
+    """
+    session = FakeSession(
+        rows_by_call=[
+            [
+                _log_row(),
+                _log_row(
+                    log_id=78,
+                    change_amount=-2,
+                    before_stock=5,
+                    after_stock=5,
+                    kind="ledger_mismatch",
+                ),
+                _log_row(
+                    log_id=79,
+                    change_type=3,
+                    change_amount=-1,
+                    before_stock=2,
+                    after_stock=1,
+                    kind="unexplained_deduction",
+                ),
+            ]
+        ]
+    )
+    found = await read_tools.list_inventory_anomalies(
+        session,
+        inner_codes=["A1000001"],
+        start=datetime(2023, 9, 1),
+        end=datetime(2023, 9, 16),
+    )
+
+    assert [a.kind for a in found] == [
+        "deduct_without_order",
+        "ledger_mismatch",
+        "unexplained_deduction",
+    ]
+    assert "无单扣减" in found[0].reason and "日志 id=77" in found[0].reason
+    assert "自相矛盾" in found[1].reason and "变动前 5" in found[1].reason
+    assert "未填备注" in found[2].reason
+
+    sql = session.sql_text
+    assert "date_format" not in sql
+    assert "left join tb_order" in sql, "order_id 未命中也要算无单扣减（脏数据同样危险）"
+    assert "join tb_vending_machine" in sql, "按 inner_code 过滤必须先映射 vm_id"
+    # 账实不符必须 NULL 安全（三列都可能为空，空值不该被当成“对得上”）
+    assert "l.before_stock is not null" in sql
+    assert _tables_in(sql) == {"tb_inventory_log", "tb_vending_machine", "tb_order"}
+
+
+async def test_inventory_anomalies_reject_bad_window():
+    session = FakeSession()
+    with pytest.raises(ToolError):
+        await read_tools.list_inventory_anomalies(
+            session,
+            inner_codes=["A"],
+            start=datetime(2023, 9, 16),
+            end=datetime(2023, 9, 1),
+        )
+    assert session.calls == []
