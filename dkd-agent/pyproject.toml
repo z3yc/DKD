@@ -19,6 +19,17 @@ dependencies = [
     "cryptography>=50.0.1",
 ]
 
+# PG checkpointer（多实例部署/跨机共享会话时才需要，评审稿「方案 A」）。
+# 为什么做成可选依赖而不是主依赖：默认后端是 SQLite，主依赖里塞一个用不到的 PG 驱动，
+# 会让镜像体积和**依赖面**（供应链风险）无谓变大；且 `app/checkpoint.py` 已按惰性导入实现，
+# 缺失时只在真正选 postgres 时给出可执行的补救命令。
+# 启用方式：`uv sync --extra postgres`（容器里为 `uv sync --extra postgres --frozen`）。
+[project.optional-dependencies]
+postgres = [
+    "langgraph-checkpoint-postgres>=3.1.2",
+    "psycopg[binary,pool]>=3.3.6",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.2",

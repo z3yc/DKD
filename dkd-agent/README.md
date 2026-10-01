@@ -95,12 +95,42 @@ DKD_AGENT_LIVE_LLM=1 uv run pytest -m live -v
 | `DKD_AGENT_ENV` | 运行环境 | dev / test / prod |
 | `DKD_AGENT_SERVICE_SECRET` | 服务间密钥 | 与 Java `AgentProperties.secret` 对应；未配置则回调接口返回 503 |
 | `DKD_AGENT_DB_USER` / `_PASSWORD` | MySQL **只读账号** | 默认 `dkd_agent`（两级授权见 `docs/ddl/create_agent_db_user.sql`），禁止使用 root |
-| `DKD_AGENT_SQLITE_PATH` | 会话 checkpoint 文件 | 默认 `var/checkpoints.db`，**需纳入备份**；备份/恢复见 `app/checkpoint.py` docstring |
+| `DKD_AGENT_CHECKPOINT_BACKEND` | 会话 checkpoint 后端 | `sqlite`（默认）/ `postgres`；**切换见下「会话存储后端」** |
+| `DKD_AGENT_SQLITE_PATH` | 会话 checkpoint 文件 | 默认 `var/checkpoints.db`，**需纳入备份**；切到 postgres 后文件仍保留（回滚用） |
+| `DKD_AGENT_PG_DSN` | PG 连接串（**仅 checkpoint**） | 仅 `BACKEND=postgres` 时必填；缺 DSN 则**启动即失败**（不静默回退）；口令只入 `.env` |
 | `DKD_AGENT_USE_LLM` | 是否真实调用 LLM | `0`=echo 链路（默认）；`1` 但无密钥则**启动即失败** |
 | `DKD_AGENT_AUDIT_ENABLED` | 留痕/计量开关 | `0` 便于本地不连库调试 |
 | `DKD_AGENT_TOKEN_LIMIT_PER_USER` / `_GLOBAL` | 日 token 限额 | `0`=不限；超限返回 **429**（防成本失控） |
 | `DKD_AGENT_TABLE_WHITELIST` | 只读表白名单 | 表名带 `tb_` 前缀 |
 | `DKD_AGENT_RESTOCK_CALIBRATION_ENABLED` | 补货 LLM 校准开关 | `0`=纯统计基线（本地验收默认关闭，避免真实调用 LLM 产生费用） |
+
+## 会话存储后端（sqlite / postgres，任务 0-10 + PG 选型评审 V1.0）
+
+**默认是 `sqlite`**（单实例部署，零新增基础设施）。出现**多实例部署**或**需跨机共享会话**时切 postgres，
+一步销掉 FIX-14（Redis 3.2.100）的两条触发条件。
+
+```bash
+# 启用 postgres 后端（D5 闭环后）
+uv sync --extra postgres                 # 装 langgraph-checkpoint-postgres + psycopg
+# .env 里设置（口令勿写入任何入仓文件）：
+#   DKD_AGENT_CHECKPOINT_BACKEND=postgres
+#   DKD_AGENT_PG_DSN=postgresql://dkd_agent_pg:<口令>@127.0.0.1:5432/dkd_agent_state
+
+# 回滚：改一个变量即可，不做双向数据同步（评审稿 D4 结论）
+#   DKD_AGENT_CHECKPOINT_BACKEND=sqlite
+```
+
+**为什么 PG 依赖做成可选组**：默认后端用不到它；放进主依赖会让镜像体积与依赖面无谓变大。
+`app/checkpoint.py` 对 PG 驱动做**惰性导入**，缺失时只在真正选 postgres 时给出可执行的补救命令。
+
+**红线（AGENTS §1 约束 5 / §7.3）**：PG **只承载 checkpoint**（及将来的向量索引），
+**不是业务数据的第二通道**。业务读取仍走 MySQL 只读账号 + 白名单，写操作仍一律回调 Java；
+`agent_*` 表**留在 MySQL**。授权脚本：`docs/ddl/create_agent_pg_role.sql`（只授自己那个库，明确不授业务库）。
+
+**排查入口**：`GET /health` 会报 `checkpoint_backend` / `checkpoint_location`（已脱敏）/ `checkpoint_open`。
+报的是**实际装配**的后端而不是配置值，且单独给出 `checkpoint_open` —— 避免“存储已在关闭后仍报绿灯”。
+
+⚠️ **D5 未闭环前不得把 `BACKEND` 置为 `postgres`**（本机 PG 账号 / 生产是否允许新增 DB 引擎待确认）。
 
 ## 留痕与成本计量（任务 0-12）
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,10 +46,25 @@ class Settings(BaseSettings):
     llm_model: str = Field(default="deepseek-chat", validation_alias="DKD_AGENT_LLM_MODEL")
     llm_timeout_s: float = Field(default=60.0, validation_alias="DKD_AGENT_LLM_TIMEOUT")
 
-    # --- 会话持久化（SQLite saver；Redis 3.2 不可用的结论见方案 V1.1 §5.1）---
+    # --- 会话持久化（checkpointer，任务 0-10）---
+    #
+    # 后端可切换（排期 0-10 + PG 选型评审稿「方案 A」）：
+    #   sqlite   —— **默认**。单实例部署，零新增基础设施；Redis 3.2.100 不可用的结论见方案 §5.1
+    #   postgres —— 多实例部署 / 需跨机共享会话时启用；接入点唯一（`app/checkpoint.py` 工厂）
+    #
+    # 为什么默认仍是 sqlite：切换必须是**显式动作**。给个“看起来更方便”的默认值，
+    # 会让部署环境在没做备份/授权准备的情况下悄悄换了存储位置，会话丢失无从追查。
+    checkpoint_backend: str = Field(
+        default="sqlite", validation_alias="DKD_AGENT_CHECKPOINT_BACKEND"
+    )
     sqlite_path: Path = Field(
         default=Path("var/checkpoints.db"), validation_alias="DKD_AGENT_SQLITE_PATH"
     )
+    # PG 连接串（仅 checkpoint 用；**不承载任何业务数据**，见 AGENTS §1 约束 5）。
+    #
+    # ⚠️ 命名红线：**绝不能**把这个字段叫 `dsn`——本类已有 `dsn` property 返回 MySQL
+    # 只读账号连接串。同名会让 `app/db.py` 静默连到 PG：读的是同一个属性名，错得毫无提示。
+    pg_dsn: str = Field(default="", validation_alias="DKD_AGENT_PG_DSN")
 
     # --- 对话模式与限额（任务 0-12：成本计量与熔断）---
     use_llm: bool = Field(default=False, validation_alias="DKD_AGENT_USE_LLM")
@@ -163,16 +178,51 @@ class Settings(BaseSettings):
 
     @property
     def dsn(self) -> str:
-        """SQLAlchemy async DSN。
+        """SQLAlchemy async DSN（**MySQL 只读账号**，业务读取的唯一通道）。
 
         账号 `dkd_agent` 采用两级授权：业务表（tb_*）只读白名单，
         智能体自有表（agent_*）可 SELECT/INSERT/UPDATE（不授 DELETE/DDL）。
         详见 `app/db.py` 模块 docstring。
+
+        注意：checkpoint 的 PG 连接串是另一个字段 `pg_dsn`。两者不可混用——
+        PG 只能承载会话状态，**不是业务数据通道**。
         """
         return (
             f"mysql+aiomysql://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}?charset=utf8mb4"
         )
+
+    # --- checkpoint 后端校验：启动即失败，而不是等第一个用户请求才炸 ---
+
+    @field_validator("checkpoint_backend")
+    @classmethod
+    def _validate_checkpoint_backend(cls, value: str) -> str:
+        """只接受已知后端。
+
+        为什么拒绝未知值而不是“回退到 sqlite”：拼错 `postgresql` 时静默用 SQLite 运行，
+        运维会以为已经切到 PG，直到某天多实例部署发现会话不共享才回头查——
+        这种“看起来成功了”的错配比启动失败昂贵得多。
+        """
+        normalized = (value or "").strip().lower()
+        if normalized not in {"sqlite", "postgres"}:
+            raise ValueError(
+                f"DKD_AGENT_CHECKPOINT_BACKEND 只能是 sqlite 或 postgres，实际为 {value!r}"
+            )
+        return normalized
+
+    @model_validator(mode="after")
+    def _require_pg_dsn(self) -> Settings:
+        """选 postgres 就必须给 DSN（fail-fast）。
+
+        评审稿 §8-4 登记的另一条同类风险（账号只有 DML 权限时 `setup()` 首次部署失败）
+        只能在真库上验证，已由 `docs/scripts/verify-checkpoint-pg.py` 覆盖。
+        """
+        if self.checkpoint_backend == "postgres" and not self.pg_dsn:
+            raise ValueError(
+                "DKD_AGENT_CHECKPOINT_BACKEND=postgres 但未配置 DKD_AGENT_PG_DSN；"
+                "拒绝以错误配置启动（口令只放 .env，不要写进入仓文件）"
+            )
+        return self
 
 
 @lru_cache

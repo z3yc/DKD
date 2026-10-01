@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     if not s.service_secret:
         logger.warning("DKD_AGENT_SERVICE_SECRET 未配置 —— 回调/运维接口将返回 503")
 
-    store = await open_checkpoint_store(s.sqlite_path)
+    store = await open_checkpoint_store(s)
     app.state.checkpoint_store = store
     app.state.chat_graph = build_chat_graph(checkpointer=store.saver, use_llm=s.use_llm)
     # 补货工作台服务（1-7）：真实 store + 真实只读依赖；测试可用 app.state.restock_service 整体替换
@@ -73,7 +73,27 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["ops"], summary="健康检查（含依赖就绪状态）")
     async def health() -> dict[str, object]:
-        """供 Java 网关与 dkd-quartz 探活；不暴露任何凭据。"""
+        """供 Java 网关与 dkd-quartz 探活；不暴露任何凭据。
+
+        `checkpoint_location` 是**已脱敏**的位置描述（sqlite 是文件路径，PG 是口令掩码后的
+        DSN），为什么报“实际装配的后端”而不是配置值：配置成 postgres 但装配回退成 sqlite 时，
+        只报配置值的 health 会告诉运维“一切正常”。
+
+        `checkpoint_open` 单独列出来：进程关闭后模块级单例仍在，只看后端名会得到
+        一个误导排障的假绿灯。
+        """
+        checkpoint_backend = s.checkpoint_backend
+        checkpoint_location: str | None = None
+        checkpoint_open = False
+        try:
+            checkpoint = get_checkpoint_store()
+            checkpoint_backend = checkpoint.backend
+            checkpoint_location = checkpoint.location
+            checkpoint_open = checkpoint.is_open
+        except RuntimeError:
+            # lifespan 未完成/已关闭：健康检查必须仍能应答，
+            # 否则排障时连“服务是否活着”都问不出来
+            pass
         return {
             "status": "ok",
             "env": s.app_env,
@@ -81,7 +101,9 @@ def create_app() -> FastAPI:
             "llm_configured": bool(s.llm_api_key),
             "service_secret_configured": bool(s.service_secret),
             "db_configured": bool(s.db_password),
-            "sqlite_path": str(s.sqlite_path),
+            "checkpoint_backend": checkpoint_backend,
+            "checkpoint_location": checkpoint_location,
+            "checkpoint_open": checkpoint_open,
             "whitelist_tables": len(s.whitelist_tables),
         }
 
