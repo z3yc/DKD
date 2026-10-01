@@ -48,10 +48,31 @@ logger = logging.getLogger("dkd.agent.tools.assistant")
 PRIORITY_LABELS = {1: "低", 2: "中", 3: "高", 4: "紧急"}
 
 # 单次返回的规模上限（token 成本与“误导性截断”的平衡点）
-MAX_PLANS = 20
+#
+# 为什么这些数字在 2026-10-01 被收紧（§十 任务 7）：实测一次带工具的问答 input ≈ **3.5k token**，
+# 是普通对话的 ~10 倍——因为 system 提示词 + 工具 schema + **工具返回值**都要进上下文，
+# 而返回值里的每一轮都会**再算一次**。三处一起压：
+#   ① 只回未完成计划（已完成的计划对“今天要补什么”毫无用处，却要每轮付一次 token）；
+#   ② 货道明细默认**只给含紧急货道的计划**（其余只给台号+汇总），需要细节时用 detail=true 再查一次；
+#   ③ reason 截断（规则兜底的理由里有大段模板文本，保留结论就够模型解释“为什么补”）。
+MAX_PLANS = 10
 MAX_CHANNELS_PER_PLAN = 5
 MAX_STOCK_CHANNELS = 20
 MAX_INFLIGHT = 20
+# reason 保留长度：够表达“缺货/低于预警值/常规补货”的结论，不含大段模板
+MAX_REASON_CHARS = 60
+# 未完成计划状态（1-建议 2-已调整 6-待指派），与 PLAN_STATUS_* / 前端筛选一致
+PENDING_PLAN_STATUSES = (1, 2, 6)
+
+
+def _clip(text: Any, limit: int = MAX_REASON_CHARS) -> str | None:
+    """截断长文本并显式标注（**不能静默截断**：模型会拿截断后的句子当完整理由讲）。"""
+    if text is None:
+        return None
+    value = str(text).strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "…（已截断）"
 
 
 def _json(payload: object) -> str:
@@ -91,9 +112,55 @@ class _PlansArgs(BaseModel):
         default=None,
         description="计划日期，格式 YYYY-MM-DD；不填表示今天",
     )
+    detail: bool = Field(
+        default=False,
+        description=(
+            "是否返回每条建议的全部货道明细。默认 false：只给含紧急货道的计划明细，"
+            "其余只给台号与汇总（控制返回体积）。需要看某台设备各货道时置 true。"
+        ),
+    )
 
 
-async def _list_restock_suggestions(plan_date: str | None = None) -> str:
+def _plan_brief(plan: dict[str, Any], *, with_channels: bool) -> dict[str, Any]:
+    """把一条计划压成给模型看的摘要（`with_channels=False` 时**不返回货道明细**）。
+
+    为什么要把这个函数提到模块级：它是“token 成本”与“信息完整性”的平衡点，
+    必须在单测里能直接断言（不能只靠跑真库看输出）。
+    """
+    items = sorted(plan.get("items", []), key=lambda i: -int(i.get("priority") or 0))
+    priorities = [int(i.get("priority") or 0) for i in items]
+    brief: dict[str, Any] = {
+        "innerCode": plan.get("innerCode"),
+        "status": status_label(int(plan.get("status") or 0)),
+        "totalQuantity": plan.get("totalQuantity"),
+        "channelCount": len(items),
+        "maxPriority": _priority_label(max(priorities) if priorities else None),
+        "assigneeName": plan.get("assigneeName") or "待指派",
+    }
+    if not with_channels:
+        # 明确告诉模型“明细可以再查”，而不是让它以为没有明细、从而编造货道细节
+        brief["channelsOmitted"] = (
+            "该计划未含紧急货道，明细已省略；需要看各货道请用 detail=true 再查"
+        )
+        return brief
+    brief["channels"] = [
+        {
+            "channelCode": i.get("channelCode"),
+            "skuName": i.get("skuName") or "（未命名商品）",
+            "current": f"{i.get('currentQuantity')}/{i.get('maxCapacity')}",
+            "suggestedQuantity": i.get("suggestedQuantity"),
+            "priority": _priority_label(i.get("priority")),
+            "estimatedDays": i.get("estimatedDays"),
+            "reason": _clip(i.get("reason")),
+        }
+        for i in items[:MAX_CHANNELS_PER_PLAN]
+    ]
+    if len(items) > MAX_CHANNELS_PER_PLAN:
+        brief["channelsTruncatedFrom"] = len(items)
+    return brief
+
+
+async def _list_restock_suggestions(plan_date: str | None = None, detail: bool = False) -> str:
     target = _parse_date(plan_date)
     try:
         store = SqlPlanStore()
@@ -104,59 +171,43 @@ async def _list_restock_suggestions(plan_date: str | None = None) -> str:
         return _json({"error": f"查询补货建议失败（{type(exc).__name__}），请稍后重试"})
 
     plans = [summarize_plan(plan_from_row(row), plan_id=int(row["id"])) for row in rows]
-    pending_status = (1, 2, 6)  # 1-建议 2-已调整 6-待指派
-    pending = [p for p in plans if p["status"] in pending_status]
-    urgent = [
-        p for p in pending if any(int(i.get("priority") or 0) >= 4 for i in p.get("items", []))
-    ]
-
-    def _plan_brief(plan: dict[str, Any]) -> dict[str, Any]:
-        items = sorted(plan.get("items", []), key=lambda i: -int(i.get("priority") or 0))[
-            :MAX_CHANNELS_PER_PLAN
-        ]
-        brief: dict[str, Any] = {
-            "innerCode": plan.get("innerCode"),
-            "status": status_label(int(plan.get("status") or 0)),
-            "totalQuantity": plan.get("totalQuantity"),
-            "assigneeName": plan.get("assigneeName") or "待指派",
-            "channels": [
-                {
-                    "channelCode": i.get("channelCode"),
-                    "skuName": i.get("skuName") or "（未命名商品）",
-                    "current": f"{i.get('currentQuantity')}/{i.get('maxCapacity')}",
-                    "suggestedQuantity": i.get("suggestedQuantity"),
-                    "priority": _priority_label(i.get("priority")),
-                    "estimatedDays": i.get("estimatedDays"),
-                    "reason": i.get("reason"),
-                }
-                for i in items
-            ],
-        }
-        if len(plan.get("items", [])) > MAX_CHANNELS_PER_PLAN:
-            brief["channelsTruncatedFrom"] = len(plan.get("items", []))
-        return brief
+    pending = [p for p in plans if p["status"] in PENDING_PLAN_STATUSES]
+    # 含紧急货道（priority=4）的计划：这些默认带明细，因为“先看紧急的”是最常见的问法
+    urgent_ids = {
+        p["id"]
+        for p in pending
+        if any(int(i.get("priority") or 0) >= 4 for i in p.get("items", []))
+    }
+    returned = pending[:MAX_PLANS]
 
     payload: dict[str, Any] = {
         "planDate": target.isoformat(),
         # 口径必须一起给出：否则模型会把“待处理”说成“全部建议”
         "stats": {
             "pendingCount": len(pending),
-            "urgentCount": len(urgent),
+            "urgentCount": len(urgent_ids),
             "pendingTotalQuantity": sum(int(p.get("totalQuantity") or 0) for p in pending),
             "allPlansCount": len(plans),
             "caliber": "pendingCount/urgentCount 只统计未完成计划（建议/已调整/待指派）；"
             "urgent 指计划内存在 priority=4（紧急）的货道",
         },
         "autoAnalysisPaused": bool(pause.paused),
-        "plans": [_plan_brief(p) for p in plans[:MAX_PLANS]],
+        # 默认只回未完成计划（token 优化）；已完成/已取消用计数告知，不装作“当天只有这些”
+        "plans": [
+            _plan_brief(p, with_channels=bool(detail) or p["id"] in urgent_ids) for p in returned
+        ],
+        "plansScope": "仅未完成计划（建议/已调整/待指派）",
+        "completedOrOtherPlans": len(plans) - len(pending),
     }
-    if len(plans) > MAX_PLANS:
-        payload["plansTruncatedFrom"] = len(plans)
+    if len(pending) > MAX_PLANS:
+        payload["plansTruncatedFrom"] = len(pending)
     if not plans:
         payload["hint"] = (
             "当日没有计划行。常见原因：① 自动分析被暂停（见 autoAnalysisPaused）；"
             "② 当日 06:00 定时任务未成功执行。不要据此说‘都不需要补货’。"
         )
+    elif not pending:
+        payload["hint"] = "当日计划都已处理完（无未完成计划）。不要据此说‘今天不用补货’。"
     return _json(payload)
 
 
@@ -333,10 +384,10 @@ def build_assistant_tools() -> list[StructuredTool]:
             coroutine=_list_restock_suggestions,
             name="list_restock_suggestions",
             description=(
-                "查询某日（默认今天）的补货建议清单：待处理数量、其中紧急多少条、"
-                "每台设备的货道建议与补货理由、接单人、自动分析是否被暂停。"
-                "当用户问“有哪些要补的/先看紧急的/今天多少条”时用它。"
-                "注意：它只读，不能建单或修改建议。"
+                "查询某日（默认今天）的补货建议：待处理与紧急条数、各设备建议与理由、接单人、"
+                "自动分析是否被暂停。默认只返回未完成计划，且只给含紧急货道的计划带明细"
+                "（需某台设备各样货道时传 detail=true 再查）。"
+                "问“有哪些要补/先看紧急/今天多少条”用它。它只读，不能建单或修改建议。"
             ),
             args_schema=_PlansArgs,
         ),

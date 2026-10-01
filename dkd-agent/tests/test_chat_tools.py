@@ -297,3 +297,96 @@ async def test_token_usage_is_summed_not_overwritten(monkeypatch, tmp_path):
     # 两轮 LLM 调用（第一轮要工具、第二轮给答案）→ 必须累加
     assert state["tokens_in"] == 20, f"input token 应累加为 20，实际 {state['tokens_in']}"
     assert state["tokens_out"] == 10, f"output token 应累加为 10，实际 {state['tokens_out']}"
+
+
+# ----------------------------------------------------------------------------------
+# 成本优化（§十 任务 7）：返回体积必须**可断言**，不能只靠“感觉变快了”
+# ----------------------------------------------------------------------------------
+
+
+def _plan_dict(*, items: int = 2, reason: str | None = None) -> dict[str, Any]:
+    return {
+        "id": 88,
+        "innerCode": "A1000001",
+        "status": 1,
+        "totalQuantity": 12,
+        "assigneeName": "张三",
+        "items": [
+            {
+                "channelCode": f"1-{i + 1}",
+                "skuName": "可口可乐",
+                "currentQuantity": 1,
+                "maxCapacity": 10,
+                "suggestedQuantity": 8,
+                "priority": 4 if i == 0 else 1,
+                "estimatedDays": 0,
+                "reason": reason if reason is not None else "库存低于预警值",
+            }
+            for i in range(items)
+        ],
+    }
+
+
+def test_plan_brief_omits_channels_unless_requested():
+    """默认不带货道明细（token 的大头），但必须**显式说明“已省略”**。
+
+    只删字段不说一声，模型会以为“这台设备没有货道明细”，进而编造货道细节——
+    那比多花 token 危险得多。
+    """
+    from app.tools.assistant_tools import _plan_brief
+
+    quiet = _plan_brief(_plan_dict(), with_channels=False)
+    assert "channels" not in quiet
+    assert quiet["channelsOmitted"].startswith("该计划未含紧急货道")
+    # 汇总信息（台号/数量/最高优先级）必须保留，否则模型连“有几台、多急”都答不出
+    assert quiet["innerCode"] == "A1000001"
+    assert quiet["totalQuantity"] == 12
+    assert quiet["channelCount"] == 2
+    assert quiet["maxPriority"] == "紧急"
+
+    detailed = _plan_brief(_plan_dict(), with_channels=True)
+    assert len(detailed["channels"]) == 2
+    assert detailed["channels"][0]["channelCode"] == "1-1"
+
+
+def test_plan_brief_clips_reason_with_visible_marker():
+    """长 reason 必须截断，且**带上“已截断”标记**（静默截断会让模型把半句话当完整理由）。"""
+    from app.tools.assistant_tools import (
+        MAX_CHANNELS_PER_PLAN,
+        MAX_REASON_CHARS,
+        _clip,
+        _plan_brief,
+    )
+
+    assert _clip(None) is None
+    assert _clip(" 短理由 ") == "短理由"
+
+    long_reason = "【降级·规则兜底】" + "很长的模板文本" * 40
+    brief = _plan_brief(_plan_dict(reason=long_reason), with_channels=True)
+    clipped = brief["channels"][0]["reason"]
+    assert clipped.endswith("…（已截断）")
+    assert len(clipped) == MAX_REASON_CHARS + len("…（已截断）")
+
+    # 超过货道上限时给出截断来源数（避免“只有 5 条”被当成全部）
+    many = _plan_brief(_plan_dict(items=MAX_CHANNELS_PER_PLAN + 3), with_channels=True)
+    assert len(many["channels"]) == MAX_CHANNELS_PER_PLAN
+    assert many["channelsTruncatedFrom"] == MAX_CHANNELS_PER_PLAN + 3
+
+
+def test_plan_brief_is_much_smaller_without_channels():
+    """量化“省了多少”：这是成本优化的验收口径，不是“看起来小了”。"""
+    import json as _json
+
+    from app.tools.assistant_tools import _plan_brief
+
+    plan = _plan_dict(items=6, reason="【降级·规则兜底】" + "模板文本" * 30)
+    with_channels = len(_json.dumps(_plan_brief(plan, with_channels=True), ensure_ascii=False))
+    without = len(_json.dumps(_plan_brief(plan, with_channels=False), ensure_ascii=False))
+    assert without * 3 < with_channels, f"省略明细后只省了 {1 - without / with_channels:.0%}"
+
+
+def test_plans_tool_schema_exposes_detail_switch():
+    """`detail` 必须出现在**工具 schema**里，否则模型永远无法按需取明细（等于没有这个开关）。"""
+    tools = {t.name: t for t in build_assistant_tools()}
+    schema = tools["list_restock_suggestions"].args_schema.model_json_schema()
+    assert "detail" in schema.get("properties", {})
