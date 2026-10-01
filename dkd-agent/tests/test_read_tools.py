@@ -125,6 +125,13 @@ async def test_daily_sales_aggregation_groups_by_day_but_filters_by_range():
     assert "date(" not in where_clause and "date_format" not in where_clause
     assert "o.create_time >= :start" in where_clause and "o.create_time < :end" in where_clause
     assert "limit :limit" in sql
+    # 2026-10-01 修复的真 bug 回归锚点：不过滤 `channel_code is not null` 时，
+    # 分组结果会含 channel_code=None 的行 → `ChannelDailySales` 的必填 str 校验失败
+    # → 工具直接抛错。本机开发库实测：7 张出货成功订单里 2 张 channel_code 为空（占 29%），
+    # 即“只含这类订单的设备”会让 1-4 基线与 06:00 定时任务整个挂掉。
+    assert "o.channel_code is not null" in where_clause, (
+        "WHERE 必须过滤 channel_code is null（不可归因到货道的行会撞必填校验并带崩整条链路）"
+    )
     _, params = session.calls[0]
     assert params["status"] == 2, "销量口径与 1-2 保持一致（出货成功）"
     assert rows[0].qty == 4 and rows[0].sale_date == date(2023, 9, 11)

@@ -420,6 +420,26 @@ async def aggregate_channel_sales(
     - 时间过滤用**范围比较**（`create_time >= :start and < :end`，半开区间，避免边界重复计数）；
     - 按 vm 分批执行，单批超时即熔断；
     - 只统计 `tb_order.status = sales_order_status`（默认 2=出货成功，口径见模块 docstring）。
+
+    ## 为什么必须过滤 `channel_code is not null`（2026-10-01 修，真库实测）
+
+    本函数是**按货道**聚合，而 `channel_code` 为空的行**无法归因到任何货道**。
+    不过滤会同时造成两个后果：
+
+    1. **工具直接崩**：分组结果里会出现 `channel_code=None`，而 `ChannelSales.channel_code`
+       是必填 `str` → Pydantic 校验失败报错。这不是“边界情况”，本机开发库 7 张
+       出货成功订单里就有 2 张 `channel_code` 为空（占 29%）——1-4 基线引擎与
+       06:00 定时任务遇到只含这类订单的设备会直接挂掉。
+    2. **语义错误**：就算放开模型允许 None，一个没有货道的“货道聚合行”
+       到了基线引擎也无处安放（映射不到货道）。
+
+    ## 但过滤掉不等于可以假装它们不存在
+
+    被过滤的订单是**真实销量**，且是数据质量信号（下单时没回填货道）。所以：
+      • 对账/巡检必须能把它们算出来——`docs/scripts/verify-1-12-reconcile.py`
+        把「Java 全局口径 = Agent 可归因口径 + 不可归因口径」做成**守恒断言**，
+        而不是让它们静静消失；
+      • 真实库中这类订单的占比应由业务侧决定要不要修数据（现已登记观察）。
     """
     codes = _normalize_inner_codes(inner_codes)
     if not codes:
@@ -441,6 +461,7 @@ async def aggregate_channel_sales(
               and o.create_time >= :start
               and o.create_time < :end
               and o.status = :status
+              and o.channel_code is not null
             group by o.inner_code, o.channel_code
             order by o.inner_code, o.channel_code
             limit :limit
@@ -480,6 +501,10 @@ async def aggregate_channel_daily_sales(
 
     `group by` 未使用 `date_format` 的原因：`DATE(create_time)` 是同类里最轻的写法
     （不需要把时间格式化成字符串再比）。
+
+    同样过滤 `channel_code is not null`：理由与 `aggregate_channel_sales` 完全一致
+    （不可归因到货道的行既会撞 Pydantic 必填校验、又无法进基线引擎），
+    两个函数的过滤条件必须保持一致——否则“总量对得上、逐日对不上”会成为新的排查黑洞。
     """
     codes = _normalize_inner_codes(inner_codes)
     if not codes:
@@ -499,6 +524,7 @@ async def aggregate_channel_daily_sales(
               and o.create_time >= :start
               and o.create_time < :end
               and o.status = :status
+              and o.channel_code is not null
             group by o.inner_code, o.channel_code, date(o.create_time)
             order by o.inner_code, o.channel_code, sale_date
             limit :limit
