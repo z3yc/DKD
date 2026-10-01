@@ -25,7 +25,7 @@
 5. **基础设施实测边界（2026-09-21 核实，不得凭印象假设）**：
    - **业务表全部带 `tb_` 前缀**（`tb_inventory`/`tb_order`/`tb_task`/`tb_task_details`/`tb_inventory_log`/`tb_emp`/`tb_channel`/`tb_vending_machine`/`tb_node`/`tb_region`/`tb_sku`/`tb_job`/`tb_policy`/`tb_partner`/`tb_vm_type`/`tb_sku_class`/`tb_task_type`/`tb_role`/`tb_report`）——写 SQL、搞白名单、建 Agent 工具前先核 `dkd-manage/src/main/resources/mapper/manage/*.xml`；
    - **Redis 为 3.2.100（Microsoft 2016 移植版）**：无模块系统（不支持 RedisJSON/RediSearch）、内核 3.2 < 5.0（无 Streams）、`appendonly no`（仅 RDB）——**不得用它承载 LangGraph checkpointer，也不得用作 Stream 队列**（会话持久化用 SQLite/Postgres saver）；
-   - **本机另有 PostgreSQL 17 服务（`postgresql-x64-17`，5432 已监听；2026-09-23 实测）**：**尚未纳入本期架构**，仅作为 LangGraph checkpointer / 向量检索的候选后端（评审稿 `docs/dkd-agent-postgres-selection-review.md`，D1~D5 待拍板）。**评审通过前任何代码路径不得依赖 PG**，也不得把 `agent_*` 表迁过去；
+   - **PostgreSQL 17（`postgresql-x64-17`，5432 已监听；2026-09-23 实测）已纳入架构，但仅限一个用途**：承载 LangGraph **checkpointer**（`DKD_AGENT_CHECKPOINT_BACKEND=postgres`，默认仍为 `sqlite`），以及将来知识库的向量索引。决策依据见 `docs/dkd-agent-postgres-selection-review.md`（**V1.0 已定稿**）。边界（不可违背）：**PG 不是业务数据的第二通道**——业务读取仍走 MySQL 只读账号 + 表白名单，写操作仍一律回调 Java；`agent_*` 表**留在 MySQL**（评审稿 §4.2，搬走会打断 3-7 审计页的 RuoYi 数据通路）。⚠️ **D5 未闭环**（本机 PG 账号 / 生产是否允许新增 DB 引擎）：D5 闭环前，`DKD_AGENT_CHECKPOINT_BACKEND` 在任何环境**不得**置为 `postgres`（配置了就启动即失败，不会静默回退）；
    - **数据源只有单主库**（`application-druid.yml` 中 `slave.enabled: false`）：任何批量聚合/分析类查询必须限定时间窗口 + 分批 + 超时熔断，禁止无 LIMIT 的全表扫描；
    - **存量业务表 DDL 未入库**（`dkd-parent/sql/` 只有 RuoYi 系统表、quartz、`tb_report.sql`），涉及表结构工作时需先导出归档至 `docs/ddl/`。
 

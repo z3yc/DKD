@@ -1,9 +1,11 @@
 # 帝可得（DKD）智能售货机平台 LangChain/LangGraph 智能体接入方案
 
-> 版本：V1.1（评审修订）
-> 日期：2026-09-21
+> 版本：V1.2（PG checkpointer 落地）
+> 日期：2026-09-28
 > 范围：现有架构分析 → 智能体场景规划 → 集成方式 → 数据链路 → 技术实现路径 → 分阶段实施计划
-> 说明：原型见 `docs/prototypes/dkd-agent-prototype.html`（V2）；排期见《DKD智能体接入项目排期计划.md》**V2**。
+> 说明：原型见 `docs/prototypes/dkd-agent-prototype.html`（V2）；排期见《DKD智能体接入项目排期计划.md》**V2.9**；PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0**。
+>
+> **V1.2 修订摘要**：**会话持久化改为可切换双后端**——默认仍为 SQLite，新增 PostgreSQL 后端（`AsyncPostgresSaver`），切换开关 `DKD_AGENT_CHECKPOINT_BACKEND=sqlite|postgres`；触发条件与回滚方式见 §5.1。PG 仅供 checkpointer（及将来的向量索引），**不是业务数据第二通道**，`agent_*` 表仍留在 MySQL（AGENTS §1 约束 5 / §7.3）。⚠️ D5（PG 账号 / 生产放行）未闭环前不得启用 postgres 后端。
 >
 > **V1.1 修订摘要（均基于源码与现场实测，证据见 §十）**：
 > ① **表白名单修正**——实际业务表**全部带 `tb_` 前缀**，V1 的 `inventory/order/task/...` 写法会直接失败，且漏掉诊断/建单必需的 `tb_inventory_log`/`tb_task_details`/`tb_emp`/`tb_channel`；
@@ -342,7 +344,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/j
 | 服务框架 | FastAPI + Uvicorn | ≥0.110 | 原生 async、SSE、Pydantic 结构化输出 |
 | 编排框架 | **LangGraph**（+ LangChain 核心包） | **锁定精确版本三元组**（langgraph / langgraph-checkpoint / 下游 saver），禁止用 `≥x.y` 开放区间 | 有状态多 Agent 编排、checkpointer、human-in-the-loop 中断恢复。注意：`interrupt` 字段在 0.6 已被移除、1.0 又有变更，且 checkpointer 模块会绑定 langgraph 主版本——开放区间会导致 1-6 `interrupt` 节点返工 |
 | LLM 接入 | `langchain-openai`（OpenAI 兼容模式指向 DeepSeek） | — | 与现有 `ai.api-url` 同一供应商账号，零迁移成本；可切通义千问 |
-| 会话持久化 | **`langgraph-checkpoint-sqlite`（AsyncSqliteSaver）**；备选 fallback：Postgres saver（需多实例时） | 锁定版本 | ① 本机 Redis 3.2.100 不支持 RedisJSON/RediSearch → `langgraph-checkpoint-redis` **不可用**；② 当前为单机部署，SQLite 零新增基础设施；③ 需同步备份 `*.db` 文件（写入 runbook）。**迁移触发条件：出现多实例部署或需跨机共享会话** |
+| 会话持久化 | **默认 `langgraph-checkpoint-sqlite`（AsyncSqliteSaver）**；多实例部署/跨机共享会话时切 **PostgreSQL（`AsyncPostgresSaver`）** | 锁定版本；两者经 `app/checkpoint.py` 工厂按 `DKD_AGENT_CHECKPOINT_BACKEND` 分派 | ① 本机 Redis 3.2.100 不支持 RedisJSON/RediSearch → `langgraph-checkpoint-redis` **不可用**；② 当前为单机部署，SQLite 零新增基础设施；③ 需同步备份 `*.db` 文件（写入 runbook）。**迁移触发条件：出现多实例部署或需跨机共享会话**（V1.2：该条件已有落地实现，不再只是 runbook 里的一句话）；④ postgres 后端需 `uv sync --extra postgres`，授权脚本 `docs/ddl/create_agent_pg_role.sql`；⑤ **回滚 = 改一个环境变量**（不做双向数据同步，评审稿 D4） |
 | 观测 | LangSmith（可选）+ 结构化日志 + `agent_decision_log` | — | 全链路 trace，Prompt/工具调用可回放审计 |
 | 数据访问 | SQLAlchemy 2.x（async, aiomysql）+ 只读账号 | — | 分析类查询 ORM/原生 SQL 双模式 |
 | 部署 | 独立 venv/conda，systemd 或 Windows 服务；与 dkd-parent 同机或同内网 | — | 与现有运维形态一致，Phase 0 不引入容器化复杂度 |
@@ -385,7 +387,7 @@ dkd-agent/
 ├─ app/tools/                  # Java REST/MySQL 只读 工具封装(带鉴权/超时/重试)
 ├─ app/models/                 # Pydantic: 补货计划/诊断报告/对话消息
 ├─ app/db/                     # SQLAlchemy 只读引擎 + SQL 白名单校验器 + 聚合工具(范围比较/分批)
-├─ app/checkpoint.py           # AsyncSqliteSaver 初始化与生命周期管理
+├─ app/checkpoint.py           # checkpointer 工厂（sqlite / postgres 双后端）+ 生命周期管理
 ├─ app/security.py             # 服务间密钥校验(回调) + 用户头解析(网关透传)
 └─ tests/                      # 单测 + 工具层集成测试(打桩Java接口)
 ```
@@ -442,7 +444,7 @@ if (!emp.getRegionId().equals(vm.getRegionId())) {
 - Python 工程骨架 + FastAPI 服务 + 健康检查；DeepSeek 连通（复用现有账号）；依赖锁定（**精确版本三元组**）；
 - Java 侧 `AgentGatewayController/AgentCallbackController/AgentProperties` + 单测；SSE 逐块透传验证（`StreamingResponseBody`）；
 - MySQL 只读账号 + **`tb_` 真实表白名单** + 数据量与索引勘查；建表 DDL（agent_conversation/message/decision_log/restock_plan）；
-- **checkpointer：SQLite `AsyncSqliteSaver`**（Redis 3.2.100 不可用的实测依据见 §5.1）；
+- **checkpointer：默认 SQLite `AsyncSqliteSaver`，可切 PostgreSQL `AsyncPostgresSaver`**（Redis 3.2.100 不可用的实测依据见 §5.1；切换开关与回滚见 §5.1）；
 - 前端 SSE 客户端（绕开 axios）+ AI 助手侧边栏壳（纯流式 echo 验证全链路）；
 - `request_id` 贯穿 + 决策留痕 + **LLM 成本计量与限额**；LangGraph 版本锁定与 state schema 评审；
 - 安全整改四项（提交 / 轮换 / Git 历史清理 / 生产注入校验）；

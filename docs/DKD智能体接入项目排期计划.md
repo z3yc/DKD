@@ -65,7 +65,7 @@
 | 0-7 | Java 回调：AgentCallbackController（服务间密钥 + 路径白名单 + 速率限制） | 1.5d | 09-29 ~ 09-30 | Java | 无密钥 401；密钥伪造 401；限流生效 | 0-6 |
 | 0-8 | **G1 中间验收**：SSE 端到端透传（前端→网关→Python echo） | 1d | 09-30 | Java+前端 | 前端逐 token 渲染；Python 停机时返回降级提示 | 0-6,0-11 |
 | 0-9 | Python 服务骨架：FastAPI 入口 / config / security（用户头解析 + 服务间密钥）/ 统一异常 + **request_id 贯穿网关→Python→工具→回调** | 1.5d | 09-23 ~ 09-24 | Python | /health、/agent/chat echo 可调；日志含 request_id | 0-2,0-7 |
-| 0-10 | **checkpointer 落地（选型已定，见下）**：SQLite `AsyncSqliteSaver` 接入 + 会话跨请求恢复 + 断线重连续接 + 文件持久化/备份/迁移路径成文 | 1d | 09-28 | Python | 会话跨请求恢复；重启后会话可续；迁移路径写入 runbook | 0-9 |
+| 0-10 | **checkpointer 落地（选型已定，见下）**：SQLite `AsyncSqliteSaver` 接入 + 会话跨请求恢复 + 断线重连续接 + 文件持久化/备份/迁移路径成文。**V2.9 追加**：PG 后端工厂化（`DKD_AGENT_CHECKPOINT_BACKEND=sqlite|postgres`） | 1d | 09-28 | Python | 会话跨请求恢复；重启后会话可续；迁移路径写入 runbook | 0-9 |
 | 0-11 | 前端 SSE 客户端（**绕开 axios**：fetch + ReadableStream + AbortController + 心跳）+ AI 助手侧边栏壳 | 2.5d | 09-23 ~ 09-28 | 前端 | 与原型交互一致：流式气泡、快捷问题条、**可取消** | 0-6 |
 | 0-12 | 结构化日志 + 决策留痕写入 agent_decision_log + **LLM 成本计量与限额（按用户/场景 token 统计 + 上限告警，自 V1 3-9 前移）** | 1.5d | 09-29 ~ 09-30 | Python | 一次对话的留痕可查；计量报表可查；超额熔断 | 0-10 |
 | 0-13 | LangGraph 版本锁定复核 + **补货 state schema 设计评审**（LangGraph 持久化语义：新代码立刻作用于历史 checkpoint，schema 不可随意变更） | 0.5d | 10-08 | 全员 | state 字段冻结文档 + 变更兼容规则 | 0-10 |
@@ -207,9 +207,9 @@
 
 ## 七、执行进度（滚动更新）
 
-> 更新于 **2026-09-28**（Phase 1 执行至 **1-9**，1-9 定时分析闭环 + 发现并修掉 Java 侧 401 误判）。
-> **最近一次：2026-09-28 —— 本轮完成 1-9（`POST /agents/restock/analyze` + 暂停开关消费 + dkd-quartz `agentTask.restockAnalyze` + 注册 SQL）与 FIX-19（JDK 流式请求 401 被误报为不可达）。**
-> 状态图例：✅ 已完成并验证 / 🔄 进行中 / ⏳ 待办 / ⛔ 阻塞。
+> 更新于 **2026-09-28（V2.9）**（Phase 1 执行至 **1-11**：1-9 定时分析闭环 + FIX-19，并在同一轮交付 **1-10/1-11 前端工作台** 与 **PG checkpointer 后端（评审稿 V1.0 定稿）**）。
+> **最近一次：2026-09-28 —— ① 1-10/1-11 前端补货工作台前端交付（构建通过，待真浏览器验证）；② PG checkpointer 落地（工厂 + 双实现 + T3 契约测试，D5 待闭环）；③ 文档三处同步（方案 V1.2 / 评审稿 V1.0 / AGENTS §1 约束 5）。**
+> 状态图例：✅ 已完成并验证 / 🟡 已实现待验收 / 🔄 进行中 / ⏳ 待办 / ⛔ 阻塞。
 > **Phase 1 剩余任务逐条状态见下方 Phase 1 表；其中“待修/前置”类问题统一登记在 §八；
 > 分支/合并/推送的交付状态见“交付与分支状态”。**
 
@@ -226,7 +226,7 @@
 | 0-7 | Java 回调（`AgentCallbackController`） | ✅ | `/agent/callback/task` 服务间密钥 + 白名单 + 限流；实机 4 项拒绝路径：无密钥 401 / 伪造 401 / 未配置密钥 503 / 非白名单 404；正确密钥 → 鉴权放行并由 `insertTaskDto` 校验链拒绝（“售货机不存在”**原样回传**，未写库） |
 | 0-8 | G1 中间验收（SSE 端到端透传） | ✅ 服务端链路全过（前端视觉待手测） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**（登录→状态→SSE 逐帧+requestId 回带→回调 3 类拒绝→未认证信封→停机降级）；一键降级 `--agent.enabled=false` 另测 4 项全符 |
 | 0-9 | Python 服务骨架（/health + SSE + 鉴权 + request_id） | ✅ | ruff / pytest 全绿；SSE 实测 meta→delta→done 逐帧输出、身份头透传、客户端断开即停 |
-| 0-10 | checkpointer 落地（SQLite） | ✅ | 跨请求恢复（history_len 2→4）、进程重启后仍可读回、`Last-Event-ID` 断点续传（只补发未收帧）均已验证 |
+| 0-10 | checkpointer 落地（SQLite 默认 + **PG 可切换**） | ✅ 代码就绪 | 跨请求恢复（history_len 2→4）、进程重启后仍可读回、`Last-Event-ID` 断点续传（只补发未收帧）均已验证。**V2.9 新增 PG 后端**：`app/checkpoint.py` 工厂（`SqliteCheckpointStore`/`PostgresCheckpointStore`）+ 配置校验（fail-fast）+ `/health` 报**实际装配**后端与 `checkpoint_open`；契约测试 **16 项**（`tests/test_checkpoint_factory.py`，零外部依赖）。⚠️ **真 PG 路径未验证**（`checkpoint.py` 覆盖率 88%，未覆盖段即 PG `open()` 主体）——需 D5 闭环后跑 `verify-checkpoint-pg.py` |
 | 0-11 | 前端 SSE 客户端 + 侧边栏壳 | ✅ | `sseFrames.js`（纯分帧）/`sse.js`（fetch+ReadableStream+AbortController+空闲超时）/`api/manage/agent.js`/`store/modules/agent.js`/`components/AgentAssistant/index.vue` + Navbar 入口 + layout 挂载；`npm run build:prod` exit 0；**用真实抓包字节流跑 18 项分帧断言全过**（含 303 个二分切点/逐字符/随机分片/CRLF/半帧） |
 | 0-12 | request_id + 留痕 + 成本计量与限额 | ✅ | 留痕/消息投影实写 MySQL（手机号实测脱敏为 `138****5678`，明文 0 行）；限额熔断 429；`/agents/usage/summary` 鉴权 401/200 正确；**审计库故障降级不中断对话**（3 项降级测试覆盖） |
 | 0-13 | LangGraph 版本锁定 + state schema 评审 | ✅ 评审稿就绪（待开会确认） | 交付 `docs/dkd-agent-restock-state-schema.md`（冻结表 + 中断契约 + 兼容规则 + 10 项检查清单）；代码侧 `restock_state.py` 冻结 + 15 项契约测试；**评审中发现 `expect_capacity` 语义陷阱**（见该稿 §4.2） |
@@ -239,9 +239,10 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | **59 files already formatted** |
-| `uv run pytest` | **276 passed**（10 个 live 用例默认 deselect），覆盖率 **95.11%**（要求 ≥70%）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
-| `mvn -pl dkd-admin -am test` | **Tests run: 60, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient **10** / TaskCreate 6 / **AgentTask 10**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
-| `npm run build:prod`（**本轮新增**） | exit 0（仅既有 chunk 体积告警） |
+| `uv run pytest` | **292 passed**（10 个 live 用例默认 deselect；本轮 **+16**：checkpointer 工厂/配置/脱敏契约测试），覆盖率 **94.89%**（要求 ≥70%）。覆盖率较上轮 95.11% 略降，原因**如实说明**：新增了未被真库覆盖的 PG `open()` 分支（`app/checkpoint.py` 88%）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
+| `mvn -pl dkd-admin -am test` | **Tests run: 60, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient **10** / TaskCreate 6 / **AgentTask 10**）；纯单测，不依赖 MySQL/Redis/Spring 上下文。**本轮 Java 侧未改动**，作为回归基线 |
+| `uv run ruff check` / `ruff format --check` | All checks passed；**60 files** already formatted（本轮新增 1 个测试文件） |
+| `npm run build:prod`（**本轮新增前端交付**） | exit 0（仅既有 chunk 体积告警）；新增 `views/manage/restock/**` 已按路由分包（`RestockAdjustDialog` / `RestockReasonDialog` 各自成 chunk） |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142）；**1-9 新增任务注册 `docs/ddl/agent_restock_job.sql`** 已在本机 dkd 库执行（校验查询 1 行：cron `0 0 6 * * ?` / misfire=2 / concurrent=1 / status=0），幂等重跑退出码 0 |
 | 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**31/31 PASS**，其中 [H] 段为 1-7b 的留痕断言）；**`docs/scripts/verify-1-9-analyze.py`（本轮新增，真 MySQL + 真实 FastAPI，20/20 PASS：鉴权 3 项 / 暂停开关 3 项 / 正常触发 3 项 / 重入安全 2 项 / 留痕 9 项）**；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
@@ -302,7 +303,7 @@
 | 1-7b | 人工干预补写 `agent_decision_log` 留痕（**FIX-2**） | ✅ | 0.5d。**AGENTS §6.3「每次写操作决策必须留痕」已闭环**：`app/services/restock_service.py` 的 `_audit()` + 可注入留痕写入器。① 覆盖 **六类动作**（confirm/adjust/skip/restore/pause/resume），`scene=2`、`trigger_type=3`、`target_type=plan|restock_pause`；② **四条终态路径都留痕**：成功 / 幂等（`already_ordered`）/ 状态机拒绝与并发冲突（`result=3`+原文 `error_msg`）/ 建单失败（`result=2`）——只记成功的留痕等于把失败藏起来；③ **不写 `llm_output`**（人工操作不得伪装成模型建议；顺带修掉 `JSON` 列把 `None` 存成 JSON `null` 的问题，改为 SQL NULL）；④ `X-Request-Id` 贯穿到留痕（confirm 回调也从合成 id 改为网关 rid）；⑤ 审计故障只 WARN 不阻断业务（假写入器抛 `RuntimeError` 的回归用例）。**证据**：真库 `verify-1-7-restock-api.py` **[H] 段 31/31 PASS**（含 request_id 命中、拒绝原因原样保存、`llm_output IS NULL`）；单测 11 项（含真 SQLite 落库用例） |
 | 1-8 | 接单人分配策略与幂等防护 | 🟡 主体已实现，验收待环境 | Python 已落地区域匹配、批量查人/负载、并发 CAS（状态 7）、非法恢复状态拒绝；Java FIX-1 已扩展防重状态（`TaskServiceImpl:180-190` 改为查 1-待接单+2-进行中）；回归用例新增。仍需 Python 3.11 pytest、Maven 回归及 10 台跨区域真数据/并发验收（本轮已复跑门禁全绿，见上「质量门禁现状」）。状态 7 在回调结果不确定时禁止自动释放，按复盘文档人工对账。
 | 1-9 | dkd-quartz 06:00 定时任务（`agentTask.restockAnalyze`） | ✅ | ① **Python**：新增 `app/api/ops.py::restock_analyze`（`POST /agents/restock/analyze`，服务间密钥路由级依赖）+ `app/services/restock_analyzer.py`（**FIX-10 的消费方**：暂停时直接 skipped、不建图不读业务库；threadId=`restock-<planDate>`；成败都写 `agent_decision_log`，trigger_type=2/user_id=NULL/llm_output=NULL）+ `app/services/decision_audit.py`（留痕纪律抽成一份，1-7b 与 1-9 共用，避免“其中一条把异常吞了”漂移）；② **Java**：新增 `dkd-quartz/.../task/AgentTask.java`——开关关闭/被暂停**不算失败**、4xx 不重试、5xx 重试（`agent.analyzeRetryMax` 默认 2 + 线性退避）、最终失败抛异常交给 `sys_job_log` 留失败记录（AGENTS §6.4）；③ **注册**：`docs/ddl/agent_restock_job.sql`（concurrent=1 禁并发、misfire_policy=2 错过补跑一次、status=0 正常，含回滚）；④ 测试 +30（Python 18：执行器 8 + 接口 9 + 图重入 1；Java 12：AgentTask 10 + 上游客户端 401 回归 2）；⑤ **端到端 20/20 PASS**（`verify-1-9-analyze.py`，真库：暂停期间计划行 update_time 不变、重复触发计划行数不变、request_id 贯穿留痕） | 1-4, 1-7 |
-| 1-10 / 1-11 | 前端补货工作台 + 调整/跳过弹窗与暂停横幅 | ⏳ | 原型对齐是 M2 验收项；**FIX-12**（真浏览器视觉验证）、**FIX-15**（建单失败重试的提示文案）一并在此处理 |
+| 1-10 / 1-11 | 前端补货工作台 + 调整/跳过弹窗与暂停横幅 | 🟡 前端已交付，待真浏览器验证 | **V2.9 交付**：`api/manage/restock.js`（8 个函数，**绕开 axios 拦截器**以保住 409/400 的业务文案）、`views/manage/restock/index.vue`（统计卡/三步引导/筛选 chips/依据折叠/暂停横幅/批量确认逐条汇总）、`RestockAdjustDialog.vue`（数量 / 按新参数重算 **互斥二选一**）、`RestockReasonDialog.vue`（跳过/恢复/暂停/恢复分析四场景复用）、菜单 SQL `docs/ddl/agent_restock_menu.sql`。**两处“不造假”取舍已落地**：无数据源的统计卡留「—」并标注来源；契约无点位名字段则只显示 `innerCode`。**待办**：**FIX-12**（真浏览器视觉验证）、菜单 SQL 未在任何环境执行（无菜单则页面不可达） |
 | 1-12 | 联调 + 数据核对 | ⏳ | 前置：**FIX-3**（报表参数绑定）/ **FIX-4**（索引 DDL）/ **FIX-5**（档案权威源） |
 | 1-13 | M2 验收（≥10 台真实设备全闭环） | ⏳ | 前置：**FIX-6**（生产/测试库数据导出）+ dkd-app 测试环境与账号 |
 | 1-14 | 规则版并行对比启动 | ⏳ | 依赖 1-13；对比看板数据源见 §八 FIX-6 的历史人工补货量 |
@@ -439,7 +440,7 @@
 | FIX-11 | 🟡 | **1-5 的真 LLM 校准链路未做 live 端到端**：本机全部验收都在 `DKD_AGENT_RESTOCK_CALIBRATION_ENABLED=0` 下跑 | 1-6/1-7 验收脚本均显式关闭校准；单测全打桩（AGENTS §8 要求） | “系数夹取/理由生成”在真实模型上尚未验证（可能遇到 JSON 漂移、超时、成本） | 建议随 1-9 或 M2 前安排一次 live 冒烟（需 key 与费用） | 待验证 |
 | FIX-12 | 🟡 | **前端视觉/交互未做真浏览器验证**（补货工作台 1-10/1-11 尚未开始，0-11 侧边栏为构建+分帧断言交付） | 排期 §七 Phase 0 之 6（0-11 手测清单 10 项中 4 项已自动化）；1-10/1-11 为待办 | 原型对齐是 M2 验收项，纯构建通过不足以证明 | **1-10/1-11** | 待做 |
 | FIX-13 | 🔵 | `X-Agent-Region` 常缺省：`sys_user` 无区域映射，网关只能给空 | 0-15 记录；`AgentRegionResolver` 已 fail-soft 不注入 | 仅影响审计上下文，“按设备区域选人”不受影响（取 `vm.region_id`） | 3-7 或后续（若审计需要按区域统计） | 待评估 |
-| FIX-14 | 🔵 | **Redis 3.2.100 技术债**：无模块系统、内核 < 5.0（无 Streams）、`appendonly no`、与 Java 共用 db0 | 方案 V1.1 §5.1 实测；本期用 SQLite saver 绕开 | 多实例部署或需跨机共享会话时必须升级（Redis 8.0+/Stack 或 Postgres saver） | 独立技术债（触发条件已写入 runbook）；**评审稿已就绪**：`docs/dkd-agent-postgres-selection-review.md`（D1~D5 待拍板） | 登记中（待评审） |
+| FIX-14 | 🔵 | **Redis 3.2.100 技术债**：无模块系统、内核 < 5.0（无 Streams）、`appendonly no`、与 Java 共用 db0 | 方案 V1.1 §5.1 实测；本期默认仍用 SQLite saver 绕开 | 多实例部署或需跨机共享会话时必须升级 | 独立技术债；**V1.0 评审已定稿**：`docs/dkd-agent-postgres-selection-review.md`（D1~D4 拍板方案 A，**D5 待运维闭环**）；代码侧已落地 PG 后端开关（`app/checkpoint.py`） | 🟡 **降级为「待 D5 闭环 + 真库验收」**（触发条件已有实现，不再是纯登记） |
 | FIX-15 | 🔵 | **回调失败后的“重试建单”只有隐式路径**：建单失败时计划状态不变，运营需**再次点「确认」**重试（服务层已如此实现，但未在接口文档/前端提示中写明） | `restock_service._execute`（失败不落库、状态不变）+ `restock_graph.create_tasks` 同类取舍 | 运营可能以为“点了没反应”；接口文档缺一句说明 | 1-10 前端提示 + 4-1 接口文档 | 待补文档 |
 | FIX-16 | 🔵 | **`@RateLimiter` 的 Redis 依赖 fail-closed 未演练**：Redis 不可用时回调用例会全拒 | 0-15 记录（“属预期行为，未做演练”） | 上线后 Redis 抖动可能表现为“Agent 建单全失败” | 3-9 压测与故障演练 | 待演练 |
 | FIX-17 | 🟡 | **M1 遗留：真 LLM 全链的 `agent.enabled=false` 一键降级已验，但“Python 侧 LLM 密钥缺失→降级到规则增强版”的自动降级未验**（目前是校准开关手动关闭） | `restock_calibration.calibrate_plan` 捕获异常降级（单测覆盖）；真实密钥失效场景未演练 | 密钥过期时行为可预期（降级）但未实测 | 3-9 故障演练 | 待演练 |
@@ -448,11 +449,65 @@
 
 ---
 
+## 九、按「智能体能力批次」的重排版本（V2.9 新增）
+
+> 为什么单独一份：§三 的原排期单位是**人日**，适合资源核算，不适合判断「现在该做什么」——
+> 因为多个任务都卡在外部输入（数据/账号/业务结论）上，人日加起来没有意义。
+> 本节的单位改为**一次可验收的能力增量（波次）**，每波的判据是「**出口条件**」而不是日期。
+> 与 §三 不矛盾：§三 仍是人力与工期基线，本节是**执行顺序与门禁**。
+
+### 9.1 范围（本轮排期包含 / 明确不排）
+
+| 处理 | 项目 |
+| --- | --- |
+| **保留** | A 补货闭环（1-10/1-11、1-12、1-13、1-14 缩水、FIX-3/4/5/15）；B 存储底座（PG）；C 知识库（pgvector）；D 诊断 Agent（2-1~2-9）；E 合规与上线（3-7、3-9、FIX-7、部署栈真机验证、4-1~4-3） |
+| **砍掉** | Phase 3 的 3-1~3-5（Copilot / 受控 NL2SQL / 评测集）——成本最高、收益最慢、风险最大；先用固定报表 |
+| **后置** | 3-6 补货复盘自动化（→ 观察期）；FIX-13（区域头）、FIX-14（Redis 升级）、FIX-18（代理通道）登记不排 |
+| **数据决定** | 5-3 自动建单放量（本就是评审项） |
+
+### 9.2 六个波次
+
+| 波次 | 能力增量（一句话） | 入口条件 | 主要工作项 | 出口验收 | 当前状态 |
+| --- | --- | --- | --- | --- | --- |
+| **波1** | 运营第一次能**看见并处理** Agent 的补货建议 | 无（Phase 1 主体已 ✅） | 1-10 工作台、1-11 弹窗与暂停横幅、FIX-15 文案、FIX-12 真浏览器验证 | 对齐原型 V2；每操作有确认与状态反馈；loading `finally` 复位；真浏览器手测全过 | 🟡 **前端已交付**（构建 exit 0），待真浏览器验证 + 菜单 SQL 执行 |
+| **波2** | 会话存储不再绑死单机：**多实例/跨机共享开箱可解** | **D5 闭环**（PG 账号 + 生产放行） | checkpoint 工厂化 + PG 实现、授权脚本、T1/T3 测试、回滚演练 | `=postgres` 启动 `/health` 正常；真 PG 跑「中断→重启→恢复」；切回 `sqlite` 行为逐字不变；**账号无 CREATE 权限时的首次部署失败被显式覆盖** | 🟡 **代码就绪**（契约测试 16 项），真 PG 路径待 D5 |
+| **波3** | 建议量**被证明与业务口径一致**并可真机验收 | 波1 完成 + **FIX-6 数据导出** + **FIX-5 业务拍板容量权威源** | FIX-3（Java 报表绑定）→ FIX-4（索引 DDL）→ 1-12 对账 → 1-13 M2 验收（10 台真机）→ 1-14 抽样对比 | 3 台设备全字段对账一致；同设备只有一个容量数；无培训完成「夜间分析→早晨确认→批量建单→dkd-app 接单流转」；建立缺货率/建议偏差/人工调整率三项基线 | ⏳ **卡在外部输入**（三项都不是写代码能解决的） |
+| **波4** | Agent 第一次拥有**可检索的领域知识**（不再只是实时查库） | 波2 完成 + 2-7 数据质量抽样通过 | pgvector 与 checkpointer**共用实例分 schema**；案例库 schema + 授权；**抽取口径冻结文档**；同步/重建链路（含失败告警）；检索工具（先规则/关键词） | ≥50 条案例可检索；口径冻结成文；**重建脚本能从 `tb_task` 全量重跑**；检索结果可复现 | ⏳ 未开工（本次只落 PG 实例，向量表不建） |
+| **波5** | 「3 号门那台机器不出货了」→ 多轮问诊 → 置信度排序病因 → 一键建单 | M2 验收通过 + 波4（**抽样不达标时降级为关键词检索，不阻塞本波**） | 2-1 异常检测 → 2-2 历史工单检索 → 2-3 多轮问诊+实体消歧 → 2-4 结论结构化 → 2-5 维修工单卡片 → 2-6 前端诊断页 → 2-8 兜底降级 | M3：无培训完成 5 个真实故障的「诊断→建单」闭环；诊断信息量对比报告 | ⏳ 未开工 |
+| **波6** | 系统具备**可审计、可演练、可回滚**的上线资格 | 波3/5 全绿 + 部署栈真机验证通过 | 3-7 审计页 → 3-9 压测与故障演练（含 FIX-16/FIX-17）→ **FIX-7 凭据轮换（重点验 FIX-19 的 401 透传）** → 部署栈真机验证 → 4-1~4-3 | 写操作 100% 可查可回放；演练清单全过；上线检查单全过；回滚预演过；runbook 成文 | ⏳ 未开工 |
+
+### 9.3 依赖与并行
+
+```
+A线  [波1 前端可用] ──► [波3 对账+M2验收] ──┐
+                            ▲              │
+                      外部:FIX-6 数据      ├──► [波6 合规上线] ──► 观察期(5-1/5-2/5-4)
+B线  [波2 PG底座] ──► [波4 知识库地基] ──► [波5 诊断Agent] ─┘
+       ▲                     ▲
+   外部:D5 账号        2-7 数据抽样
+```
+
+- **关键路径**：波1 → 波3 → 波5 → 波6；**供给线**：波2 → 波4（不阻塞关键路径）。
+- **可并行**：波1 ∥ 波2（**已在并行执行**）；波3 ∥ 波4（波2 完成后）；波6 内部的 3-7 / 部署验证 / FIX-7 三者互不依赖。
+- **等外部条件时不空转**：等 FIX-6 → 做波1 全量 + FIX-3 那一行 Java SQL + FIX-4 评审；等 D5 → 做波1 + T3 契约测试（不连真库）；等 M2 真机 → 做波2、波4。
+
+### 9.4 一个排序结论（若只能做一件事）
+
+1. **波1 前端工作台** —— 只做这件，补货 Agent 就从「能算」变成「能用」，且零外部依赖；
+2. **FIX-5 找业务拍板 + FIX-3 一行 SQL** —— 成本极低，却是对账与 M2 验收的开关；
+3. **催 FIX-6 数据导出** —— 不是开发任务，但是关键路径上最大的闸门；
+4. **波2 PG 落地** —— 方向已定，越早引完越省二次迁移；
+5. 其余按 §9.2 推进。
+
 ---
 
-*本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.1）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。*
+---
 
-*版本：**V2.8（2026-09-28，任务 1-9 定时分析闭环 + FIX-19/FIX-10 关闭）**。本次变更：① §七 Phase 1 表 1-9 行转 ✅（交付物 + 21 项新测试 + 20/20 真库端到端）；② §七 质量门禁更新为实测值（pytest 276 passed/95.11%、mvn 60 passed、ruff format 59 文件、verify-1-9 20/20）；③ §八 FIX-10 关闭、新增 FIX-19（JDK 流式请求 401 被误报为不可达，已修，含代价说明），计数改为「已关闭 5 / 待修 14」；④ 新增 2026-09-28 补记（交付内容 / 验证 / 未验证项 / 下一步）；⑤ 「交付与分支状态」新增本地分支行（**未推送/未合并**）。**方案口径未变（仍 V1.1）**：1-9 是排期 V2 已列任务，未改变任何既定约定；新增的“定时任务四条约定”（开关关闭/被暂停不算失败、4xx 不重试而 5xx 重试、最终失败必须抛异常交给 `sys_job_log`）已回写 AGENTS §6.4。*
+*本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` **V1.2**）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0（已定稿）**。*
+
+*版本：**V2.9（2026-09-28，1-10/1-11 前端交付 + PG checkpointer 落地）**。本次变更：① §七 Phase 1 表 1-10/1-11 转 🟡（前端已交付、待真浏览器验证），Phase 0 的 0-10 行补 PG 可切换与未验证边界；② §七 质量门禁更新为实测值（pytest **292 passed / 94.89%**、ruff 60 文件、`npm run build:prod` exit 0、`mvn -pl dkd-admin -am test` **60 passed / BUILD SUCCESS**（Java 本轮未改动，作回归基线））；③ §八 FIX-14 降级为「待 D5 闭环 + 真库验收」；④ **新增 §九「按能力批次的重排版本」**（六波次 + 依赖图 + 裁剪清单）；⑤ 新增 2026-09-28 开发进度补记（V2.9）。**方案同步改版为 V1.2**（§5.1 会话持久化行、§5 目录结构、§十 `checkpoint.py` 职责），评审稿置为 V1.0 定稿——三者互相引用版本号（AGENTS §4.3）。*
+
+*上一版 **V2.8（2026-09-28，任务 1-9 定时分析闭环 + FIX-19/FIX-10 关闭）**。本次变更：① §七 Phase 1 表 1-9 行转 ✅（交付物 + 21 项新测试 + 20/20 真库端到端）；② §七 质量门禁更新为实测值（pytest 276 passed/95.11%、mvn 60 passed、ruff format 59 文件、verify-1-9 20/20）；③ §八 FIX-10 关闭、新增 FIX-19（JDK 流式请求 401 被误报为不可达，已修，含代价说明），计数改为「已关闭 5 / 待修 14」；④ 新增 2026-09-28 补记（交付内容 / 验证 / 未验证项 / 下一步）；⑤ 「交付与分支状态」新增本地分支行（**未推送/未合并**）。**方案口径未变（仍 V1.1）**：1-9 是排期 V2 已列任务，未改变任何既定约定；新增的“定时任务四条约定”（开关关闭/被暂停不算失败、4xx 不重试而 5xx 重试、最终失败必须抛异常交给 `sys_job_log`）已回写 AGENTS §6.4。*
 
 *上一版 **V2.7（2026-09-23，Docker 部署栈提前交付）**。本次变更：① 新增 `deploy/docker/` 全套部署脚本与四个 Dockerfile（详见补记）；② 为容器化把 DB/Redis/agent 地址改为带默认值的占位符（本机行为不变）；③ 实测并登记两个容器化障碍（agent 账号 host 模式、业务表 DDL 缺失在部署场景下成为硬阻断）；④ 记录未验证项（真实构建/镜像 tag）。**方案口径未变（仍 V1.1）**；若部署脚本在真实服务器上验证后需要调整运行时形态（如引入非 root 运行/HTTPS），届时按 §4.3 同步方案 §5.1 与 runbook。*
 
@@ -500,3 +555,23 @@
 - 只读查询参数展开：复查发现 read_tools 的 IN 参数文本查询须声明 SQLAlchemy expanding bind，已为设备编号、区域、状态列表逐处绑定，并加回归断言；这是安全参数绑定和驱动兼容性修复，不是拼接 SQL。
 - 遗留：FIX-2（人工调整/跳过等决策写入 agent_decision_log）本次未处理，仍需在计划中独立闭环；不得宣称所有决策留痕已完成。
 - 验证结果：使用独立 Python 3.11.13 与隔离依赖环境运行全量 `pytest -p no:cacheprovider`，`247 passed, 10 deselected`；改动文件 Ruff check 通过、`ruff format --check .` 通过（54 文件）。全量 `ruff check .` 仍被既有 `app/audit.py:59` 的 UP038 阻断，本轮不顺手扩展修复范围。Java 定向 `AgentTaskCreateServiceTest` Maven 命令通过（退出码 0）。首次运行 read_tools 回归暴露 expanding bind 安装点遗漏和 SQL 形状断言过时，修复后重跑通过；全量 pytest 受系统 TEMP 权限阻挡，改用仓库隔离临时目录后全绿。验收仍需真实库只读抽样、10 台跨区域派单及双并发确认；若结果不确定，需人工查 Java 工单及 Agent 计划后处置。
+
+### 2026-09-28 开发进度补记（V2.9 · 波次1 前端交付 + 波次2 PG checkpointer）
+
+- **交付内容**：
+  **波次 1（前端，A 线）**：① `dkd-vue/src/api/manage/restock.js`（8 个函数）；② `dkd-vue/src/views/manage/restock/index.vue`（工作台主体）；③ `components/RestockAdjustDialog.vue`（两种模式**互斥二选一**）；④ `components/RestockReasonDialog.vue`（跳过/恢复/暂停/恢复分析四场景复用）；⑤ `docs/ddl/agent_restock_menu.sql`（菜单 + 5 个按钮权限 + 回滚，**未在任何环境执行**）。
+  **波次 2（Python，B 线）**：① `app/checkpoint.py` 重构为**工厂 + 双实现**（`SqliteCheckpointStore` / `PostgresCheckpointStore`）+ DSN 脱敏 + `is_open`；② `app/config.py` 新增 `checkpoint_backend` / `pg_dsn` + 两个校验器（未知后端拒绝、缺 DSN 拒绝）；③ `app/main.py` 改工厂装配，`/health` 改报**实际装配**后端与 `checkpoint_open`；④ `tests/test_checkpoint_factory.py`（**16 项**零依赖契约测试）；⑤ `docs/ddl/create_agent_pg_role.sql`（PG 授权，**未执行**）；⑥ `.env.example` 两个占位符；⑦ `pyproject.toml` **可选依赖组** `postgres`（`langgraph-checkpoint-postgres 3.1.2` / `psycopg 3.3.6`）。
+- **仅有的行为变化（对既有链路零影响）**：① 前端新增页面与 API 层（未改任何现有页面/路由文件）；② checkpoint 默认后端仍是 sqlite，行为逐字不变；③ `/health` 字段由 `sqlite_path` 改为 `checkpoint_backend` + `checkpoint_location` + `checkpoint_open`（**已核实无脚本/用例断言旧字段名**）。"正向验证与反向断言"：`tests/test_checkpoint.py`、`tests/test_restock_graph.py` 与 `docs/scripts/verify-1-6/1-7*.py` 仍按旧名 `CheckpointStore` 调用 → **保留向后兼容别名**（verify 脚本是已归档的验收证据，改它们会让"当时验过的代码"与"现在能跑的脚本"不一致）。
+- **本轮两个「不造假」取舍（M2 验收要求数字可核对）**：
+  1. **无数据源的统计卡留「—」**：后端 `stats` 只返 `pending`/`urgent`/`totalQuantity`，原型 V2 的「预测 7 日缺货率」「上期建议准确率」**没有数据源** → 卡位留空并标注「待接入（1-14 双跑对比 / 3-6 复盘自动化）」，不填演示数字；
+  2. **契约里没有的字段不拼假值**：`summarize_plan` 只有 `innerCode`/`vmId`，**没有点位名/地址** → 页面只显示设备编号，不伪造"北京中关村创业大厦"这类看起来很像真的的占位。
+  配套的第三条（必须先决策才能落地）：原型「全部确认建单」后端**故意不提供批量端点**（`api/restock.py` docstring：批量端点会把"一台失败是否整批回滚"变成没人说得清的问题）→ 前端改为**逐条串行调用 + 逐条汇总结果**，失败台号列清且不隐掉已成功的，而不是"后置不做"。
+- **本轮发现并修掉的真问题**：`/health` 可能在 checkpointer 已关闭时仍报"后端正常"——进程关闭后模块级单例仍在，只看后端名会得到一个**误导排障的假绿灯**（AGENTS §6.4「告警要可信」）。修法：给存储合同加 `is_open`，`/health` 单独列 `checkpoint_open`，并加断言（打开后 True / 关闭后 False）。
+- **验证（全部实跑）**：`uv run ruff check .` All checks passed；`uv run ruff format --check .` **60 files already formatted**；`uv run pytest` **292 passed / 10 deselected**（本轮 **+16**），覆盖率 **94.89%**；`npm run build:prod` **exit 0**；`mvn -pl dkd-admin -am test` **60 passed / BUILD SUCCESS**（Java 本轮未改动，作回归基线）。
+- **未验证（不隐瞒）**：
+  ① **PG 真库路径未验证**：`app/checkpoint.py` 覆盖率 **88%**，未覆盖段即 `PostgresCheckpointStore.open()` 主体（懒导入分支已覆盖）——需 D5 闭环后跑 `verify-checkpoint-pg.py`；
+  ② **前端未做真浏览器视觉验证**（FIX-12 仍开着）：AGENTS §8 允许以"构建通过 + 手测清单"交付，本次未引入 Playwright 等未声明依赖；
+  ③ **菜单 SQL 未执行**：不执行则页面在菜单里不可达（这是"代码已交付"与"运营能用"之间的最后一步）；
+  ④ **批量确认的部分失败场景未真机演练**：逐条汇总逻辑已写，但未在"真 Java 回调中途失败"下跑过（需 M2 真机环境）；
+  ⑤ **PG 权限方案 2（无 CREATE 权限）未验证**：授权脚本方案 1 给角色独立库 owner（`setup()` 开箱可用），方案 2 的 `setup()` 行为**未经真库验证**，选它前必须先验。
+- **下一步（按风险排序）**：① 执行菜单 SQL + 真浏览器跑一遍波1 手测清单（FIX-12）；② 催 **D5**（PG 账号/生产放行）与 **FIX-6**（生产/测试库数据导出）；③ FIX-5 业务拍板容量权威源 + FIX-3 那行 Java SQL；④ 以上到位后进入波3（1-12 对账 → 1-13 M2 验收）。
