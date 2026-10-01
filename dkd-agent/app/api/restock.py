@@ -80,10 +80,33 @@ async def list_plans(request: Request, plan_date: str | None = None) -> dict[str
     return await _guard(service.list_plans(target))
 
 
-@router.post("/plans/{plan_id}/confirm", summary="确认建单（幂等：已建单再点会返回“已建单”）")
+@router.post(
+    "/plans/{plan_id}/confirm",
+    summary="确认建单（失败后可原样重试；已建单再点返回“已建单”）",
+)
 async def confirm(
     plan_id: int, request: Request, plan_date: str | None = None
 ) -> dict[str, object]:
+    """确认建单——幂等、可重试（FIX-15 的接口契约）。
+
+    三种结果形态，前端按状态码分别提示：
+
+    | 结果 | 状态码 | 计划状态 | 运营下一步做什么 |
+    | --- | --- | --- | --- |
+    | 建单成功 | 200 | → 4-已建单（无接单人时 → 6-待指派） | 无需操作 |
+    | **建单失败** | **502** | **不变** | **原样再点一次「确认建单」**（无需改库/无需等次日） |
+    | 重复确认 | 200 | 保持 4-已建单 | 无需操作（幂等，不会建出第二张工单） |
+    | 状态机/并发拒绝 | 409 | 不变 | 刷新后按提示处理（如“正在建单中”） |
+
+    **为什么要把“可重试”写进接口文档（FIX-15）**：建单失败时服务层**刻意不回退计划状态**
+    ——“改回建议”会让运营以为没点过而重复点，也可能把已经建出的工单状态改乱。
+    代价是重试路径变成“隐式”的：运营只知道“操作失败”，不知道“再点一次就行”。
+    该行为由 `tests/test_api_restock.py` 的
+    `test_confirm_retry_after_502_succeeds_without_manual_state_fix` 锁定
+    （不只是“状态没变”，而是“重试真的能成”）。
+    注意：回调是**非幂等动作且不自动重试**（见 `app/tools/task_tools.py`）——重试决策
+    交给本接口的调用方（人工或前端），故意不做传输层自动重试，否则网络抖动时会重复建单。
+    """
     service = get_service(request)
     user_id = require_user_id(request)
     target = _parse_date(plan_date) if plan_date else _today()

@@ -399,6 +399,30 @@ async def test_confirm_callback_failure_is_502_and_status_unchanged():
     assert store.decisions == [], "建单失败不落库、不改状态（交 1-7 的重试建单）"
 
 
+async def test_confirm_retry_after_502_succeeds_without_manual_state_fix():
+    """FIX-15：建单失败后**再次点确认**必须能直接成功——这就是那条“重试路径”。
+
+    为什么要单独立一条（而不是接着上面那条就结束）：“状态没变”只证明数据没坏，
+    不证明运营能自救。真实动作是“再点一次确认”；如果那条路径要求人工先改库、
+    或等下一次 06:00 定时任务，FIX-15 描述的“隐式重试”就仍然不可用——
+    只是从“没提示”变成了“提示了但按了没用”，后者更难查。
+    """
+    deps = FakeDeps(task_error=CallbackUnavailableError("Java 不可达"))
+    service, store, _, _ = _service(deps=deps)
+
+    with pytest.raises(RestockServiceError) as first:
+        await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+    assert first.value.status_code == 502
+
+    # Java 恢复后**原样重试**：运营不改任何东西，只再点一次「确认建单」
+    deps.task_error = None
+    result = await service.confirm(5, plan_date=PLAN_DATE, user_id=7)
+
+    assert result["status"] == 4, f"重试后应落 4-已建单，实际 {result['status']}"
+    assert deps.created, "第二次确认必须真的建出工单（而不是只把状态改漂亮）"
+    assert store.decisions, "第二次确认必须落库（4-已建单）"
+
+
 # --------------------------------------------------------------------------------------
 # 并发确认（排期 1-8 验收项 ②/③）
 # --------------------------------------------------------------------------------------
