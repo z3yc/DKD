@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentDecisionLogMapper">
+
+    <!--
+      决策审计页的 SQL（排期 3-7）。
+
+      ## 两条刻意的设计取舍
+
+      1. **列表不查两个 JSON 列**（input_context / llm_output）。
+         这张表随每次对话增长（每条用户消息一行），而 JSON 列可能很大；
+         列表要分页、要能筛，带上它们会让分页越用越慢，而且 99% 的列表浏览
+         并不需要看完整上下文。需要时点“详情”单独取（selectAgentDecisionLogById）。
+
+      2. **时间过滤用范围比较，不用 date_format()**。
+         仓库里既有 mapper（如 `OrderMapper.xml:44`、`InventoryLogMapper.xml:46`）
+         写的是 `date_format(create_time,'%y%m%d') >= date_format(#{...},'%y%m%d')` ——
+         这正是 AGENTS §10 明确禁止的写法：**函数包裹索引列会让索引失效**。
+         本表有 `(scene, create_time)` / `(result, create_time)` 复合索引，
+         一旦包成 date_format，审计页随留痕增长会退化成“只能用上索引的第一列”，
+         且与业务抢同一主库（本机无只读从库）。
+
+         **本机实测（2026-10-01，agent_decision_log）**：同一查询形状
+         （`scene = ? AND 时间范围`）分别用 FORCE INDEX 强制走
+         `idx_agent_decision_scene_time`：
+
+           写法                      type    key_len  rows  Extra
+           范围比较（本文件）          range   7        1     Using index condition
+           date_format 包裹索引列      ref     1        55    Using index condition
+
+         `key_len 7 → 1` 是关键证据：只有范围比较那一种能把 `create_time`
+         真正推进索引（scene 占 1 字节 + create_time 占 6 字节），
+         而 date_format 那一种只能用到 scene，剩下的行全部要回表过滤。
+         （说明：本表当前仅百余行，优化器在全表扫更便宜时会主动选择扫表——
+         所以这里用 FORCE INDEX 隔离出“索引能不能用”这个单一变量，
+         而不是拿“小表 EXPLAIN 没走索引”去下结论。）
+
+         上界用 `< DATE_ADD(#{params.endTime}, INTERVAL 1 DAY)` 而不是 `<= endTime`：
+           · 半开区间天然包含整天的最后一刻（含毫秒），不用去纠结 23:59:59；
+           · 函数作用在**参数**上而不是索引列上，不影响索引使用。
+    -->
+    <resultMap type="AgentDecisionLog" id="AgentDecisionLogResult">
+        <id     property="id"            column="id"            />
+        <result property="requestId"     column="request_id"    />
+        <result property="scene"         column="scene"         />
+        <result property="userId"        column="user_id"       />
+        <result property="triggerType"   column="trigger_type"  />
+        <!--
+          JSON 列（input_context / llm_output）直接映射为 String。
+          为什么不用自定义 TypeHandler：MySQL 的 JSON 列经 JDBC 返回的就是文本，
+          而本仓库既有的 JSON 列（`tb_report.top_products` 等）也是这么映射的（见 ReportMapper.xml）——
+          保持与现有做法一致，而不是为一张只读审计表引入新的类型处理链。
+        -->
+        <result property="inputContext"  column="input_context" />
+        <result property="llmOutput"     column="llm_output"    />
+        <result property="action"        column="action"        />
+        <result property="targetType"    column="target_type"   />
+        <result property="targetId"      column="target_id"     />
+        <result property="result"        column="result"        />
+        <result property="errorMsg"      column="error_msg"     />
+        <result property="confidence"    column="confidence"    />
+        <result property="costTokens"    column="cost_tokens"   />
+        <result property="createBy"      column="create_by"     />
+        <result property="createTime"    column="create_time"   />
+    </resultMap>
+
+    <!-- 列表用：剔除两个大 JSON 列 -->
+    <sql id="selectAgentDecisionLogListVo">
+        select id, request_id, scene, user_id, trigger_type, action, target_type, target_id,
+               result, error_msg, confidence, cost_tokens, create_by, create_time
+        from agent_decision_log
+    </sql>
+
+    <!-- 详情用：带上两个 JSON 列 -->
+    <sql id="selectAgentDecisionLogDetailVo">
+        select id, request_id, scene, user_id, trigger_type, input_context, llm_output,
+               action, target_type, target_id, result, error_msg, confidence, cost_tokens,
+               create_by, create_time
+        from agent_decision_log
+    </sql>
+
+    <!-- 过滤条件（列表与详情共用，避免两处写法漂移） -->
+    <sql id="agentDecisionLogWhere">
+        <where>
+            <!-- 审计查询默认只看未删除（AGENTS §7.4：查询默认过滤 del_flag） -->
+            del_flag = '0'
+            <if test="requestId != null and requestId != ''">
+                AND request_id = #{requestId}
+            </if>
+            <if test="scene != null">
+                AND scene = #{scene}
+            </if>
+            <if test="userId != null">
+                AND user_id = #{userId}
+            </if>
+            <if test="triggerType != null">
+                AND trigger_type = #{triggerType}
+            </if>
+            <if test="action != null and action != ''">
+                AND action like concat('%', #{action}, '%')
+            </if>
+            <if test="targetType != null and targetType != ''">
+                AND target_type = #{targetType}
+            </if>
+            <if test="targetId != null and targetId != ''">
+                AND target_id = #{targetId}
+            </if>
+            <if test="result != null">
+                AND result = #{result}
+            </if>
+            <if test="params.beginTime != null and params.beginTime != ''">
+                <!-- 范围比较（禁用 date_format 包裹索引列，AGENTS §10） -->
+                AND create_time &gt;= #{params.beginTime}
+            </if>
+            <if test="params.endTime != null and params.endTime != ''">
+                <!-- 半开区间上界：含 endTime 当天全部时刻，函数只作用在参数上 -->
+                AND create_time &lt; DATE_ADD(#{params.endTime}, INTERVAL 1 DAY)
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAgentDecisionLogList" parameterType="AgentDecisionLog" resultMap="AgentDecisionLogResult">
+        <include refid="selectAgentDecisionLogListVo"/>
+        <include refid="agentDecisionLogWhere"/>
+        order by id desc
+    </select>
+
+    <select id="selectAgentDecisionLogById" parameterType="Long" resultMap="AgentDecisionLogResult">
+        <include refid="selectAgentDecisionLogDetailVo"/>
+        where id = #{id} and del_flag = '0'
+    </select>
+
+</mapper>

@@ -240,11 +240,12 @@
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | **59 files already formatted** |
 | `uv run pytest` | **299 passed**（10 个 live 用例默认 deselect；累计本轮 **+20**：checkpointer 工厂/配置/脱敏/事件循环守卫契约测试），覆盖率 **94.88%**（要求 ≥70%）。覆盖率较上轮 95.11% 略降，原因**如实说明**：新增了未被真库覆盖的 PG `open()` 主体分支（`app/checkpoint.py` 已由 88% 升至 **90%**；PG 真库路径改由 `docs/scripts/verify-checkpoint-pg.py` 覆盖）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
-| `mvn -pl dkd-admin -am test` | **Tests run: 65, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 10 / TaskCreate 6 / AgentTask 10 / **ReportMapperSql 5**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
+| `mvn -pl dkd-admin -am test` | **Tests run: 69, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 10 / TaskCreate 6 / AgentTask 10 / ReportMapperSql 5 / **AgentDecisionLogMapperSql 4**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `uv run ruff check` / `ruff format --check` | All checks passed；**60 files** already formatted（本轮新增 1 个测试文件） |
 | `npm run build:prod`（**本轮新增前端交付**） | exit 0（仅既有 chunk 体积告警）；新增 `views/manage/restock/**` 已按路由分包（`RestockAdjustDialog` / `RestockReasonDialog` 各自成 chunk） |
 | 端到端（**2026-10-01 新增**） | `docs/scripts/verify-checkpoint-pg.py` **--phase all 18/18 PASS**（含 5 项越权拒绝路径）；**跨进程** write/read 两独立进程 **3/3 PASS**；服务级 `python -m app` → `/health` `checkpoint_backend=postgres`/`checkpoint_open=true`；真实 SSE 会话落 PG 后已清理 |
 | 前端真浏览器（**2026-10-01 新增，FIX-12**） | `docs/scripts/restock-workbench-browser-check.cjs` 在**全栈真环境**下 **29/29 PASS**（菜单/骨架/真实数据 3 行/依据展开/弹窗两模式互斥/原因必填拦截/筛选生效/暂停恢复闭环/控制台 0 错误）；截图 `docs/evidence/restock-workbench-fix12.png`、`restock-paused-fix12.png`。依赖装在项目外（`playwright-core`，AGENTS 禁止擅自引入仓库依赖） |
+| 审计页真浏览器（**2026-10-01 新增，任务 3-7**） | `docs/scripts/agent-audit-browser-check.cjs` **14/14 PASS**：菜单/只读提示条/**无写操作按钮（断言）**/110 条真实留痕/场景与结果中文标签/筛选 110→109 且不再出现其它场景/详情回放 JSON 已格式化缩进/控制台 0 错误；截图 `docs/evidence/agent-audit-3-7.png`、`agent-audit-detail-3-7.png` |
 | 端到端（**本轮新增**） | `docs/scripts/g1-gateway-smoke.sh` **16/16 PASS**；SSE 增量到达实测；`agent.enabled=false` 降级 4 项全符 |
 | DDL 真库执行 | 幂等重跑 + 唯一键拒绝路径 + 8 项权限拒绝路径均已实测；**1-7 新增表 `agent_restock_pause`** 已 real 执行（root 建表 + 授权），并实测 dkd_agent 可 UPSERT、`DELETE` 被拒（ERROR 1142）；**1-9 新增任务注册 `docs/ddl/agent_restock_job.sql`** 已在本机 dkd 库执行（校验查询 1 行：cron `0 0 6 * * ?` / misfire=2 / concurrent=1 / status=0），幂等重跑退出码 0 |
 | 端到端脚本（Phase 1 新增，需真环境人工触发） | `docs/scripts/verify-1-3-build-task.py`（真库真回调：taskId=573 / expectCapacity=9 / 拒绝路径零写入）；`docs/scripts/verify-1-6-restock-plan.py`（**两个进程**验证中断跨重启恢复）；`docs/scripts/verify-1-7-restock-api.py`（真 MySQL + 真实 FastAPI，**31/31 PASS**，其中 [H] 段为 1-7b 的留痕断言）；**`docs/scripts/verify-1-9-analyze.py`（本轮新增，真 MySQL + 真实 FastAPI，20/20 PASS：鉴权 3 项 / 暂停开关 3 项 / 正常触发 3 项 / 重入安全 2 项 / 留痕 9 项）**；`docs/scripts/backtest-restock-baseline-1-4.py`（只读回测，含未验证项如实登记） |
@@ -479,7 +480,7 @@
 | **波3** | 建议量**被证明与业务口径一致**并可真机验收 | 波1 完成 + **FIX-6 数据导出** + **FIX-5 业务拍板容量权威源** | FIX-3（Java 报表绑定）→ FIX-4（索引 DDL）→ 1-12 对账 → 1-13 M2 验收（10 台真机）→ 1-14 抽样对比 | 3 台设备全字段对账一致；同设备只有一个容量数；无培训完成「夜间分析→早晨确认→批量建单→dkd-app 接单流转」；建立缺货率/建议偏差/人工调整率三项基线 | ⏳ **卡在外部输入**（三项都不是写代码能解决的） |
 | **波4** | Agent 第一次拥有**可检索的领域知识**（不再只是实时查库） | 波2 完成 + 2-7 数据质量抽样通过 | pgvector 与 checkpointer**共用实例分 schema**；案例库 schema + 授权；**抽取口径冻结文档**；同步/重建链路（含失败告警）；检索工具（先规则/关键词） | ≥50 条案例可检索；口径冻结成文；**重建脚本能从 `tb_task` 全量重跑**；检索结果可复现 | ⏳ 未开工（本次只落 PG 实例，向量表不建） |
 | **波5** | 「3 号门那台机器不出货了」→ 多轮问诊 → 置信度排序病因 → 一键建单 | M2 验收通过 + 波4（**抽样不达标时降级为关键词检索，不阻塞本波**） | 2-1 异常检测 → 2-2 历史工单检索 → 2-3 多轮问诊+实体消歧 → 2-4 结论结构化 → 2-5 维修工单卡片 → 2-6 前端诊断页 → 2-8 兜底降级 | M3：无培训完成 5 个真实故障的「诊断→建单」闭环；诊断信息量对比报告 | ⏳ 未开工 |
-| **波6** | 系统具备**可审计、可演练、可回滚**的上线资格 | 波3/5 全绿 + 部署栈真机验证通过 | 3-7 审计页 → 3-9 压测与故障演练（含 FIX-16/FIX-17）→ **FIX-7 凭据轮换（重点验 FIX-19 的 401 透传）** → 部署栈真机验证 → 4-1~4-3 | 写操作 100% 可查可回放；演练清单全过；上线检查单全过；回滚预演过；runbook 成文 | ⏳ 未开工 |
+| **波6** | 系统具备**可审计、可演练、可回滚**的上线资格 | 波3/5 全绿 + 部署栈真机验证通过 | ~~3-7 审计页~~（✅ 已提前交付，见下）→ 3-9 压测与故障演练（含 FIX-16/FIX-17，两项已单独演练完成）→ **FIX-7 凭据轮换（重点验 FIX-19 的 401 透传）** → 部署栈真机验证 → 4-1~4-3 | 写操作 100% 可查可回放；演练清单全过；上线检查单全过；回滚预演过；runbook 成文 | 🟡 **部分提前完成**：3-7 审计页 ✅、FIX-16/FIX-17 演练 ✅；剩 FIX-7 轮换（需值班窗口）、部署栈真机验证（本机 Docker 守护进程不可用）、3-9 其余压测项 |
 
 ### 9.3 依赖与并行
 
@@ -672,3 +673,44 @@ B线  [波2 PG底座] ──► [波4 知识库地基] ──► [波5 诊断Age
   （便于人工看页面）；如需停掉：`pkill -f dkd-admin.jar`、`pkill -f "python -m app"`、
   `pkill -f vite`、`/e/Redis-x64-3.2.100/redis-cli.exe shutdown`。
 
+
+### 2026-10-01 开发进度补记（V2.10 续 · 任务 3-7 决策审计页提前交付）
+
+- **为什么提前做（不在原计划顺序里）**：3-7 原属 Phase 3 / 波次 6，入口条件是波次 3/5 全绿。
+  但它的**依赖是留痕数据**（自 1-7b 起已持续写入，当前库里 110 条），
+  与 M2 真机验收、知识库都无耦合——挂着做不了别的事，提前交付即可让
+  AGENTS §10 CR 清单里「Agent 相关改动：决策留痕已接」这条从“数据齐备”升级为**可查、可回放**。
+- **交付内容（Java + 前端 + 菜单）**：
+  ① Java：`AgentDecisionLog`（domain）、`AgentDecisionLogMapper`(+XML)、`IAgentDecisionLogService`/
+  `AgentDecisionLogServiceImpl`、`AgentDecisionLogController`（`/manage/agent/decision-log`）；
+  ② 前端：`api/manage/agentAudit.js`、`views/manage/agentAudit/index.vue`；
+  ③ 菜单：`docs/ddl/agent_audit_menu.sql`（9007~9009，挂在既有的「AI 智能体」目录下）。
+- **四处刻意的设计取舍（都写进了代码注释）**：
+  1. **只读，没有任何写接口**：留痕是审计证据，**能改的留痕就不是留痕**。
+     Mapper 接口只暴露 `select*`，并有单测断言这一点；前端也断言“页面上没有写操作按钮”。
+  2. **列表不查两个 JSON 上下文列**，详情才查：该表随每次对话增长，
+     列表带上大 JSON 会让分页越来越慢；对应两个 <sql> 片段，单测锁住“列表/详情列不同”。
+  3. **时间过滤用范围比较，禁用 `date_format()`**。仓库里既有的 `OrderMapper.xml:44`/
+     `InventoryLogMapper.xml:46` 正是被 AGENTS §10 点名的反例；新页面不沿用。
+     **本机量化实测**（FORCE INDEX 隔离“索引能不能用”这一个变量，
+     因为本表仅百余行时优化器会主动选全表扫，直接看 EXPLAIN 得不出结论）：
+     `scene = ? AND 时间范围` 下，范围比较 `type=range, key_len=7, rows=1`；
+     `date_format()` 写法只能 `type=ref, key_len=1, rows=55`——
+     `key_len 7→1` 是关键证据：只有前者能把 `create_time` 真正推进索引。
+  4. **置信度为空显示「—」并说明原因**：人工干预本来就不产生置信度（1-7b 的取舍），
+     留空不等于缺数据；用 tooltip 写清楚，避免审计时误判为“数据缺失”。
+- **验收（全部实跑）**：
+  · 接口层：`/manage/agent/decision-log/list` → `total=110`（且**不含** JSON 列）；
+    详情接口返回完整 `input_context`；时间范围过滤可用；
+  · **真浏览器 14/14 PASS**（`docs/scripts/agent-audit-browser-check.cjs`，全栈真环境）；
+  · Java 门禁：**69 passed**（+4，新增 `AgentDecisionLogMapperSqlTest` 把上面三条约定锁死）；
+  · 前端 `npm run build:prod` exit 0。
+- **本轮踩到一个构建陷阱（值得全组记一下）**：`mvn -pl dkd-admin -am package -DskipTests`
+  报 **BUILD SUCCESS，但产出的 jar 是旧的**（`maven-jar-plugin:2.4` 判定“jar 已最新”而跳过重建，
+  且嵌套的 `dkd-manage` jar 也未刷新）→ 新接口一直 404，而构建日志看起来完全正常。
+  现象与根因：**BUILD SUCCESS ≠ 你刚写的代码进了 jar**。
+  可靠做法：新增类后加 `clean`（`mvn -pl <mods> -am clean package`），或先 `install` 再打包。
+  本次验证方式：解包 fat jar 看 `BOOT-INF/lib/dkd-manage-3.8.7.jar` 里有没有新 class
+  （只看 target/classes 有 class 是不够的）。
+- **未做（不隐瞒）**：截图未经逐像素视觉评审（执行环境不支持读图），断言在 DOM 层；
+  审计页的**导出**、按 `request_id` 聚合的多条留痕串联视图未做（当前可用筛选+详情凑合）。
