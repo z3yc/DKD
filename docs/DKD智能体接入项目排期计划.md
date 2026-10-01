@@ -239,7 +239,7 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | **59 files already formatted** |
-| `uv run pytest` | **305 passed**（10 个 live 用例默认 deselect；累计本轮 **+20**：checkpointer 工厂/配置/脱敏/事件循环守卫契约测试），覆盖率 **94.88%**（要求 ≥70%）。覆盖率较上轮 95.11% 略降，原因**如实说明**：新增了未被真库覆盖的 PG `open()` 主体分支（`app/checkpoint.py` 已由 88% 升至 **90%**；PG 真库路径改由 `docs/scripts/verify-checkpoint-pg.py` 覆盖）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
+| `uv run pytest` | **305 passed**（10 个 live 用例默认 deselect；累计本轮 **+29**：checkpointer 工厂/配置/脱敏/事件循环守卫/连接池契约 + SSE 兜底），覆盖率 **94.76%**（要求 ≥70%）。覆盖率比上轮 95.11% 低，原因**如实说明**：新增的 PG 真库分支（连接池的 `open()` 主体 `checkpoint.py:317-339`）在单测里不可能覆盖，改由 `docs/scripts/verify-checkpoint-pg.py`（18/18）与 `verify-3-9-drills.py`（pg-recover 4/4）覆盖；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
 | `mvn -pl dkd-admin -am test` | **Tests run: 69, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 10 / TaskCreate 6 / AgentTask 10 / ReportMapperSql 5 / **AgentDecisionLogMapperSql 4**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `uv run ruff check` / `ruff format --check` | All checks passed；**60 files** already formatted（本轮新增 1 个测试文件） |
 | `npm run build:prod`（**本轮新增前端交付**） | exit 0（仅既有 chunk 体积告警）；新增 `views/manage/restock/**` 已按路由分包（`RestockAdjustDialog` / `RestockReasonDialog` 各自成 chunk） |
