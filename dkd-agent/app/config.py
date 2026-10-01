@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     # ⚠️ 命名红线：**绝不能**把这个字段叫 `dsn`——本类已有 `dsn` property 返回 MySQL
     # 只读账号连接串。同名会让 `app/db.py` 静默连到 PG：读的是同一个属性名，错得毫无提示。
     pg_dsn: str = Field(default="", validation_alias="DKD_AGENT_PG_DSN")
+    # 连接池上限（仅 postgres 后端）。为什么做成配置而不是常量：
+    # 池子大小直接决定“PG 能同时服务多少个在途会话”，多实例部署时要按副本数算总量。
+    # 默认 4：单实例 + 一个后台定时任务（1-9）的并发量级完全够，且远低于 PG 默认 max_connections。
+    pg_pool_max_size: int = Field(default=4, validation_alias="DKD_AGENT_PG_POOL_MAX")
+    # 建池时等待首个连接的超时（秒）：PG 不可达时应尽早失败，而不是把启动挂在这里
+    pg_pool_open_timeout_s: float = Field(
+        default=10.0, validation_alias="DKD_AGENT_PG_POOL_OPEN_TIMEOUT"
+    )
 
     # --- 对话模式与限额（任务 0-12：成本计量与熔断）---
     use_llm: bool = Field(default=False, validation_alias="DKD_AGENT_USE_LLM")

@@ -230,18 +230,32 @@ class PostgresCheckpointStore:
     连 SQLite 模式都起不来。惰性导入把失败限定在「真的选了 postgres」这一条路径上，
     并且给出可直接执行的补救命令。
 
-    ## 未在真库验证（如实标注，AGENTS §9.3 不隐瞒）
+    ## 真库验收与两处实测修正（2026-10-01）
 
-    评审稿 D5（本机 PG 账号 / 生产是否允许新增 DB 引擎）**尚未闭环**，
-    因此本类**没有跑过真实 PG**：
-      - `open()` / `setup()` / `close()` 的 SQL 语义未验证；
-      - 评审稿 §8-4 那条未验证假设（账号只有 DML 权限时 `setup()` 首次部署会失败）
-        由 `docs/scripts/verify-checkpoint-pg.py` 在 D5 闭环后覆盖。
+    本类已在**本机 PostgreSQL 17.11 上完成真库验收**
+    （`docs/scripts/verify-checkpoint-pg.py` 18/18 + 跨进程恢复 3/3 服务级验证），
+    过程中改掉了两件事（都是从“看代码看不出来”的实测里出来的）：
+
+    1. **Windows 事件循环守卫**：uvicorn 0.36+ 改用 `loop_factory` 后不再读全局策略，
+       直接启 PG 后端会报 psycopg 的 ProactorEventLoop 错误（见 `app/__main__.py`）；
+    2. **必须自己建连接池**：`AsyncPostgresSaver.from_conn_string()` 内部是**单个**
+       `AsyncConnection`，连接一断 saver 就**永久失效**（只有重启进程才能恢复）。
+       本类改为注入带 `check_connection` 的 `AsyncConnectionPool`；
+       触发这个修改的演练：`verify-3-9-drills.py --phase pg-recover`。
+
     工厂分派、配置校验、脱敏与失败降级由 `tests/test_checkpoint_factory.py` 覆盖（零外部依赖）。
     """
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        max_size: int = 4,
+        open_timeout_s: float = 10.0,
+    ) -> None:
         self._dsn = dsn
+        self._max_size = max(1, int(max_size))
+        self._open_timeout_s = float(open_timeout_s)
         self._stack = AsyncExitStack()
         self._saver: Any | None = None
 
@@ -274,24 +288,65 @@ class PostgresCheckpointStore:
 
         try:
             from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            from psycopg.rows import dict_row
+            from psycopg_pool import AsyncConnectionPool
         except ImportError as exc:  # 依赖缺失：给出可执行的补救命令，而不是让它像“连不上库”
             raise RuntimeError(
                 "checkpoint_backend=postgres 需要 langgraph-checkpoint-postgres 与 psycopg："
                 '请执行 `uv add "langgraph-checkpoint-postgres" "psycopg[binary,pool]"` 后重试'
             ) from exc
 
-        self._saver = await self._stack.enter_async_context(
-            AsyncPostgresSaver.from_conn_string(self._dsn)
+        # ## 为什么必须自己建连接池，而不能用 from_conn_string（2026-10-01 演练实测）
+        #
+        # `AsyncPostgresSaver.from_conn_string()` 内部是**单个** `AsyncConnection`
+        # （实测 langgraph-checkpoint-postgres 3.1.2 源码）。
+        # 后果：连接一旦断掉，saver **永久失效**——不是“这一次失败”，而是之后所有会话读写
+        # 全部失败，直到进程重启。
+        #
+        # 演练现场（`verify-3-9-drills.py --phase pg-recover`）：用应用自己的角色终止自己的
+        # 其它 PG 后端（模拟一次网络抖动 / 服务端重启）后，**后续每一轮都失败**，
+        # 只有重启服务才恢复。“一次抖动 = 永久挂掉”在单机开发时几乎撞不到，
+        # 但它正是“上线后才炸”的典型（生产上 PG 重启/主备切换都会触发）。
+        #
+        # 改法：把 `AsyncConnectionPool` 直接交给 saver（构造器显式支持 pool），
+        # 并用 `check=AsyncConnectionPool.check_connection` 在**取用前校验**——
+        # 死连接会被丢弃并重建，后续请求自动恢复。
+        #
+        # `kwargs` 必须与 from_conn_string 的连接参数一致（autocommit / prepare_threshold /
+        # row_factory），否则 saver 的语义会变（它依赖 autocommit）——这是“自己建池”最容易漏的一步。
+        pool = AsyncConnectionPool(
+            conninfo=self._dsn,
+            min_size=1,
+            max_size=self._max_size,
+            open=False,  # 显式 open，把连接等待时间纳入生命周期管理
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+            check=AsyncConnectionPool.check_connection,
+            name="dkd-agent-checkpoint",
         )
-        # setup() 需要**建表权限**；账号只有 DML 权限时这里会失败（评审稿 §8-4）
+        await self._stack.enter_async_context(pool)
+        await pool.open(wait=True, timeout=self._open_timeout_s)
+
+        self._saver = AsyncPostgresSaver(pool)
+        # setup() 需要**建表权限**；账号只有 DML 权限时这里会失败（评审稿 §8-4，已实测证伪方案 2）
         await self._saver.setup()
-        logger.info("checkpointer ready: backend=%s target=%s", self.backend, self.location)
+        logger.info(
+            "checkpointer ready: backend=%s target=%s pool=%s..%s",
+            self.backend,
+            self.location,
+            pool.min_size,
+            pool.max_size,
+        )
         return self._saver
 
     async def close(self) -> None:
         await self._stack.aclose()
         self._saver = None
         logger.info("checkpointer closed: backend=%s", self.backend)
+
+    @property
+    def pool_size(self) -> int:
+        """配置的最大连接数（供日志/测试断言；池未打开时也可读）。"""
+        return self._max_size
 
 
 # 向后兼容别名：`tests/test_checkpoint.py`、`tests/test_restock_graph.py` 与
@@ -308,7 +363,11 @@ def build_checkpoint_store(settings: Settings) -> CheckpointBackend:
     用假实现替换「打开」这一步。
     """
     if settings.checkpoint_backend == BACKEND_POSTGRES:
-        return PostgresCheckpointStore(settings.pg_dsn)
+        return PostgresCheckpointStore(
+            settings.pg_dsn,
+            max_size=settings.pg_pool_max_size,
+            open_timeout_s=settings.pg_pool_open_timeout_s,
+        )
     return SqliteCheckpointStore(settings.sqlite_path)
 
 

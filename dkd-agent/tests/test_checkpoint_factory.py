@@ -357,3 +357,34 @@ def test_health_reports_actual_backend_and_no_credentials(client):
     dumped = resp.text.lower()
     assert "password" not in dumped
     assert "s3cr3t" not in dumped
+
+
+# --- 9. PG 连接池契约（FIX-23：单连接会让一次抖动变成永久失效） ----------------------
+
+
+def test_postgres_store_uses_configured_pool_size():
+    """池大小必须来自配置（多实例部署时要按副本数算总量，不能写死）。"""
+    store = PostgresCheckpointStore(PG_DSN, max_size=7)
+    assert store.pool_size == 7
+
+
+def test_pool_size_is_floored_at_one():
+    """非法配置（0 或负数）不能造出一个“取不到连接”的池——下限夹到 1。"""
+    assert PostgresCheckpointStore(PG_DSN, max_size=0).pool_size == 1
+    assert PostgresCheckpointStore(PG_DSN, max_size=-3).pool_size == 1
+
+
+def test_factory_wires_pool_settings_from_config():
+    """工厂必须把 `pg_pool_max_size` / `pg_pool_open_timeout_s` 真正传下去。
+
+    为什么单独立一条：这两个配置项很容易出现“配了但不生效”（工厂忘了传），
+    而后果是运维改了池大小却不生效，且不会有任何报错——只能靠人看代码发现。
+    """
+    settings = _settings(
+        DKD_AGENT_CHECKPOINT_BACKEND="postgres",
+        DKD_AGENT_PG_DSN=PG_DSN,
+        DKD_AGENT_PG_POOL_MAX="9",
+    )
+    store = build_checkpoint_store(settings)
+    assert isinstance(store, PostgresCheckpointStore)
+    assert store.pool_size == 9, "工厂没有把配置的池大小传下去"

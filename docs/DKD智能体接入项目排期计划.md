@@ -239,10 +239,11 @@
 | --- | --- |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | **59 files already formatted** |
-| `uv run pytest` | **299 passed**（10 个 live 用例默认 deselect；累计本轮 **+20**：checkpointer 工厂/配置/脱敏/事件循环守卫契约测试），覆盖率 **94.88%**（要求 ≥70%）。覆盖率较上轮 95.11% 略降，原因**如实说明**：新增了未被真库覆盖的 PG `open()` 主体分支（`app/checkpoint.py` 已由 88% 升至 **90%**；PG 真库路径改由 `docs/scripts/verify-checkpoint-pg.py` 覆盖）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
+| `uv run pytest` | **305 passed**（10 个 live 用例默认 deselect；累计本轮 **+20**：checkpointer 工厂/配置/脱敏/事件循环守卫契约测试），覆盖率 **94.88%**（要求 ≥70%）。覆盖率较上轮 95.11% 略降，原因**如实说明**：新增了未被真库覆盖的 PG `open()` 主体分支（`app/checkpoint.py` 已由 88% 升至 **90%**；PG 真库路径改由 `docs/scripts/verify-checkpoint-pg.py` 覆盖）；`-m live` 另有真库抽样用例（含 1-8 并发派单） |
 | `mvn -pl dkd-admin -am test` | **Tests run: 69, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 10 / TaskCreate 6 / AgentTask 10 / ReportMapperSql 5 / **AgentDecisionLogMapperSql 4**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `uv run ruff check` / `ruff format --check` | All checks passed；**60 files** already formatted（本轮新增 1 个测试文件） |
 | `npm run build:prod`（**本轮新增前端交付**） | exit 0（仅既有 chunk 体积告警）；新增 `views/manage/restock/**` 已按路由分包（`RestockAdjustDialog` / `RestockReasonDialog` 各自成 chunk） |
+| 3-9 演练（**2026-10-01 新增**） | `docs/scripts/verify-3-9-drills.py`：**对话并发 4/4**（8 会话无串话，含内容核对）、**PG 连接中断恢复 4/4**（修后自动恢复）、Python 宕机降级（`upstream=down` + 降级帧） |
 | 端到端（**2026-10-01 新增**） | `docs/scripts/verify-checkpoint-pg.py` **--phase all 18/18 PASS**（含 5 项越权拒绝路径）；**跨进程** write/read 两独立进程 **3/3 PASS**；服务级 `python -m app` → `/health` `checkpoint_backend=postgres`/`checkpoint_open=true`；真实 SSE 会话落 PG 后已清理 |
 | 前端真浏览器（**2026-10-01 新增，FIX-12**） | `docs/scripts/restock-workbench-browser-check.cjs` 在**全栈真环境**下 **29/29 PASS**（菜单/骨架/真实数据 3 行/依据展开/弹窗两模式互斥/原因必填拦截/筛选生效/暂停恢复闭环/控制台 0 错误）；截图 `docs/evidence/restock-workbench-fix12.png`、`restock-paused-fix12.png`。依赖装在项目外（`playwright-core`，AGENTS 禁止擅自引入仓库依赖） |
 | 审计页真浏览器（**2026-10-01 新增，任务 3-7**） | `docs/scripts/agent-audit-browser-check.cjs` **14/14 PASS**：菜单/只读提示条/**无写操作按钮（断言）**/110 条真实留痕/场景与结果中文标签/筛选 110→109 且不再出现其它场景/详情回放 JSON 已格式化缩进/控制台 0 错误；截图 `docs/evidence/agent-audit-3-7.png`、`agent-audit-detail-3-7.png` |
@@ -427,7 +428,7 @@
 
 > 只在「有证据 + 有归属任务 + 有验收方式」时才登记；关闭时必须写清证据（AGENTS §9.3 不隐瞒）。
 > 图例：🔴 阻塞/红线相关 · 🟡 影响验收或体验 · 🔵 技术债/观测性。归属列写的是**落地任务号**。
-> 更新于 2026-10-01（连续推进：Phase 1 前端收口 + PG 真库验收 + 3-7 审计页提前交付 + 1-12 订单侧对账 + 2-7 抽样 + FIX-13/14 收口）。共 **22 条**：已关闭 **15** 条（FIX-2/3/4/8/9/10/11/12/13/14/15/16/17/19/20），待修 **7** 条（FIX-1/5/6/7/18/21/22）。
+> 更新于 2026-10-01（连续推进：Phase 1 前端收口 + PG 真库验收 + 3-7 审计页提前交付 + 1-12 订单侧对账 + 2-7 抽样 + 3-9 三项演练 + FIX-13/14/23/24）。共 **24 条**：已关闭 **17** 条（FIX-2/3/4/8/9/10/11/12/13/14/15/16/17/19/20/23/24），待修 **7** 条（FIX-1/5/6/7/18/21/22）。
 
 | # | 等级 | 问题 | 证据（file:line / 实测） | 影响 | 归属 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -453,6 +454,8 @@
 | FIX-20 | 🔴 | **Windows + PG 后端：uvicorn 0.36+ 不再读事件循环策略，直接用 `uvicorn app.main:app` 会启动失败**——它改用 `loop_factory` 直接指定循环（实测 0.53：`uvicorn.loops.asyncio.asyncio_loop_factory` 在 win32 返回 `ProactorEventLoop`），而 psycopg 异步不支持 Proactor | 2026-10-01 实测：`uvicorn app.main:app` → `psycopg.InterfaceError: cannot use the 'ProactorEventLoop'`；改用 `--loop none` 或 `python -m app` 正常（`/health` 报 `checkpoint_backend=postgres`、`checkpoint_open=true`）。**光设全局策略无用**（已在 `app/main.py` 模块级设了，仍失败，因为 uvicorn 绕过了策略） | 运维/开发会照旧习惯直接 `uvicorn app.main:app` 启动 → PG 后端完全打不开；且报错指向 psycopg 内部，与真因（uvicorn 机制变更）相距很远，排查代价高 | Python 侧（0-10 真库验收一并修） | **✅ 本轮已修**：新增 `app/__main__.py` 启动入口（`loop="none"` + 先定策略）；`PostgresCheckpointStore.open()` 加启动守卫，把该错误转为**含具体命令的可执行提示**（而非 psycopg 内部异常）；回归用例 **+4**（selector 接受 / win32+proactor 拒绝 / 非 Windows 平台门控 / 守卫报错文案）；AGENTS §1 约束 5 与 README 同步 |
 | FIX-21 | 🟡 | **订单 `channel_code` 为空导致“按货道聚合”工具直接崩**（2026-10-01 发现，已修工具侧）：分组结果含 `channel_code=None` 行 → `ChannelSales`/`ChannelDailySales` 的必填 `str` 校验失败 → 工具抛错。**本机实测：7 张出货成功订单里 2 张（29%）channel_code 为空** | 触发场景：设备只有（或包含）这类订单时，`aggregate_channel_sales` 直接报 Pydantic `ValidationError`；影响 1-4 基线引擎与 **06:00 定时任务**整条链路（`verify-1-12-reconcile.py` 首次运行就是被它撞出来的） | 工具侧已加 `channel_code is not null`（不可归因到货道的行不应进“按货道”聚合）+ 两处函数保持一致 + 回归断言；**数据侧待评估**：29% 不可归因偏高，属下单未回填货道的数据质量问题 | Python 侧（已修）；数据修复归属业务（新增） | 🟡 **工具侧 ✅ 已修**（含 docstring 说明“过滤≠可以假装不存在”，并由对账脚本用**守恒断言**保证不静默丢失：可归因+不可归因==全局）；**数据侧待业务决定是否修数**（本机库 2/7，生产占比未知） |
 | FIX-22 | 🔴 | **Phase 2 故障案例库（2-7）与相似案例检索（2-2）在当前数据源上不可实现**——2026-10-01 按排期要求做 2-7 前置抽样，**4/4 门槛全不达标** | `docs/scripts/sample-2-7-case-library.py` 实测：① 维修类工单（product_type_id=1）**仅 8 条**（验收需 ≥50）；② 描述非空率 **75%**（需 ≥80%）；③ 平均描述长度 **2.5 字**（需 ≥15）；④ **无原因/处置/故障码类字段**（`tb_task` 全部字段 15 个，无一个能装“原因/处置”）。内容样本：`投放`/`11`/`不想干了`/`后台工作人员取消`/`加急`——**无一条是故障现象** | 影响 Phase 2 的 **2-2**（历史维修工单检索 + 相似案例匹配）与 **2-7**（案例库冷启动）、以及 **2-4**（结论置信度排序需历史支撑）。若不处置，Phase 2 会建出一个“看起来很高级但检索结果不可验证”的空知识库——**比没有更危险**（诊断 Agent 会拿无依据的“相似案例”当证据） | **业务/产品**：① 维修工单增加结构化的「现象/原因/处置」回填（或至少把 `desc` 用成真实故障描述）；② 或提供设备厂商故障码表/维修手册作为替代知识源 | 🔴 **待业务决策（Phase 2 入口前置）**：已按排期 2-7 的**预定预案降级为规则库**（按设备/型号/近期异常特征检索，无命中时用保守话术，不假装有历史案例）。**未建任何向量表**（数据源不存在时建表只会让口径被反向绑架——PG 选型评审 §4.3 的纪律）。启用门槛已写成可复跑检查（本脚本），达标后才进“口径冻结 → 建表 → 回填” |
+| FIX-23 | 🔴 | **PG checkpointer 用的是单连接，一次连接中断即“永久失效”（只有重启进程能恢复）** | `AsyncPostgresSaver.from_conn_string()` 内部是单个 `AsyncConnection`（实测 langgraph-checkpoint-postgres **3.1.2** 源码）。**2026-10-01 由 3-9 演练撞出**（`verify-3-9-drills.py --phase pg-recover`）：用应用自己的角色终止自己其它 PG 后端（模拟网络抖动/服务端重启）后，**后续每一轮对话都失败**，重启服务才恢复 | “一次抖动 = 永久挂掉”在单机开发时几乎撞不到，但生产上 PG 重启/主备切换/网络瞬断都会触发——会让 Agent 的会话能力在无人察觉的情况下彻底停摆。**属上线阻塞级** | Python 侧（3-9 演练一并修） | **✅ 本轮已修**：改为注入 `AsyncConnectionPool`（`min_size=1` + `check=ConnectionPool.check_connection`，取用前校验、死连接丢弃重建），`kwargs` 与 `from_conn_string` 保持一致（autocommit / prepare_threshold / row_factory）；新增配置 `DKD_AGENT_PG_POOL_MAX`（默认 4）/`DKD_AGENT_PG_POOL_OPEN_TIMEOUT`；**修后复测 4/4 PASS**（中断后自动恢复且后续稳定，无需重启）；回归用例 **+3**（池大小来自配置 / 下限夹到 1 / 工厂真把配置传下去）；日志新增 `pool=min..max` 便于排障 |
+| FIX-24 | 🔴 | **基础设施异常会抛穿 SSE 生成器（客户端只看到断流）**：`/agent/chat` 此前只捕 `LlmError`，checkpointer/DB 异常（如 `psycopg.OperationalError`）直接抛穿，客户端拿到 `httpx.ReadError`，**既无 error 帧也无任何提示** | 2026-10-01 演练实测：终止 PG 连接后发一轮 → 服务端抛 `consuming input failed: server closed the connection unexpectedly` → 流当场断开；服务本身仍健康（`/health` 200） | 违反 AGENTS §6.3「工具执行异常由编排层兜底转为结果消息，**不抛穿编排层**」的同一条精神；前端只能表现为“气泡突然不动了”，用户与运维都无从下手 | Python 侧（3-9 演练一并修） | **✅ 本轮已修**：新增兜底 `except Exception` → 转成 **error 帧**（含可对日志的请求号、「可重试」标记；存储类异常给 503 且文案指向“会话存储”，其它给 500）；回归用例 **+2**（通用异常 → 500 error 帧不断流；storage 类 → 503 且文案指向会话存储） |
 
 ---
 
@@ -747,3 +750,43 @@ B线  [波2 PG底座] ──► [波4 知识库地基] ──► [波5 诊断Age
 - **一句话区分“没做完”与“做不了”**：
   **PG 接入知识库这件事，基础设施层已完成并验证**（0-10 真库验收 18/18 + 跨进程 3/3）；
   **内容层被数据质量卡住**，而这一条**不是写代码能解决的**。
+
+### 2026-10-01 开发进度补记（V2.10 续 · 3-9 三项演练：对话并发 / Python 宕机降级 / PG 连接中断）
+
+- **为什么做这三项**：3-9 清单里「定时任务重入」已由 1-9 验过、`agent.enabled=false` 降级已由 0-15 验过，
+  但**对话并发**与**PG 连接中断恢复**此前完全没测过——而这两条正是“上线后才炸”的典型
+  （并发暴露共享状态问题，连接中断暴露连接池与错误处理问题）。且 0-15 的宕机降级是在
+  checkpointer 还是 SQLite 时验的，本轮在 **PG 后端下**重验。
+- **新增脚本** `docs/scripts/verify-3-9-drills.py`（三相，**每相都自检环境**，不满足就拒绝执行——
+  这是 FIX-16 那次误写事故留下的纪律；`sse_chat_safe` 把“流被打断”也当成可报告结果，
+  不让异常把脚本打挂导致“什么都没产出”）。
+- **验收结果（全部实跑）**：
+  · `--phase concurrent` **4/4 PASS**：8 个不同会话同时对话，全部走完 meta→delta→done，
+    **无跨会话串话**（既核对了返回的 conversation_id，也核对了 delta **内容**与各自输入一一对应——
+    只查 id 会漏掉“状态串了但 id 对”的情况）；
+  · `--phase pg-recover` **4/4 PASS**（修后）：终止应用侧 PG 后端后，下一轮**自动恢复**
+    （连接池重连，无需重启），后续稳定；
+  · `--phase python-down`：停 Python 后网关如实上报 `upstream=down`；对话返回降级帧。
+- **本轮演练撞出两个 🔴 上线阻塞级缺陷（都已修）**：
+  1. **FIX-23：PG checkpointer 用的是单连接，一次中断即永久失效**。
+     `AsyncPostgresSaver.from_conn_string()` 内部是**单个** `AsyncConnection`（实测 3.1.2 源码）——
+     连接一断，saver 就再也不工作了，**只有重启进程能恢复**。演练现场：终止 PG 后端后
+     **后续每一轮都失败**。改法：注入 `AsyncConnectionPool` + `check=check_connection`
+     （取用前校验、死连接丢弃重建），`kwargs` 与 `from_conn_string` 保持一致
+     （autocommit / prepare_threshold / row_factory——自己建池最容易漏的一步）。
+     新增配置 `DKD_AGENT_PG_POOL_MAX`（默认 4）；日志加 `pool=min..max` 便于排障。
+     **复测：中断后自动恢复且稳定。**
+  2. **FIX-24：基础设施异常抛穿 SSE 生成器，客户端只看到断流**。
+     `/agent/chat` 此前只捕 `LlmError`；checkpointer 抛的 `psycopg.OperationalError` 一路抛穿，
+     客户端拿到 `httpx.ReadError`——**既没有 error 帧，也没有任何可展示的提示**，
+     前端表现为“气泡突然不动了”。违反 AGENTS §6.3「编排层兜底转结果消息」的精神。
+     改法：新增兜底 `except Exception` → 转成 error 帧（含可对日志的请求号 + 可重试标记；
+     存储类异常给 503 且文案指向“会话存储”，其它给 500）。
+- **这两条为什么值得单独记**：它们都属于「**读代码看不出来、单机开发撞不到、生产上必炸**」的类型：
+  单连接在开发机上（PG 从不重启）永远不会暴露；断流在 curl 下看起来只是“请求结束”。
+  演练的价值就在这里——`verify-3-9-drills.py` 第一次跑就被 ReadError 打挂，
+  第二次跑发现“恢复不了”，才挖出这两个真问题。
+- **未覆盖（如实说明）**：`3-9` 的 **MySQL 慢查询**演练**未做** ——
+  本机开发库只有 29 单 / 28 工单，造不出有意义的慢查询（强行造需要写脏数据），
+  留待 M2 真机环境；**SQLite 文件损坏恢复**也随本机切 PG 后端而降级为低优先级
+  （仍可切回 sqlite 后演练，已记在 3-9 剩余项里）。

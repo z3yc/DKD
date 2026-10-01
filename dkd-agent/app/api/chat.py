@@ -376,6 +376,45 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
         logger.warning("chat llm failed rid=%s: %s", rid, exc)
         yield _sse("error", {"msg": str(exc), "code": 502})
         return
+    except Exception as exc:  # noqa: BLE001 —— 编排层兜底，见下方注释
+        # 为什么需要这个“兜底 except”（2026-10-01 由 3-9 演练撞出来）：
+        #
+        # 此前只抓了 `LlmError`，**基础设施异常会直接抛穿 SSE 生成器**：
+        # 演练中终止 PG 连接后再发一轮，服务端抛 psycopg.OperationalError
+        # （`consuming input failed: server closed the connection unexpectedly`），
+        # 流当场断开 → 客户端拿到的是 httpx.ReadError（断流），
+        # **既没有 error 帧、也没有任何可展示的提示**，前端只能表现为“气泡突然不动了”。
+        #
+        # 这违反了 AGENTS §6.3「工具执行异常由编排层兜底转为结果消息，**不抛穿 LangGraph 循环**」
+        # 的同一条精神：编排层（这里就是 SSE 生成器）必须把异常变成**可展示的结果**。
+        #
+        # 注意：这里不区分“会话存储故障”与“其它故障”去改变**行为**（都是本轮失败 + 可重试），
+        # 只在**文案**上区分——运维拿到 rid 去查日志即可，用户不需要知道是哪个组件坏了。
+        kind = type(exc).__name__
+        storage_related = any(
+            marker in kind for marker in ("Operational", "Interface", "DBAPI", "SQLAlchemy")
+        )
+        logger.warning(
+            "chat aborted by infra error rid=%s type=%s storage_related=%s",
+            rid,
+            kind,
+            storage_related,
+            exc_info=True,
+        )
+        yield _sse(
+            "error",
+            {
+                "msg": (
+                    "会话存储暂时不可用，本轮对话未保存；请稍后重试"
+                    "（若持续出现请联系运维，提供请求号 " + rid + "）"
+                    if storage_related
+                    else "智能体服务内部错误，本轮对话已中断；请稍后重试（请求号 " + rid + "）"
+                ),
+                "code": 503 if storage_related else 500,
+                "retryable": True,
+            },
+        )
+        return
 
     # 3) 留痕与计量（旁路能力，失败降级放行）
     await _record_turn(
