@@ -46,6 +46,33 @@ _CHUNK = 24
 _INTERVAL_S = 0.03
 HEADER_LAST_EVENT_ID = "Last-Event-ID"
 
+# 存储类异常的类型名标记（详见 _is_storage_error）：
+#   Operational/Interface —— psycopg（PG 挂断 / 事件循环不兼容）
+#   DBAPI/SQLAlchemy     —— SQLAlchemy 包装层
+#   Database/Integrity   —— sqlite3.DatabaseError（**文件损坏**，2026-10-01 由
+#                           verify-3-9-drills.py --phase sqlite-corrupt 实测到）与
+#                           sqlalchemy.exc.DatabaseError/IntegrityError
+_STORAGE_ERROR_MARKERS = (
+    "Operational",
+    "Interface",
+    "DBAPI",
+    "SQLAlchemy",
+    "Database",
+    "Integrity",
+)
+
+
+def _is_storage_error(exc: BaseException) -> bool:
+    """异常是否来自“会话存储”（checkpointer / 连接池 / 磁盘）。
+
+    为什么必须抽成函数而不是写在 except 里：这个判断**对外决定用户看到哪句话**
+    （503“会话存储暂时不可用” vs 500“内部错误”），对内决定排查方向，
+    因此只能有一处定义。否则 API 的判断与演练脚本的判断会各自漂移，
+    最后得到“演练说会归存储类、线上却报内部错误”这类最耗时间的假结论。
+    """
+    return any(marker in type(exc).__name__ for marker in _STORAGE_ERROR_MARKERS)
+
+
 """对话图里承担“生成回复”的节点名（build_chat_graph 注册名，echo/LLM 两种实现同名）。"""
 _RESPOND_NODE = "respond"
 
@@ -391,9 +418,7 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
         # 注意：这里不区分“会话存储故障”与“其它故障”去改变**行为**（都是本轮失败 + 可重试），
         # 只在**文案**上区分——运维拿到 rid 去查日志即可，用户不需要知道是哪个组件坏了。
         kind = type(exc).__name__
-        storage_related = any(
-            marker in kind for marker in ("Operational", "Interface", "DBAPI", "SQLAlchemy")
-        )
+        storage_related = _is_storage_error(exc)
         logger.warning(
             "chat aborted by infra error rid=%s type=%s storage_related=%s",
             rid,

@@ -129,3 +129,37 @@ def test_storage_error_is_503_and_message_points_at_session_store(client: TestCl
     err = next(d for e, d in events if e == "error")
     assert err["code"] == 503, f"存储类异常应为 503，实际 {err['code']}"
     assert "会话存储" in err["msg"], f"文案应指向会话存储：{err['msg']}"
+
+
+def test_corrupted_sqlite_error_is_also_classified_as_storage(client: TestClient):
+    """SQLite 文件损坏（`sqlite3.DatabaseError: database disk image is malformed`）也必须归存储类。
+
+    为什么补这一条（2026-10-01，3-9 的 sqlite-corrupt 演练撞出来）：
+    原分类只看 `Operational/Interface/DBAPI/SQLAlchemy`，而**损坏的 SQLite 文件**抛出的是
+    `sqlite3.DatabaseError`（类型名 `DatabaseError`）——它会落到“服务内部错误（500）”，
+    文案让人以为要去查编排逻辑，而真正该做的是恢复/替换会话库文件。
+
+    这正是 FIX-24 那条修完之后**还剩下的一半**：异常不再抛穿 SSE 了（行为对了），
+    但**分类**漏了一类（诊断信息还错）。两者都属于“读代码看不出来”的类型。
+    """
+    import sqlite3
+
+    from app.api.chat import _is_storage_error
+
+    assert _is_storage_error(sqlite3.DatabaseError("database disk image is malformed"))
+
+    client.app.state.chat_graph = _ExplodingGraph(
+        sqlite3.DatabaseError("database disk image is malformed")
+    )
+    resp = _post_chat(client, "c-infra-3")
+    err = next(d for e, d in _frames(resp.text) if e == "error")
+    assert err["code"] == 503, f"SQLite 损坏应归存储类（503），实际 {err['code']}"
+    assert "会话存储" in err["msg"], f"文案应指向会话存储：{err['msg']}"
+
+
+def test_business_error_is_not_misclassified_as_storage():
+    """反向断言：业务/编程错误**不得**被说成“会话存储不可用”（否则运维会去查错东西）。"""
+    from app.api.chat import _is_storage_error
+
+    assert not _is_storage_error(RuntimeError("boom"))
+    assert not _is_storage_error(ValueError("bad input"))
