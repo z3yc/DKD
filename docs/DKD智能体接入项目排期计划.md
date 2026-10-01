@@ -243,7 +243,7 @@
 | `mvn -pl dkd-admin -am test` | **Tests run: 75, Failures: 0, Errors: 0**（Filter 7 / Gateway 10 / Routing 3 / SseRelay 6 / TokenFilter 8 / UpstreamClient 10 / TaskCreate 6 / AgentTask 10 / ReportMapperSql 5 / AgentDecisionLogMapperSql 4 / **TaskServiceCreateConflict 6**）；纯单测，不依赖 MySQL/Redis/Spring 上下文 |
 | `uv run ruff check` / `ruff format --check` | All checks passed；**65 files** already formatted |
 | `npm run build:prod`（**本轮新增前端交付**） | exit 0（仅既有 chunk 体积告警）；新增 `views/manage/restock/**` 已按路由分包（`RestockAdjustDialog` / `RestockReasonDialog` 各自成 chunk） |
-| 3-9 演练（**V2.12 补齐两相**） | `docs/scripts/verify-3-9-drills.py` 五相：**对话并发 4/4**（llm 模式；echo 模式 5/5，断言按 `meta.mode` 分支）、**PG 连接中断恢复 4/4**、Python 宕机降级（`upstream=down` + 降级帧）、**SQLite 损坏 7/7**、**MySQL 慢查询护栏 8/8**（EXPLAIN 真实 SQL `type=range`/`key_len 68 vs 63`、分批 2 条 SQL、超时熔断被切断；⚠️ 真实数据量下的慢查询仍不覆盖，需 M2） |
+| 3-9 演练（**V2.12 补齐两相**） | `docs/scripts/verify-3-9-drills.py` 五相：**对话并发 4/4**（llm 模式；echo 模式 5/5，断言按 `meta.mode` 分支）、**PG 连接中断恢复 4/4**、**Python 宕机降级 7/7**（`--auto-manage-service`：脚本自己停→验→起；经网关观察到 `degrade=true` + `finish_reason=degrade`）、**SQLite 损坏 7/7**、**MySQL 慢查询护栏 8/8**（EXPLAIN 真实 SQL `type=range`/`key_len 68 vs 63`、分批 2 条 SQL、超时熔断被切断；⚠️ 真实数据量下的慢查询仍不覆盖，需 M2） |
 | M2 验收载体（**V2.12 新增**） | `docs/scripts/verify-1-13-m2-acceptance.py`：只读相 **10/10 PASS**（11 台设备 / 3 区域 / 当日计划 3 条 / 数量夹取断言）；`--confirm-write` **15/15 PASS**（真建 1 张 → 幂等复点不建第二张 → 写护栏“新增 1 == 成功 1” → `--rollback-task` 软取消）；**「10 台」本机不可能达成**（`BLOCKED`，前置 FIX-6） |
 | 1-14 双跑对比（**V2.12 新增**） | `docs/scripts/compare-1-14-rule-vs-baseline.py`（只读）口径验证通过；**关键发现：偏差 +212% 的根因是 FIX-5 容量口径**，不是算法——见 `docs/agent-restock-1-14-comparison-caliber.md` |
 | 助手真库端到端（**V2.12 复跑**） | `docs/scripts/verify-assistant-tools.py` **16/16 PASS**（成本优化后无回归）；浏览器 `assistant-mode-hint-check.cjs` **llm 8/8 / echo 7/7**；`restock-workbench-browser-check.cjs` **30/30**（含写入护栏 5→5）、`agent-audit-browser-check.cjs` **14/14**、`agent-assistant-browser-check.cjs` **10/10** |
@@ -560,7 +560,7 @@ M2 验收脚本与 1-14 对比口径已就绪（V2.12）；Phase 2 首项（2-1 
 | 2 | ~~2-2/2-3 规则检索骨架~~ → **V2.13 已完成** | 2-2 规则库检索（三级降级 + `phenomenon_usable`）与 2-3 的实体消歧 `find_devices` 已落地，端到端 22/22 |
 | 3 | ~~把 2-1 的读工具接进诊断对话~~ → **V2.13 已完成（按场景挂载）** | 剩 **2-3 多轮问诊循环**与 **2-4 结构化结论**（置信度排序）未做 |
 | 4 | ~~审计页按 `request_id` 串联视图~~ → **V2.14 已完成** | 后端 `GET /manage/agent/decision-log/trace`（升序 + LIMIT 50 + 参数绑定）+ 前端链路弹窗；浏览器 **19/19**（含 5 项链路断言） |
-| 5 | **把 `verify-3-9-drills.py` 的 `python-down` 相纳入一键回归** | 该相必须先停 Python，目前靠人工；可做成“停→验→起”的自包含脚本 |
+| 5 | ~~把 `python-down` 相做成“停→验→起”自包含脚本~~ → **V2.15 已完成** | 新增 `--auto-manage-service`（默认关闭，需显式给）：自动停 :8090 → 经网关验降级帧 → 用 `python -m app` 重启并等 `/health`。⚠️ 顺带发现该相位**此前不可能跑完**：它直连已停的 Python 发对话，必然 ConnectError——即降级帧从未被它验过 |
 
 ### 10.3 被外部阻塞的（催人，不是写代码）
 
@@ -672,7 +672,11 @@ cd dkd-vue && npm run build:prod
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` **V1.2**）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0（已定稿）**。*
 
-*版本：**V2.14（2026-10-01，3-7 收官：审计「按 request_id 链路」+ 接口文档补齐）**。本次变更：
+*版本：**V2.15（2026-10-01，3-9 最后一相自包含 + 一处“假绿”修正）**。本次变更：
+① `verify-3-9-drills.py --phase python-down --auto-manage-service`：脚本自己**停 :8090 → 经 Java 网关验降级帧 → 用 `python -m app` 重启并等 `/health`**（默认关闭，不擅自停别人的进程）；
+② **修正一处长期“假绿”**：该相位原本在 Python 已停时**直连 :8090 发对话**，必然 `httpx.ConnectError` 把脚本打挂——也就是说它此前只验到了网关状态上报，**降级帧从未被这个脚本验过**；改为经 Java 网关观察后补 3 项断言（`degrade=true` / 文案指向智能体服务 / `finish_reason=degrade`），现 **7/7**；
+③ 五相全绿：concurrent 4/4 · python-down 7/7 · pg-recover 4/4 · sqlite-corrupt 7/7 · slow-query 8/8；
+④ §十 10.2b 的「仍可立刻开工」清单**清零**。上一版如下。
 ① 新增 `GET /manage/agent/decision-log/trace`（按请求号串联同一次请求的全部留痕，**升序** + `limit 50` + 参数绑定；空 requestId 直接报错而不是退化成“最近 50 条”）；前端加「链路」入口与时间线弹窗；
 ② 审计页浏览器验收 **14/14 → 19/19**（新增 5 项链路断言；过程中再次踩到 §十 10.6 坑 4：Element Plus 弹窗关闭后 DOM 仍保留，标题断言必须先限定 `:visible`）；
 ③ 验收脚本的 `X-Request-Id` 改为**每次调用唯一**（此前写死常量，导致审计页把多次请求串成一条链路，实测 13 行）；
@@ -1214,3 +1218,28 @@ cd dkd-vue && npm run build:prod
 
 - **未做（不隐瞒）**：链路视图的**导出**、以及跨 `request_id` 的「同一天同一设备的所有决策」聚合视图未做
   （当前可用「筛选 + 链路」凑合）；截图仍未逐像素视觉评审（执行环境不支持读图）。
+
+### 2026-10-01 开发进度补记（V2.15 · 3-9 收敛：python-down 自包含 + 一处“假绿”修正）
+
+- **做了什么**：把 §十 10.2b 最后一项（`python-down` 相自动化）做完，过程中发现并修正了一个**长期假绿**。
+
+- **修正的假绿（重要，属于“证据本身不成立”这一类）**：
+  该相位原本在 Python 已停时用 `sse_chat()` 直连 **:8090** 发对话——而 :8090 正是它要求停掉的东西，
+  必然 `httpx.ConnectError`，脚本直接抛栈退出。也就是说：
+  **此前记录的「Python 宕机降级」只验到了网关状态上报（`upstream=down`），降级帧从未被这个脚本验过。**
+  修法：改为经 **Java 网关** `POST /agent/chat`（带 JWT）观察，网关在 Python 不可达时会合成
+  `event: error`（`degrade=true`、`code=503`、文案“智能体服务暂不可用”）+ `event: done`（`finish_reason=degrade`）。
+  并补 3 项断言把它钉住。
+
+- **新增 `--auto-manage-service`（默认关闭）**：脚本自己完成「停 → 验 → 起」——
+  停掉监听 :8090 的进程（把 PID 与命令行打印出来，如实说明停了什么）→ 跑本相位的断言 →
+  用**本仓入口 `python -m app`** 重启（见 FIX-20，不能写 `uvicorn app.main:app`）并等 `/health` 200。
+  为什么默认关闭：脚本不该擅自停别人机器上的服务；但验收环境下“人工停完忘了起”是最常见的半停事故，
+  所以给一个显式开关，并在重启失败时打印可手工执行的命令。
+
+- **实测（五相全绿，全部实跑）**：`concurrent` **4/4**（llm 模式；echo 模式 5/5）·
+  `python-down --auto-manage-service` **7/7**（含“已自动重启并 /health 200”这一项）·
+  `pg-recover` **4/4** · `sqlite-corrupt` **7/7** · `slow-query` **8/8**。
+
+- **§十 10.2b 的「仍可立刻开工」清单现在清零**：剩余项要么卡在外部输入（FIX-5/6/7/22），
+  要么属于下一步的 Phase 2 设计（2-3 多轮问诊、2-4 结构化结论）。

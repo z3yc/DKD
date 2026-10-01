@@ -12,12 +12,12 @@
   · **MySQL 慢查询** —— 本机开发库 29 单/28 工单，**造不出有意义的慢查询**（强行造要写脏数据），
     如实留待 M2 真机环境执行，不在本脚本假装覆盖。
 
-## 三相位的环境要求（脚本会**自检**，不满足就拒绝执行——这是 FIX-16 那次误写事故的教训）
+## 各相位的环境要求（脚本会**自检**，不满足就拒绝执行——这是 FIX-16 那次误写事故的教训）
 
 | 相位 | 要求 | 自检 |
 | --- | --- | --- |
 | `--phase concurrent` | Python 可用 + PG 可用 | 都用 /health 与 TCP 探 |
-| `--phase python-down` | **Python 必须已停** + Java 可用 | Python 可连则拒绝 |
+| `--phase python-down` | **Python 必须已停** + Java 可用 | Python 可连则拒绝；加 `--auto-manage-service` 则由脚本自己停→验→起（默认关闭，不擅自停别人的进程） |
 | `--phase pg-recover` | Python 可用 + PG 可用 | 同上 |
 | `--phase sqlite-corrupt` | **无**（自建临时 SQLite 文件，不碰服务） | 无需自检；不需要 PG，也不需要服务在跑 |
 | `--phase slow-query` | MySQL 可用（只读） | MySQL 不可连则拒绝；会打印业务表行数说明数据量 |
@@ -28,8 +28,9 @@
 cd dkd-agent
 set -a; source ../.env; set +a
 python ../docs/scripts/verify-3-9-drills.py --phase concurrent
-# 停 Python 后：
+# 停 Python 后（人工停），或让脚本代劳：
 python ../docs/scripts/verify-3-9-drills.py --phase python-down
+python ../docs/scripts/verify-3-9-drills.py --phase python-down --auto-manage-service
 python ../docs/scripts/verify-3-9-drills.py --phase pg-recover
 # 与上面几相无关，可随时跑：
 python ../docs/scripts/verify-3-9-drills.py --phase sqlite-corrupt
@@ -45,7 +46,9 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 _AGENT_ROOT = Path(__file__).resolve().parents[2] / "dkd-agent"
@@ -54,6 +57,7 @@ if str(_AGENT_ROOT) not in sys.path:
 
 import httpx  # noqa: E402
 
+AGENT_PORT = 8090  # 与 AGENT_BASE 同源（本机默认）
 AGENT_BASE = os.environ.get("DKD_AGENT_BASE_URL", "http://127.0.0.1:8090")
 JAVA_BASE = os.environ.get("DKD_AGENT_JAVA_BASE", "http://127.0.0.1:8080")
 SERVICE_SECRET = os.environ.get("DKD_AGENT_SERVICE_SECRET", "")
@@ -90,6 +94,103 @@ def pg_up() -> bool:
     return tcp_ok("127.0.0.1", 5432)
 
 
+# ----------------------------------------------------------------------------------
+# 「Python 宕机降级」相的服务接管（--auto-manage-service）
+# ----------------------------------------------------------------------------------
+#
+# 这一相原本要求人工先把 Python 停掉，实测有两个麻烦：
+#   ① 忘了停 → 脚本拒跑（护栏是对的，但每次都要人工切一顿）；
+#   ② 停完忘了起 → 环境留在半停状态，后续相位全部失败。
+# 所以加一个**显式开关**：`--auto-manage-service` 时由脚本自己停、验、再起。
+# 默认关闭（不自动动别人的进程），需要时显式给。
+#
+# ⚠️ 重启**必须用本仓入口 `python -m app`**（见 FIX-20：uvicorn 0.36+ 在 Windows 上
+#    默认给 ProactorEventLoop，psycopg 异步不支持；`python -m app` 内部已把 loop 钉住）。
+#    这条写在代码里而不是注释里——重启命令写错会让整台环境静默变成另一种形态。
+_AGENT_ROOT_FOR_RESTART = Path(__file__).resolve().parents[2] / "dkd-agent"
+
+
+def _windows_pids_on_port(port: int) -> list[int]:
+    """取监听该端口的 PID 列表（Windows：netstat -ano 解析）。"""
+    out = subprocess.run(
+        ["netstat", "-ano"], capture_output=True, text=True, timeout=20
+    ).stdout
+    pids: list[int] = []
+    for line in out.splitlines():
+        if f":{port}" not in line or "LISTENING" not in line.upper():
+            continue
+        parts = line.split()
+        if parts and parts[-1].isdigit():
+            pids.append(int(parts[-1]))
+    return sorted(set(pids))
+
+
+def _process_cmdline(pid: int) -> str:
+    """取进程命令行（用于把“我们停了什么”如实打印出来）。"""
+    try:
+        out = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=25,
+        ).stdout.strip()
+        return out
+    except Exception:  # noqa: BLE001 —— 拿不到命令行不影响停服务，但要如实说
+        return "<无法读取命令行>"
+
+
+async def stop_python_service() -> dict:
+    """停掉监听 :8090 的进程，返回 {stopped: bool, pids: [...], cmdline: str}。"""
+    pids = _windows_pids_on_port(AGENT_PORT)
+    if not pids:
+        return {"stopped": False, "pids": [], "cmdline": ""}
+    cmdline = _process_cmdline(pids[0])
+    for pid in pids:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=20)
+    deadline = asyncio.get_running_loop().time() + 20
+    while asyncio.get_running_loop().time() < deadline:
+        if not _windows_pids_on_port(AGENT_PORT):
+            return {"stopped": True, "pids": pids, "cmdline": cmdline}
+        await asyncio.sleep(0.5)
+    return {"stopped": False, "pids": pids, "cmdline": cmdline, "timeout": True}
+
+
+async def start_python_service(timeout_s: float = 90) -> dict:
+    """用本仓入口重启 Python（`python -m app`），等 /health 变绿。"""
+    log_path = Path(tempfile.gettempdir()) / "dkd-agent-pyphase.log"
+    with open(log_path, "w", encoding="utf-8") as log:
+        proc = subprocess.Popen(  # noqa: S603 —— 参数是固定列表，不是 shell 拼接
+            [sys.executable, "-m", "app"],
+            cwd=str(_AGENT_ROOT_FOR_RESTART),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        if tcp_ok("127.0.0.1", AGENT_PORT):
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as probe:
+                    resp = await probe.get(f"{AGENT_BASE}/health")
+                if resp.status_code == 200:
+                    return {"started": True, "pid": proc.pid, "log": str(log_path)}
+            except Exception:  # noqa: BLE001 —— 还没起完，继续等
+                pass
+        if proc.poll() is not None:
+            return {
+                "started": False,
+                "pid": proc.pid,
+                "log": str(log_path),
+                "exit_code": proc.returncode,
+            }
+        await asyncio.sleep(1.0)
+    return {"started": False, "pid": proc.pid, "log": str(log_path), "timeout": True}
+
+
 async def sse_chat(client: httpx.AsyncClient, *, conversation_id: str, text: str) -> dict:
     """发一轮 SSE，返回按事件类型归类的帧字典。"""
     events: dict[str, list[dict]] = {}
@@ -99,6 +200,35 @@ async def sse_chat(client: httpx.AsyncClient, *, conversation_id: str, text: str
         json={"message": text, "conversation_id": conversation_id, "scene": 1},
         headers={"X-Agent-User": "7", "X-Request-Id": f"drill-{conversation_id}"},
         timeout=60.0,
+    ) as resp:
+        event_name = None
+        async for line in resp.aiter_lines():
+            if line.startswith("event: "):
+                event_name = line[7:].strip()
+            elif line.startswith("data: ") and event_name:
+                try:
+                    events.setdefault(event_name, []).append(json.loads(line[6:]))
+                except json.JSONDecodeError:
+                    events.setdefault(event_name, []).append({"raw": line[6:]})
+    return events
+
+
+async def sse_chat_via_gateway(client: httpx.AsyncClient, *, token: str, text: str) -> dict:
+    """经 **Java 网关**发一轮 SSE（Python 已停时必须走这条：直连 Python 只会 ConnectError）。
+
+    为什么要单独一个函数（而不是复用 `sse_chat`）：`sse_chat` 直连 Python :8090，
+    而本相位的**前提就是它已经停了**——第一版就是这么写的，结果一调对话就
+    `httpx.ConnectError` 把脚本打挂，前两项断言过了、真正要验的降级帧反而没验到。
+    网关在 Python 不可达时会合成降级帧（`event: error` + `degrade=true`，
+    随后 `event: done` + `finish_reason=degrade`），这才是要观察的对象。
+    """
+    events: dict[str, list[dict]] = {}
+    async with client.stream(
+        "POST",
+        f"{JAVA_BASE}/agent/chat",
+        json={"message": text, "scene": 1},
+        headers={"Authorization": f"Bearer {token}", "X-Request-Id": "drill-python-down"},
+        timeout=30.0,
     ) as resp:
         event_name = None
         async for line in resp.aiter_lines():
@@ -224,12 +354,25 @@ async def phase_concurrent() -> None:
 # ----------------------------------------------------------------------------------
 
 
-async def phase_python_down() -> None:
+async def phase_python_down(*, auto_manage: bool = False) -> None:
+    """Python 已停 → 网关应如实报未就绪、对话走降级。
+
+    @param auto_manage 为 True 时由脚本**自己停 → 验 → 再起**（`--auto-manage-service`）。
+                       默认 False：不擅自停别人的进程，仍要求人工先停（护栏不变）。
+    """
     print("\n[降级] Python 已停：网关应报未就绪且对话走降级，而不是假装可用")
     if agent_up():
-        print("  ⛔ 拒绝执行：Python（:8090）仍可连——本相位必须先真的停掉它")
-        print("     停法： 任务管理器结束 uvicorn/python 进程，或 taskkill /PID <pid> /F")
-        raise SystemExit(1)
+        if not auto_manage:
+            print("  ⛔ 拒绝执行：Python（:8090）仍可连——本相位必须先真的停掉它")
+            print("     两种做法：① 人工停：netstat -ano | findstr :8090 拿 PID → taskkill /PID <pid> /F")
+            print("               ② 让脚本代劳：加 --auto-manage-service（脚本验完会自己重启）")
+            raise SystemExit(1)
+        print("  → auto-manage：正在停掉 :8090 的服务…")
+        stopped_info = await stop_python_service()
+        if not stopped_info.get("stopped"):
+            print(f"  ⛔ 停服务失败：{stopped_info}（请人工停后重跑）")
+            raise SystemExit(1)
+        print(f"  → 已停止 pid={stopped_info['pids']}（{stopped_info['cmdline'][:60]}）")
     print("  ✓ 前置自检通过：Python 不可连")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -254,15 +397,36 @@ async def phase_python_down() -> None:
             f"upstream={data.get('upstream')}",
         )
 
-        # 对话应返回降级帧而不是 500/超时
-        events = await sse_chat(client, conversation_id="drill-down", text="Python 已停时的一句话")
+        # 对话应返回降级帧而不是断流/超时。**必须经 Java 网关**：Python 已停，
+        # 直连 :8090 只会 ConnectError（本相位第一版就是这么把自己的脚本打挂的）。
+        events = await sse_chat_via_gateway(client, token=token, text="Python 已停时的一句话")
         print(f"  → 帧类型：{sorted(events)}")
-        check("对话返回了降级/错误帧（不是静默失败）", bool(events.get("error") or events.get("done")),
-              f"帧={sorted(events)}")
+        check("经网关的对话返回了降级/错误帧（不是静默失败）",
+              bool(events.get("error") or events.get("done")), f"帧={sorted(events)}")
         if events.get("error"):
             err = events["error"][0]
             print(f"  → 降级帧内容：{str(err)[:120]}")
-            check("降级帧明确标记 degrade（前端可据此提示）", bool(err.get("degrade")), f"degrade={err.get('degrade')}")
+            check("降级帧明确标记 degrade（前端可据此提示）",
+                  bool(err.get("degrade")), f"degrade={err.get('degrade')}")
+            check("降级文案指向智能体服务（而不是含糊的“操作失败”）",
+                  "智能体服务" in str(err.get("msg") or ""), f"msg={str(err.get('msg'))[:60]}")
+        done = (events.get("done") or [{}])[0]
+        check("降级收尾帧 finish_reason=degrade（前端据此收掉流式态）",
+              done.get("finish_reason") == "degrade", f"done={done}")
+
+    # 收尾：把服务起回来（**不留半停环境**——人工停完最容易忘的就是这一步）
+    if auto_manage:
+        print("  → auto-manage：正在重启 Python（必须用 `python -m app`，见 FIX-20）…")
+        started = await start_python_service()
+        check(
+            "服务已自动重启并 /health 200（不留半停环境）",
+            bool(started.get("started")),
+            f"pid={started.get('pid')} 日志={started.get('log')}"
+            if started.get("started")
+            else f"启动失败：{started}；请手工执行 cd dkd-agent && .venv/Scripts/python.exe -m app",
+        )
+
+
 
 
 # ----------------------------------------------------------------------------------
@@ -710,12 +874,17 @@ async def main() -> int:
         required=True,
         choices=["concurrent", "python-down", "pg-recover", "sqlite-corrupt", "slow-query"],
     )
+    parser.add_argument(
+        "--auto-manage-service",
+        action="store_true",
+        help="仅 python-down 相：由脚本自己停掉 :8090、验完再重启（默认关闭，需显式给出）",
+    )
     args = parser.parse_args()
 
     if args.phase == "concurrent":
         await phase_concurrent()
     elif args.phase == "python-down":
-        await phase_python_down()
+        await phase_python_down(auto_manage=args.auto_manage_service)
     elif args.phase == "sqlite-corrupt":
         await phase_sqlite_corrupt()
     elif args.phase == "slow-query":
