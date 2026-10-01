@@ -160,8 +160,20 @@ async def create_restock_task(
             plan.inner_code,
             request_id,
         )
+        # 为什么这条文案比“请勿盲目重试”长（FIX-16 演练产出，2026-10-01 实测）：
+        #
+        # 演练中真的停掉 Redis 后，回调在 Java 侧要等 Redis 连接超时，**超过了这里的 10s**，
+        # 于是 Agent 先行放弃——Java 明明已经算出了精确原因（“服务器限流异常，请稍候再试”），
+        # 却因为超时被整个丢弃。运营看到的是“超时、结果未知”，运维会去查网络/Java，
+        # 而真因在 Redis（FIX-16 登记的就是“朝错误方向排查”）。
+        #
+        # 改不了 Java 侧的失败耗时（改它会动到 RuoYi 全局限流切面，影响所有接口），
+        # 但可以让这句文案**自己带上下一步动作与可能原因**，把死胡同变成可行动。
+        # 措辞上用“可能”而不是断言 Redis：Agent 看不到 Java 内部，不能替运维下结论。
         raise CallbackUnavailableError(
-            f"建单回调超时（>{settings.callback_timeout_s}s），结果未知，请勿盲目重试"
+            f"建单回调超时（>{settings.callback_timeout_s}s），未确认结果："
+            "请先刷新该计划状态再决定是否重试（若已变为「已建单」则勿重试）；"
+            "回调经过 Redis 限流计数与数据库，可能原因包括 Java 或 Redis 不可用，建议一并检查"
         ) from exc
     except httpx.HTTPError as exc:
         # 只记异常类型：异常文本可能含 URL，而 URL 不含密钥（密钥只在头里），但仍避免贴原始报文

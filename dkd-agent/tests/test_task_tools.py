@@ -155,8 +155,17 @@ async def test_timeout_and_network_failure_are_unavailable_not_business():
         raise httpx.ConnectTimeout("boom")
 
     async with _client(timeout_handler) as client:
-        with pytest.raises(CallbackUnavailableError, match="超时"):
+        with pytest.raises(CallbackUnavailableError, match="超时") as excinfo:
             await create_restock_task(_plan(), client=client)
+
+        # FIX-16 演练产出（2026-10-01）：超时文案必须**可行动**，不能只说“结果未知”。
+        # 真实演练中停掉 Redis 后，Java 侧等 Redis 连接超时超过了本客户端的 10s，
+        # Agent 先行放弃并把 Java 已算出的精确原因（“服务器限流异常”）整个丢掉，
+        # 运营只看到“超时”——运维于是去查网络，而真因在 Redis。
+        message = str(excinfo.value)
+        assert "刷新" in message and "已建单" in message, "要告诉运营下一步做什么"
+        assert "Redis" in message, "要把“Redis 不可用”列为可能原因（本例的真因）"
+        assert "可能原因" in message, "用“可能”措辞：Agent 看不到 Java 内部，不能替运维下结论"
 
     def refuse_handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")
