@@ -23,8 +23,10 @@ from app.checkpoint import (
 from app.config import get_settings
 from app.db import dispose_engine
 from app.graphs.chat_graph import build_chat_graph
+from app.llm import build_chat_model
 from app.logging_conf import RequestContextMiddleware, setup_logging
 from app.services.restock_analyzer import build_default_analyzer
+from app.tools.assistant_tools import build_assistant_tools
 
 logger = logging.getLogger("dkd.agent")
 
@@ -44,9 +46,32 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     if not s.service_secret:
         logger.warning("DKD_AGENT_SERVICE_SECRET 未配置 —— 回调/运维接口将返回 503")
 
+    # 工具能力启动探测（2026-10-01）：配了工具但模型不支持函数调用时，**启动即拒绝**。
+    # 为什么不等第一条消息再报：那时用户已经看到了一个 502 错误帧，
+    # 而运维要在一堆正常启动日志里找到“模型不支持工具”这条线索。
+    # 探测不发网络请求（bind_tools 只做本地包装），代价可忽略。
+    if s.use_llm:
+        probe_tools = build_assistant_tools()
+        try:
+            build_chat_model().bind_tools(probe_tools)
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "当前 LLM 客户端不支持函数调用（bind_tools），但助手已配置只读工具 —— "
+                "拒绝以不兼容的配置启动。处理方式：改用支持 function calling 的模型"
+                "（如 deepseek-chat），或把 DKD_AGENT_USE_LLM 置 0。"
+            ) from exc
+
     store = await open_checkpoint_store(s)
     app.state.checkpoint_store = store
-    app.state.chat_graph = build_chat_graph(checkpointer=store.saver, use_llm=s.use_llm)
+    # 给 LLM 分支挂上**只读工具**（2026-10-01 补齐智能功能）：
+    # 助手因此能真取数（补货清单/设备库存/在途工单/近期销量）并基于真实数据作答，
+    # 而不再是“我看不了数据”。写操作**不在这里**：建单/确认/调整一律走补货工作台的人工确认
+    # （AGENTS §7.9）。工具集里没有任何写工具，且有测试断言这一点。
+    app.state.chat_graph = build_chat_graph(
+        checkpointer=store.saver,
+        use_llm=s.use_llm,
+        tools=build_assistant_tools() if s.use_llm else None,
+    )
     # 补货工作台服务（1-7）：真实 store + 真实只读依赖；测试可用 app.state.restock_service 整体替换
     app.state.restock_service = restock.build_default_service()
     # 定时分析执行器（1-9）：与工作台共用同一份 checkpointer；

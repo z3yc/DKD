@@ -37,15 +37,41 @@ from app.prompts.assistant_chat import (
 # ------------------------------------------------------------------------------------
 
 
-def test_prompt_declares_capability_boundary_and_no_fabrication():
-    """能力诚实是这套提示词最核心的一条，逐条断言而不是“看起来有写”。"""
+def test_prompt_declares_read_capability_and_no_write():
+    """能力契约：**能查只读数据、不能改任何业务数据**——两边都要断言。
+
+    为什么两边都要：只写“能查”会让模型误以为自己什么都能做；只写“不能写”会让它拒绝查数
+    （第一次修订前就是这样，模型答“我看不了实时数据”）。这条契约与工具集是一体的，
+    改一边必须改另一边（见 prompts 模块 docstring 的“能力变了必须同步改这里”）。
+    """
     prompt = system_prompt(SCENE_RESTOCK)
 
-    assert "绝不编造数字" in prompt, "必须禁止编造具体数值（假清单比不回答更危险）"
-    assert "智能补货工作台" in prompt, "必须告诉用户去哪里看真实数据"
+    # 能查：四个只读工具都要在提示词里出现（否则模型不知道有它们）
+    for tool_name in (
+        "list_restock_suggestions",
+        "get_machine_inventory",
+        "list_inflight_work_orders",
+        "get_sales_summary",
+    ):
+        assert tool_name in prompt, f"提示词未告知工具 {tool_name}，模型不会去用"
+
+    # 不能写：必须明确“不得代做/不得声称已做”，并指向人工确认入口
+    assert "不能修改任何业务数据" in prompt
+    assert "智能补货工作台" in prompt
+    assert "绝对不要说“已为你创建/已调整”" in prompt, "必须禁止声称做过写操作（说了就是假话）"
     assert "决策审计" in prompt, "审计入口也要指出来（排障最常用）"
-    assert "不能**创建工单" in prompt or "不能创建工单" in prompt, "必须明确不能建单"
-    assert "不要用模糊话术糊过去" in prompt or "直接说做不到" in prompt, "做不到要直说"
+
+
+def test_prompt_declares_number_discipline():
+    """数字纪律：只能引用工具返回值；报错如实说；口径与截断要随行。"""
+    prompt = system_prompt(SCENE_RESTOCK)
+
+    assert "只能引用工具返回的数字" in prompt, "必须禁止无工具出数（假清单比不回答危险）"
+    assert "不要说出任何具体数值" in prompt
+    assert "如实告诉用户查询失败" in prompt, "工具报错要如实说，不能猜"
+    assert "caliber" in prompt and "带上口径" in prompt, "口径必须随行（否则 5 单会被当成全部）"
+    assert "TruncatedFrom" in prompt, "截断要说明“只列出前 N 条”"
+    assert "dataConsistent" in prompt, "档案不一致要提醒，不能静默选边"
 
 
 def test_prompt_guards_against_user_text_as_instructions():
@@ -82,6 +108,10 @@ class _CapturingModel:
 
     def __init__(self) -> None:
         self.received: list = []
+
+    # 图挂了只读工具后会调用 bind_tools；桩必须实现它（返回自身即可）。
+    def bind_tools(self, _tools):  # noqa: ANN001, ANN202
+        return self
 
     async def ainvoke(self, messages):  # noqa: ANN001, ANN202
         self.received = list(messages)
@@ -120,7 +150,7 @@ def test_llm_node_prepends_system_prompt_before_history(client_with_llm: TestCli
 
     prompt = str(first.content)
     assert "智能补货" in prompt, "system 里必须带上场景侧重（scene=2）"
-    assert "绝不编造数字" in prompt, "system 里必须带上能力诚实约束"
+    assert "只能引用工具返回的数字" in prompt, "system 里必须带上数字纪律"
 
     # 用户消息仍在，且是 HumanMessage（不是被塞进 system）
     humans = [m for m in model.received if isinstance(m, HumanMessage)]

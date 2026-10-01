@@ -48,9 +48,39 @@ async function step(name, fn) {
   try { await fn() } catch (e) { fail++; console.log('  ERROR  ' + name + ' :: ' + String(e).split('\n')[0]) }
 }
 
+/**
+ * 写入护栏（2026-10-01 加，来自一次真实教训）：
+ *
+ * 本脚本会点「调整/跳过/暂停/恢复」这些**会改业务数据**的按钮。虽然它刻意不点「确认建单」，
+ * 但当天在库中检出一条**非预期的建单留痕**（agent_decision_log id=130：plan 83 被 confirm，
+ * planStatusBefore=2，建出 task 575），而当天唯一在点这个页面的就是本脚本——
+ * 说明“靠脚本作者记得别点”是不够的。
+ *
+ * 因此每次运行都对比运行前后的**活跃工单数**：变多就以失败退出并大声报出来，
+ * 而不是让一次演练静默写进业务数据。取证入口：agent_decision_log 按当次时间窗查。
+ */
+function countOpenTasks() {
+  const { execFileSync } = require('child_process')
+  const mysql = process.env.MYSQL_BIN || 'D:/MySQLMySQL Server 8.0/bin/mysql.exe'
+  const opt = process.env.MYSQL_OPT_FILE
+  if (!opt) return null
+  try {
+    const out = execFileSync(
+      mysql,
+      [`--defaults-extra-file=${opt}`, '-N', '-B', '-e',
+        'select count(*) from tb_task where task_status in (1,2)', 'dkd'],
+      { encoding: 'utf8' }
+    )
+    return parseInt(String(out).trim(), 10)
+  } catch (e) {
+    return null
+  }
+}
+
 ;(async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true })
   const page = await browser.newPage({ viewport: { width: 1560, height: 980 } })
+  const openTasksBefore = countOpenTasks()
   const errors = []
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()) })
   page.on('pageerror', (e) => errors.push(String(e)))
@@ -212,6 +242,15 @@ async function step(name, fn) {
     console.log('      截图：' + path.join(SHOT_DIR, 'restock-paused.png'))
     const real = errors.filter((e) => !/favicon|ResizeObserver/i.test(e))
     ok(real.length === 0, real.length ? `控制台错误 ${real.length} 条：${real.slice(0, 3).join(' | ')}` : '控制台无错误')
+  })
+
+  await step('[9] 写入护栏：本次运行不得新增活跃工单', async () => {
+    const after = countOpenTasks()
+    if (openTasksBefore === null || after === null) {
+      console.log('  SKIP  未提供 MYSQL_OPT_FILE，跳过写入护栏（建议提供，见文件头注释）')
+      return
+    }
+    ok(after <= openTasksBefore, `活跃工单数 ${openTasksBefore} -> ${after}（脚本不应产生业务写入）`)
   })
 
   await browser.close()

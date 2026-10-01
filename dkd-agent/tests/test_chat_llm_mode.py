@@ -42,6 +42,11 @@ def _stub_model(
     """把 LLM 节点依赖的模型客户端换成桩（不产生任何外部调用）。"""
 
     class _StubChatModel:
+        # 图挂了只读工具后会调用 bind_tools；桩必须实现它（返回自身即可），
+        # 否则测试会因为“桩不会绑工具”而红——那是测试的缺口，不是产品的。
+        def bind_tools(self, _tools):  # noqa: ANN001, ANN202
+            return self
+
         async def ainvoke(self, _messages):  # noqa: ANN001, ANN202 —— 只需满足节点用到的调用面
             return AIMessage(
                 content=content,
@@ -144,9 +149,17 @@ def test_llm_tokens_arrive_as_multiple_delta_frames(client_with_llm: TestClient,
     """
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 
-    fake = GenericFakeChatModel(
-        messages=iter([AIMessage(content="建议给 A1 货道补货 六 瓶 可乐 以备 周末 高峰")])
-    )
+    class _Fake(GenericFakeChatModel):
+        """图挂了工具后会调 bind_tools；GenericFakeChatModel 未实现（基类抛 NotImplementedError）。
+
+        这是测试桩的缺口，不是产品的：真实模型（ChatOpenAI/DeepSeek）支持 function calling，
+        而桩只需满足被调用的接口面。
+        """
+
+        def bind_tools(self, _tools):  # noqa: ANN001, ANN202
+            return self
+
+    fake = _Fake(messages=iter([AIMessage(content="建议给 A1 货道补货 六 瓶 可乐 以备 周末 高峰")]))
     monkeypatch.setattr(chat_graph, "build_chat_model", lambda *a, **kw: fake)
 
     resp = client_with_llm.post("/agent/chat", json={"message": "补货建议", "scene": 2})

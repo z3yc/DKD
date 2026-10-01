@@ -513,9 +513,113 @@ B线  [波2 PG底座] ──► [波4 知识库地基] ──► [波5 诊断Age
 
 ---
 
+## 十、交接给下一个会话（Handoff，2026-10-01 新增）
+
+> 本章是**专门为「新会话快速接手」写的**：读完这一章就能开工，不必翻前面的 500 行。
+> 写作原则：**每条都带可执行的命令或文件路径**，不含“建议关注”这类无法行动的句子。
+
+### 10.1 一句话现状
+
+**Phase 1（补货 Agent）已交付完毕并可浏览器验收；PG checkpointer 已真库验收；助手已具备只读取数能力。
+剩下的都不是写代码能推动的**——分别卡在业务拍板（FIX-5/FIX-22）、外部数据（FIX-6）、值班窗口（FIX-7）。
+
+### 10.2 可立刻开工的任务（不需要任何人给东西）
+
+| 优先级 | 任务 | 入口条件 | 要改的地方 | 验收 |
+| --- | --- | --- | --- | --- |
+| **1** | **M2 验收准备**：把「10 台真机全闭环」写成一键脚本 | 无（数据到了再跑） | 新增 `docs/scripts/verify-1-13-m2-acceptance.py`（参照 `verify-1-3-build-task.py` 的真库真回调写法） | 脚本能跑通并输出验收报告 |
+| **2** | **1-14 规则版对比埋点** | 无 | 对比口径：`generateRestockSuggestions`（Java）vs 基线引擎；数据源见 `docs/ddl/business_tables_survey.md` | 产出对比报表口径文档 |
+| **3** | **FIX-1 的 Java 配套改动**（把 1062 转成业务文案） | 无（可与约束解耦：`task_code` 唯一键也会抛 1062） | `dkd-manage/.../service/impl/TaskServiceImpl.java`（捕获 `DuplicateKeyException`/`DataIntegrityViolationException` → 转成“设备有未完成工单或工单号冲突，请刷新重试”） | 新增单测 + 现有 69 项全绿 |
+| **4** | **3-9 剩余演练：MySQL 慢查询** | M2 真机环境（开发库 29 单造不出慢查询） | `docs/scripts/verify-3-9-drills.py` 加一相 | 慢查询能在受限窗口 + 分批 + 超时下被拦住 |
+| **5** | **3-9 剩余演练：SQLite 损坏恢复** | 无（切回 sqlite 后端即可跑） | 同上加一相 | 损坏后能给出可诊断错误，不静默丢会话 |
+| **6** | **前端：助手工具调用的“正在查询”反馈** | 无 | `dkd-vue/src/components/AgentAssistant/index.vue`：现在工具轮次不产生 delta，用户会看到气泡空白几秒；可加“正在查数据…”占位 | 浏览器手测 + `assistant-mode-hint-check.cjs` 仍 7/7 |
+| **7** | **助手的成本优化**（一次带工具的问答 ≈ 3.5k input token，是普通对话的 ~10 倍） | 无 | `app/tools/assistant_tools.py`：限制 `reason` 长度、只回最近 N 条计划、按需返回 channels | `verify-assistant-tools.py` 仍 16/16 且 token 下降 |
+| **8** | **2-1 异常检测读工具**（Phase 2 首项，不受 FIX-22 阻塞） | 需先决定是否放宽 Phase 门禁（M2 未验收） | `app/tools/read_tools.py` 新增订单异常/库存异常查询 | 构造异常样本验证识别 |
+
+### 10.3 被外部阻塞的（催人，不是写代码）
+
+| 项 | 需要谁 | 具体要什么 | 拿到后第一件事 |
+| --- | --- | --- | --- |
+| **FIX-5** 🔴 | 业务 | 货道容量权威源选 `tb_inventory` 还是 `tb_channel`（实测 3/3 不一致） | 修 `read_tools` 的容量取值 + 跑 `verify-1-12-reconcile.py` 库存例 |
+| **FIX-6** 🔴 | 项目负责人 | 生产/测试库导出（`tb_inventory` 历史快照、`tb_order` 近 90 天、历史人工补货量） | 跑 `backtest-restock-baseline-1-4.py` 验±20% → 推 1-13 |
+| **FIX-22** 🔴 | 业务/产品 | 维修工单补「现象/原因/处置」回填，或给厂商故障码表/手册 | 跑 `sample-2-7-case-library.py` 看门槛是否达标 → 达标才进知识库 |
+| **FIX-7** 🔴 | 你+运维 | 值班窗口 + 云控制台（MySQL root / Redis / JWT / OSS / Druid）；**三处同一口令** | 按 `docs/security-credential-rotation.md` 逐项轮换，**重点验 FIX-19 的 401 透传** |
+| **D5 生产半场** | 运维/负责人 | 生产是否允许新增 DB 引擎 | 同步 `DKD_AGENT_PG_DSN` 到部署环境 + 容器 host 模式 |
+| FIX-18 | 环境 | 备用交付通道（SSH key / 第二代理节点） | — |
+| FIX-21 | 业务 | 29% 订单无 `channel_code` 是否修数 | — |
+
+### 10.4 环境操作速查
+
+```bash
+# ── 启动全栈（顺序无关，但都要在）──────────────────────────
+# 1) 基础设施：MySQL 服务 + Redis + PostgreSQL（Windows 服务/手动）
+# 2) Python 智能体（⚠️ 必须用这个入口，见坑 1）
+cd dkd-agent && set -a && . ../.env && set +a && uv run python -m app
+# 3) Java 后端（⚠️ 新增类后必须 clean 打包，见坑 2）
+cd dkd-parent && mvn -pl dkd-admin -am clean package -DskipTests && java -jar dkd-admin/target/dkd-admin.jar
+# 4) 前端
+cd dkd-vue && npm run dev        # :80，入口 http://127.0.0.1  账号 admin/admin123
+
+# ── 停止（⚠️ pkill 停不干净，见坑 3）─────────────────────────
+netstat -ano | findstr :8090     # 拿真实 PID
+netstat -ano | findstr :8080
+
+# ── 全部门禁（合并前必跑）─────────────────────────────
+cd dkd-agent && uv run ruff check . && uv run ruff format --check . && uv run pytest
+cd dkd-parent && mvn -pl dkd-admin -am test     # 69 passed
+cd dkd-vue && npm run build:prod
+```
+
+### 10.5 验证脚本速查（每条都是真环境、可复跑）
+
+| 脚本 | 跑什么 | 最近结果 | 是否写业务数据 |
+| --- | --- | --- | --- |
+| `verify-checkpoint-pg.py` | PG checkpointer：配置/脱敏/生命周期/5 项拒绝/跨进程 | 18/18 + 3/3 | 否 |
+| `verify-3-9-drills.py` | 并发 / PG 连接中断恢复 / Python 宕机降级 | 4/4 + 4/4 | 否 |
+| `verify-fix16-redis-failmode.py` | Redis fail-closed 三相位 | 2/2+7/7+2/2 | 否 |
+| `verify-fix17-llm-degrade.py` | 密钥失效降级 / 真 LLM 校准 live | 6/6 + 7/7 | 否（live 相花钱） |
+| `verify-1-12-reconcile.py` | Agent 聚合口径 vs Java 报表口径 | 8/8 | 否 |
+| **`verify-assistant-tools.py`** | 助手工具真库取数 + 端到端 + **不写护栏** | **16/16** | 否（第三条专门验“不写”） |
+| `restock-workbench-browser-check.cjs` | 补货工作台浏览器 | 29/29 | **会点调整/跳过/暂停 → 有写入护栏** |
+| `agent-audit-browser-check.cjs` | 审计页浏览器 | 14/14 | 否 |
+| `assistant-mode-hint-check.cjs` | 助手模式提示（llm/echo 两模式） | 7/7 + 7/7 | 否 |
+| `sample-2-7-case-library.py` | 知识库数据质量门槛 | **4 项不过** | 否 |
+
+### 10.6 本轮新增的坑（下个会话直接避）
+
+1. **Python 服务必须用 `uv run python -m app`**：uvicorn 0.36+ 在 Windows 上默认给 `ProactorEventLoop`，psycopg 异步不支持 → 报错却指向 psycopg（FIX-20）。
+2. **Java 新增类后必须 `clean package`**：`mvn -pl dkd-admin -am package` 会因 maven-jar-plugin 2.4 判定“jar 已最新”而**跳过重建**，嵌套的 dkd-manage jar 也不刷新 → **BUILD SUCCESS 但新接口 404**。验证要看**解包 fat jar 里的 class**。
+3. **别用 `pkill -f "python -m app"` 当停服务**：`uv run` 包了一层，真实监听进程命令行不匹配 → 老进程占着 8090，新进程绑定失败，**而你一直在访问旧代码**。用 netstat 找 PID。
+4. **Playwright 三坑**：`:has-text()` 是**子串**匹配（`button:has-text("跳过")` 会命中筛选 chip「已跳过」）；同页两组 chips 里各有一个「全部」；Element Plus 弹窗关闭后**DOM 仍保留**，footer 按钮会匹配到多个、等 `detached` 永远等不到（应等 `hidden`）。
+5. **跨 shell 写 Python 时别用 `/f/...` 绝对路径**：`\f` 会被当成换页符 → `FileNotFoundError`。在 Python 里用 `F:/...` 或相对路径。
+6. **JSON 响应里的 `\n` 会被 shell heredoc 折叠**：在 bash 里拼含反斜杠的 Python 字符串时用 `chr(10)` 或换锚点，不要依赖 `\\n`。
+7. **`.cjs` 脚本可能是 CRLF**：Python 里按 `\n` 匹配会全部失败（需要 `read_bytes().decode()` 后先 `replace("\r\n", "\n")`）。
+
+### 10.7 诚实清单（未验证 / 出过的事故）
+
+**未验证项**
+- 前端图（`docs/evidence/*.png`）**未经逐像素视觉评审**——执行环境不支持读图，断言均在 DOM 层。
+- 助手**尚不能建单/改数据**（设计如此，不是没做完）：需要 Phase 2 的工具编排 + 人工确认交互。
+- **MySQL 慢查询演练**未做（开发库无数据量）；**SQLite 损坏恢复**未做（本机已切 PG）。
+- 非 Windows 环境**未实测**（事件循环分支按设计为 no-op）。
+- 生产半场 D5、容器真实 `docker build/up`、生产凭据轮换 —— 均未做。
+
+**出过的事故（均已回退并加护栏，留痕未删）**
+| 时间 | 事故 | 处置 |
+| --- | --- | --- |
+| 10:12 | FIX-16 演练脚本**没有环境自检**，redis-cli 因需 AUTH 停库失败 → “故障相位”在正常环境跑完并真建单（task 574） | 加前置守卫（Redis 可连则拒跑）+ 回退写入 + 事故写进脚本注释 |
+| 10:50 | **来源未查明的一次建单**（`agent_decision_log` id=130：plan 83 confirm，planStatusBefore=2，建出 task 575）。留痕只能给出 `user_id=1`、`trigger_type=3`；当天唯一在点该页面的就是浏览器验收脚本 | 回退（工单软取消、计划回 1-建议）+ **给脚本加写入护栏**（对比运行前后活跃工单数，变多即失败） |
+
+> 两次事故的共同教训：**会改数据的验证脚本必须自带“我没改数据”的自检**，
+> 不能靠“作者记得别点那个按钮”。护栏比承诺可靠。
+
+---
+
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` **V1.2**）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0（已定稿）**。*
 
-*版本：**V2.10（2026-10-01，Phase 1 前端全部收口 + PG 本机真库验收 + FIX-3/4/12/20）**。本次变更：① §七 **1-10/1-11 转 ✅ 真浏览器验证**（脚本 29/29）、0-10 转 ✅ **真库已验收**（18/18 + 跨进程 3/3 + 服务级 `/health` + 真实 SSE 落 PG）；② §八 **FIX-3 关闭**（报表 SQL 绑定 status+时间窗，真库 28/26→7/5 且与 Agent 对账值一致）、**FIX-4 本机已执行**（EXPLAIN 走 range）、**FIX-12 关闭**（新增浏览器验收脚本）、FIX-14 转「触发条件已有实现且已验证」、**新增 FIX-20（uvicorn 0.36+ 事件循环，已修）**——计数改为「已关闭 **9** / 待修 **11**」；③ 1-12 前置由三项降为**仅剩 FIX-5**；④ 质量门禁更新（pytest 299 passed/94.88%、mvn **65 passed**、verify-checkpoint-pg 18/18、**浏览器 29/29**）；⑤ 新增 2026-10-01 开发进度补记（含菜单执行与 FIX-3/4/12）。**方案 V1.2 口径未变**；评审稿升为 **V1.1**（§8-4 假设关闭：方案 2 经实测证伪）；AGENTS §1 约束 5 新增「Windows + PG 事件循环」实测边界（第四次回写）。*
+*版本：**V2.11（2026-10-01，助手智能功能补齐 + 交接章）**。本次变更：① 助手挂上**只读工具**（真取数），新增 §十「交接给下一个会话」；② FIX 计数不变（本轮无新增/关闭，但新增两条诚实记录见 §十 10.7）；③ 质量门禁：pytest **320 passed**、真库端到端 **16/16**。上一版如下。
+
+*上一版 **V2.10（2026-10-01，Phase 1 前端全部收口 + PG 本机真库验收 + FIX-3/4/12/20）**。本次变更：① §七 **1-10/1-11 转 ✅ 真浏览器验证**（脚本 29/29）、0-10 转 ✅ **真库已验收**（18/18 + 跨进程 3/3 + 服务级 `/health` + 真实 SSE 落 PG）；② §八 **FIX-3 关闭**（报表 SQL 绑定 status+时间窗，真库 28/26→7/5 且与 Agent 对账值一致）、**FIX-4 本机已执行**（EXPLAIN 走 range）、**FIX-12 关闭**（新增浏览器验收脚本）、FIX-14 转「触发条件已有实现且已验证」、**新增 FIX-20（uvicorn 0.36+ 事件循环，已修）**——计数改为「已关闭 **9** / 待修 **11**」；③ 1-12 前置由三项降为**仅剩 FIX-5**；④ 质量门禁更新（pytest 299 passed/94.88%、mvn **65 passed**、verify-checkpoint-pg 18/18、**浏览器 29/29**）；⑤ 新增 2026-10-01 开发进度补记（含菜单执行与 FIX-3/4/12）。**方案 V1.2 口径未变**；评审稿升为 **V1.1**（§8-4 假设关闭：方案 2 经实测证伪）；AGENTS §1 约束 5 新增「Windows + PG 事件循环」实测边界（第四次回写）。*
 
 *上一版 **V2.9（2026-09-28，1-10/1-11 前端交付 + PG checkpointer 落地）**。本次变更：① §七 Phase 1 表 1-10/1-11 转 🟡（前端已交付、待真浏览器验证），Phase 0 的 0-10 行补 PG 可切换与未验证边界；② §七 质量门禁更新为实测值（pytest **292 passed / 94.89%**、ruff 60 文件、`npm run build:prod` exit 0、`mvn -pl dkd-admin -am test` **60 passed / BUILD SUCCESS**（Java 本轮未改动，作回归基线））；③ §八 FIX-14 降级为「待 D5 闭环 + 真库验收」；④ **新增 §九「按能力批次的重排版本」**（六波次 + 依赖图 + 裁剪清单）；⑤ 新增 2026-09-28 开发进度补记（V2.9）。**方案同步改版为 V1.2**（§5.1 会话持久化行、§5 目录结构、§十 `checkpoint.py` 职责），评审稿置为 V1.0 定稿——三者互相引用版本号（AGENTS §4.3）。*
 
@@ -865,3 +969,37 @@ B线  [波2 PG底座] ──► [波4 知识库地基] ──► [波5 诊断Age
 - **仍未做（不隐瞒）**：助手**尚不能真正取数/建单**——它现在会**如实说明**这一点并把人引导到页面。
   真正的“对话里问一句就看紧急清单”需要 Phase 2 的 Supervisor + 工具编排（排期 2-3/2-6 之后），
   不在本次修复范围。这一点必须在验收口径上说清：**本次修的是“答非所问与误判为故障”，不是“让对话能取数”**。
+
+### 2026-10-01 开发进度补记（V2.11 · 助手「智能功能」补齐：从“看不了数据”到“真取数”）
+
+- **背景**：上一轮修掉「对话不返回数据」时明确写了“**本次修的是答非所问与误判，不是让对话能取数**”。
+  本轮把后半句补上：给助手挂只读工具，让它能真查库再回答。
+- **交付内容**：
+  ① **只读工具集** `app/tools/assistant_tools.py`（4 个）：
+     补货建议清单 / 设备档案与货道库存 / 在途工单 / 近期销量。
+     每个工具都返回**口径说明（caliber）**与**截断标记**，失败返回 `{"error":...}` 而不是抛异常。
+  ② **工具调用循环** `app/graphs/chat_graph.py`：`respond ⇄ tools`，三个关键设计——
+      · **轮次上限 3 轮，且是硬的**（在条件边拦，不只靠“不 bind_tools 让模型自觉”）；
+      · **token 跨轮累计**（否则成本计量系统性低估且无任何报错）；
+      · **工具异常不回显原始异常文本**（SQLAlchemy/psycopg 异常常带连接串，会进 prompt 与留痕）。
+  ③ **提示词同步**（`app/prompts/assistant_chat.py`）：从“我看不了数据”改为“能查只读、不能写”，
+     并补数字纪律与口径随行要求。**能力变了必须同时改提示词**——否则与上一轮那个 bug 同类。
+  ④ **启动即校验**：配了工具但模型不支持 function calling → 拒绝启动（而不是每条消息都 502）。
+  ⑤ **前端模式提示**（上一轮已交付）与助手底部工具说明保持一致。
+- **验收（全部实跑）**：
+  · **真库端到端 16/16**（新增 `docs/scripts/verify-assistant-tools.py`）：
+    工具返回值与库中真值逐项一致（计划数/点位名/在途数）；端到端回复里**出现了只有查库才知道的设备编码**；
+    而且第三条专门验红线——让它建单时，回复明确拒绝且**库里工单数 30→30 未变**；
+  · 单测 +10（`tests/test_chat_tools.py`）：只读红线（反射断言无写工具）/ 循环执行 /
+    **上限是硬的（含“模型一直要工具”的对抗用例）** / token 求和 / 工具异常兜底 / 不支持工具的报错可执行 / 不配工具时行为不变；
+  · 门禁：ruff 全过、pytest **320 passed**、前端 build exit 0。
+- **实测效果**（同一句「先看紧急的」）：
+  > 今天（2026-10-01）紧急的只有 **1 条**：设备 `aim5xu4I`，货道 1-1，当前 0/10，建议补 **8** 件，
+  > 接单人：曹操；理由：【降级·规则兜底】…（并附口径说明：紧急=priority=4，只含未完成计划）
+  > …要确认或调整的话，需要你到「AI 智能体 → 智能补货工作台」人工操作，我这里只能给建议、不能建单。
+- **成本提示（已写进交接章）**：一次带工具的问答 ≈ 3.5k input token，是普通对话的约 10 倍——
+  因为 system 提示词 + 工具 schema + 工具返回值都要进上下文。已在 §十 列为优化项。
+- **仍未做（不隐瞒）**：助手**不能建单/改数据**（设计如此，需人工确认）；工具调用期间前端
+  没有“正在查数据”的反馈（气泡会空白几秒）；MySQL 慢查询与 SQLite 损坏恢复两项演练未做。
+- **另附**：本轮又发现一次**来源未查明的建单**（见 §十 10.7 事故表），已回退并给浏览器验收脚本
+  加上**写入护栏**（对比运行前后活跃工单数）。
