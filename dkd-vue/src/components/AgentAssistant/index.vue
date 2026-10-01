@@ -41,6 +41,25 @@
         <el-button link type="primary" @click="probeStatus(true)">重试</el-button>
       </div>
 
+      <!--
+        回显模式提示（2026-10-01 新增）。
+
+        为什么必须有：服务端在 `DKD_AGENT_USE_LLM=0` 时走 Phase 0 的**链路自检分支**，
+        回复会被硬编码成 `[echo] <你输入的内容>`（见 `app/graphs/chat_graph.py::ECHO_PREFIX`）。
+        此前前端**完全没读 meta 帧里的 `mode` 字段**，于是这个行为看起来就像“对话坏了/答非所问”。
+
+        这正是报障里最贵的一类：用户看到的是“智能体失灵”，而真相是“本机配置没打开真模型”。
+        把它显示出来，报障时会直接指向配置而不是代码。
+      -->
+      <div v-if="turnMode === 'echo'" class="mode-bar">
+        <span class="txt">
+          当前为<strong>回显模式</strong>：回答不会调用大模型（会原样回显你的问题）。
+          这是链路自检状态，启用方式：服务端设 <code>DKD_AGENT_USE_LLM=1</code> 后重启。
+        </span>
+      </div>
+      <!-- 真模型时只做一个轻量标识：模型名按**服务端实际返回**显示（可能与配置不同，用于核对计费口径） -->
+      <div v-else-if="turnModel" class="model-badge">模型：{{ turnModel }}</div>
+
       <div ref="bodyRef" class="chat-body">
         <div v-if="messages.length === 0" class="msg ai">
           <div class="ava">🤖</div>
@@ -141,6 +160,10 @@ const draft = ref('')
 const sending = ref(false)
 const degraded = computed(() => agentStore.degraded)
 const degradedReason = computed(() => agentStore.degradedReason)
+/** 服务端本轮的实际模式：'llm' | 'echo'（来自 meta 帧） */
+const turnMode = ref('')
+/** 服务端实际返回的模型名（来自 done 帧；echo 模式为空） */
+const turnModel = ref('')
 const messages = ref([])
 const bodyRef = ref(null)
 // 会话上下文：首轮由服务端下发 conversation_id（Python 侧 thread_id），后续轮次复用实现多轮
@@ -228,9 +251,15 @@ function handleFrame(frame, assistantMsg) {
   if (frame.id) lastEventId.value = frame.id
   if (frame.event === 'meta') {
     if (data.conversation_id) conversationId.value = data.conversation_id
+    // 记录服务端本轮的模式：echo 必须显式告知用户（否则看起来就是“坏了”）
+    turnMode.value = data.mode || ''
   } else if (frame.event === 'delta') {
     assistantMsg.content += data.text || ''
     scrollToBottom()
+  } else if (frame.event === 'done') {
+    // 模型名只在 done 帧才有（服务端按**实际返回**的模型回填，不按配置猜）
+    if (data.model) turnModel.value = data.model
+    if (data.mode && !turnMode.value) turnMode.value = data.mode
   } else if (frame.event === 'error') {
     assistantMsg.error = data.msg || '智能体返回错误'
     // degrade=true 表示服务不可用（网关合成），此时禁用输入而不是让用户反复失败
@@ -409,6 +438,36 @@ onBeforeUnmount(stop)
   .txt {
     flex: 1;
   }
+}
+
+/* 回显模式提示：与 degraded 区分开——服务是好的，只是没接真模型，用蓝色“状态”色而非警告色 */
+.mode-bar {
+  padding: 8px 16px;
+  background: #ecf5ff;
+  border-bottom: 1px solid #d9ecff;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #409eff;
+
+  strong {
+    font-weight: 600;
+  }
+
+  code {
+    background: rgba(64, 158, 255, 0.12);
+    padding: 0 4px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+}
+
+/* 真模型时的轻量标识（证明“确实调了模型”，模型名按服务端实际返回显示） */
+.model-badge {
+  padding: 4px 16px;
+  background: #fafbfc;
+  border-bottom: 1px solid #eef0f3;
+  font-size: 11px;
+  color: #909399;
 }
 
 .chat-body {

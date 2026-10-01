@@ -12,11 +12,12 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any, TypedDict
 
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from app.llm import LlmError, build_chat_model
+from app.prompts.assistant_chat import SCENE_GENERAL, system_prompt
 
 logger = logging.getLogger("dkd.agent.chat_graph")
 
@@ -71,14 +72,25 @@ async def respond_with_llm(state: ChatState) -> dict[str, Any]:
     `streaming=True` 是刻意显式打开的：API 层用 `astream(stream_mode="messages")` 逐 token 下发，
     依赖模型的流式回调。虽然 langchain 在检测到 token 回调时会自动改走流式路径，
     但那是内部启发式——显式打开才能保证“首 token 延迟”这个体验指标不被版本升级默默改掉。
+
+    **为什么必须带 system 提示词（2026-10-01 修报障）**：
+    本节点原先把裸消息历史直接交给模型，一条 system 都没有，连 `state["scene"]` 也没用。
+    实测后果：在前端写着“我是补货 Agent”的抽屉里问**「先看紧急的」**，
+    模型回答「请问您遇到了什么紧急情况？…（例如：身体不适、账号被盗…）」——
+    把**补货术语**理解成了人身紧急事件。
+    这类缺陷不会报错、不会 500、测试也不会红，只能靠拿真实用例问一遍发现。
+    提示词内容与三条纪律（身份/能力诚实/用户输入非指令）见 `app/prompts/assistant_chat.py`。
     """
     client = build_chat_model(streaming=True)
     history = [
         m if isinstance(m, HumanMessage) else AIMessage(content=str(m.content))
         for m in state.get("messages", [])
     ]
+    # system 必须在最前面（放在历史之后会变成“事后补充说明”，模型容易忽略）
+    messages = [SystemMessage(content=system_prompt(int(state.get("scene", SCENE_GENERAL))))]
+    messages.extend(history)
     try:
-        resp = await client.ainvoke(history)
+        resp = await client.ainvoke(messages)
     except Exception as exc:  # 统一转 LlmError，由 API 层映射 502（AGENTS §6.3）
         raise LlmError(f"LLM 调用失败：{type(exc).__name__}") from exc
     reply = resp.content if isinstance(resp.content, str) else str(resp.content)
