@@ -260,7 +260,7 @@ def _blocked(phase: str, exc: Exception) -> None:
     _blocked_count += 1
     print(f"  ⛔ {phase} 未验到（未通过≠失败≠通过）：{exc}")
     print("     这不是被测能力失败，而是当日 token 配额（0-12 成本护栏）把 LLM 拦住了。")
-    print("     复跑：次日重跑，或临时调高 .env 的 DKD_AGENT_TOKEN_DAILY_LIMIT_PER_USER 后再跑。")
+    print("     复跑：次日重跑，或临时调高 .env 的 DKD_AGENT_TOKEN_LIMIT_PER_USER 后再跑。")
     print("     注意：调高配额只是为了验收，不要把它当成“让报告变绿”的手段。")
 
 
@@ -391,7 +391,11 @@ async def phase_e2e_conclusion(session, client: httpx.AsyncClient) -> None:
     real_order_nos = [a.order_no for a in anomalies if a.order_no][:5]
 
     try:
-        reply = await ask(client, f"{DEVICE} 到底什么问题？给我一个诊断结论")
+            # ⚠️ 必须把窗口写进问题里：工具默认只看 90 天，而本机历史数据在 2023 年——
+            # 第一版问的是「到底什么问题？」，模型按默认 90 天查 → 0 条异常 → 如实答
+            # “平台侧无法给出故障原因，也不能判定设备正常”。**那是正确行为**，
+            # 失败的是断言（它期望 1825 天窗口下的真值）。所以修断言而不是改模型行为。
+            reply = await ask(client, f"{DEVICE} 近五年到底是什么问题？给我一个诊断结论")
     except QuotaHit as exc:
         _blocked("端到端结论问答", exc)
         return

@@ -247,7 +247,7 @@
 | M2 验收载体（**V2.12 新增**） | `docs/scripts/verify-1-13-m2-acceptance.py`：只读相 **10/10 PASS**（11 台设备 / 3 区域 / 当日计划 3 条 / 数量夹取断言）；`--confirm-write` **15/15 PASS**（真建 1 张 → 幂等复点不建第二张 → 写护栏“新增 1 == 成功 1” → `--rollback-task` 软取消）；**「10 台」本机不可能达成**（`BLOCKED`，前置 FIX-6） |
 | 1-14 双跑对比（**V2.12 新增**） | `docs/scripts/compare-1-14-rule-vs-baseline.py`（只读）口径验证通过；**关键发现：偏差 +212% 的根因是 FIX-5 容量口径**，不是算法——见 `docs/agent-restock-1-14-comparison-caliber.md` |
 | 助手真库端到端（**V2.12 复跑**） | `docs/scripts/verify-assistant-tools.py` **16/16 PASS**（成本优化后无回归）；浏览器 `assistant-mode-hint-check.cjs` **llm 8/8 / echo 7/7**；`restock-workbench-browser-check.cjs` **30/30**（含写入护栏 5→5）、`agent-audit-browser-check.cjs` **14/14**、`agent-assistant-browser-check.cjs` **10/10** |
-| 诊断场景真库 + 真 LLM（**V2.13 新增；V2.16 扩到工具直连 17 项**） | `docs/scripts/verify-assistant-diagnosis.py`：工具直连 **17/17**（含 2-4 结构化结论的 8 项断言：证据条数与库一致 / 每条带来源 / 置信度按规则 / 未知项含“日志未采集” / **无病因字段** / 动作指向真实入口 / mustSay）；端到端**当日 BLOCKED**（见下）：异常条数与独立 SQL 一致；历史工单命中 2 条、**可用 0 条**且回复明说“没有一条能当故障现象用”；模糊指代列出 8 台候选且**零编造编号**；建单被拒且 `tb_task` 32→32 |
+| 诊断场景真库 + 真 LLM（**V2.13 新增；V2.17 全部转绿**） | `docs/scripts/verify-assistant-diagnosis.py --phase all`：**34/34 PASS**（工具直连 17 + 真 LLM 端到端 14 + 不写护栏 3）。其中 2-4 结论的端到端实测回复：「本结论不包含病因推断——平台没有结构化的故障原因/处置知识库，我只能给你证据、未知项和平台侧可执行动作。置信度 high（依据是订单/库存状态本身的事实，而非推断）」；工具直连含 8 项结论契约断言（证据条数与库一致 / 每条带来源 / 置信度按规则 / 未知项含“日志未采集” / **无病因字段** / 动作指向真实入口 / mustSay）：异常条数与独立 SQL 一致；历史工单命中 2 条、**可用 0 条**且回复明说“没有一条能当故障现象用”；模糊指代列出 8 台候选且**零编造编号**；建单被拒且 `tb_task` 32→32 |
 | 诊断场景浏览器（**V2.13 新增**） | `docs/scripts/assistant-diagnosis-browser-check.cjs` **15/15**：切场景清会话、欢迎语不越权、快捷问题均可答、异常问答带真值、建单被拒 + **数库护栅 32→32** |
 | 端到端（**2026-10-01 新增**） | `docs/scripts/verify-checkpoint-pg.py` **--phase all 18/18 PASS**（含 5 项越权拒绝路径）；**跨进程** write/read 两独立进程 **3/3 PASS**；服务级 `python -m app` → `/health` `checkpoint_backend=postgres`/`checkpoint_open=true`；真实 SSE 会话落 PG 后已清理 |
 | 前端真浏览器（**2026-10-01 新增，FIX-12**） | `docs/scripts/restock-workbench-browser-check.cjs` 在**全栈真环境**下 **29/29 PASS**（菜单/骨架/真实数据 3 行/依据展开/弹窗两模式互斥/原因必填拦截/筛选生效/暂停恢复闭环/控制台 0 错误）；截图 `docs/evidence/restock-workbench-fix12.png`、`restock-paused-fix12.png`。依赖装在项目外（`playwright-core`，AGENTS 禁止擅自引入仓库依赖） |
@@ -673,7 +673,11 @@ cd dkd-vue && npm run build:prod
 
 *本清单与方案文档（`docs/DKD智能体接入方案-LangChain-LangGraph.md` **V1.2**）及原型 V2（`docs/prototypes/dkd-agent-prototype.html`）配套使用。任务编号已按 Phase-序号编码，可直接映射为 Epic（Phase）/Story（任务）。PG 选型见 `docs/dkd-agent-postgres-selection-review.md` **V1.0（已定稿）**。*
 
-*版本：**V2.16（2026-10-01，2-4 结构化诊断结论 + 一次被配额拦住的诚实记录）**。本次变更：
+*版本：**V2.17（2026-10-01，配额上调后把 V2.16 的 BLOCKED 跑成绿 + 两处断言修正）**。本次变更：
+① **V2.16 记录的「端到端未验到」已复跑转绿**：`verify-assistant-diagnosis.py --phase all` **34/34 PASS**（工具直连 17 + 端到端 14 + 不写护栏 3），2-4 的结构化结论在真模型上实测符合契约（主动声明“不含病因推断”、给证据/未知项/动作与置信度依据）；
+② **修正两处自己的错误**：(a) 该脚本的结论提问没写窗口——模型按工具默认 90 天查（本机数据在 2023 年 → 0 条），如实答“无法给出病因、也不能判定设备正常”，**那是正确行为**，失败的是断言（期望 1825 天窗口的真值），已把窗口写进问题；(b) 文档/脚本里把配额开关写成了 `DKD_AGENT_TOKEN_DAILY_LIMIT_PER_USER`，真名是 `DKD_AGENT_TOKEN_LIMIT_PER_USER`（照抄会设不上而不报错）——已全仓改正；
+③ 本机 `.env` 配额按负责人要求上调为 **200 万/用户、2000 万/全局**（原走代码默认 20 万/200 万，一天几轮真库 e2e 就会跑满）；**代码与 `.env.example` 的保守默认未动**（生产成本护栏不受影响）；
+④ 今日累计消耗 **349,573** token（留痕 150 行），新配额下余量充足。上一版如下。
 ① **2-4 落地**（`app/services/diagnosis.py` + 工具 `build_device_diagnosis`）：结构化输出**证据 / 未知项 / 平台动作 / confidence**，其中 `confidence` 由证据强度按固定规则算出（可单测可回归），**刻意不含病因字段**——本平台没有结构化故障知识库（FIX-22），给“病因排序”就是编领域知识；
 ② 单测 **+11**（`tests/test_diagnosis.py`：置信度规则 / 未知项 / 反面断言“不得出现病因字段” / camelCase 别名）；真库工具直连 **17/17**；
 ③ **诚实记录**：当日真 LLM 端到端**被 0-12 的每日 token 配额拦住**（201136/200000，被这一整天的验收跑满）——已把“未验到”与“失败/通过”分开：脚本报 `BLOCKED` 且退出码 **2**，并写明复跑条件；runbook 补「退出码约定」（别用“调高配额”让报告变绿）；
@@ -1277,10 +1281,11 @@ cd dkd-vue && npm run build:prod
   `⛔ … 未验到（未通过≠失败≠通过）`、计入 `BLOCKED`、**退出码 2**（0=全绿 / 1=有失败 / 2=有未验到）。
   为什么较真这个：如果不区分，几天之内团队就会开始用“调高配额”让报告变绿，而那条护栏正是为了防成本失控。
   runbook 已补「退出码约定」。复跑条件：次日重跑，或临时调高
-  `.env` 的 `DKD_AGENT_TOKEN_DAILY_LIMIT_PER_USER`（**仅用于验收**）。
+  `.env` 的 `DKD_AGENT_TOKEN_LIMIT_PER_USER`（**仅用于验收**）。
 
 - **未做（不隐瞒）**：
   ① 2-4 的**前端渲染**（置信度进度条）未做：结论目前经助手文字转述，前端要画进度条需要把结构化 JSON
      以新帧型透出（SSE 协议 + 前端卡片，属 2-6）；
   ② 2-3 的**多轮问诊循环**未做；
   ③ 真 LLM 的结论问答因配额未验到（工具层已验、模型转述待次日复跑）。
+     **→ 同日已复跑转绿（V2.17）**：配额上调后 `--phase all` **34/34 PASS**；实测结论回复主动声明“不含病因推断”，并给出证据、未知项、动作与置信度依据。

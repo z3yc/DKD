@@ -231,6 +231,22 @@ DKD_AGENT_ENABLED=false   # 网关层：/agent/status 报 enabled=false；对话
 一天跑几轮就会把每日配额（默认 20 万 token/用户）跑满——若把“护栏拦住了 LLM”报成“能力失败”，
 几天之后团队就会开始用“调高配额”来让报告变绿，那正好毁掉这条成本护栏。
 
+### 6.4 成本护栏配额（0-12）与本机现状
+
+| 开关（真名，别写错） | 代码/模板默认 | 本机 `.env` 当前值 |
+| --- | --- | --- |
+| `DKD_AGENT_TOKEN_LIMIT_PER_USER` | 200000 | **2000000** |
+| `DKD_AGENT_TOKEN_LIMIT_GLOBAL` | 2000000 | **20000000** |
+
+- 超限时 `/agent/chat` **直接熔断**（error 帧 `code=429` + “当日 token 已达上限”），不再调 LLM——这是**功能**，不是故障。
+- ⚠️ 开关**名字容易写错**：早期文档里出现过 `DKD_AGENT_TOKEN_DAILY_LIMIT_PER_USER`（多了 `DAILY_`）。
+  写错不会报错，只会“设了没生效”，然后你会以为配额没上调——**改完请用**
+  `uv run python -c "import sys;sys.path.insert(0,'.');from app.config import get_settings;print(get_settings().token_daily_limit_per_user)"`
+  核对实际生效值。
+- 本机为什么要调大：每次真库验收都真调 LLM，一天几轮就会把 20 万/用户跑满（实测 2026-10-01 被拦在 201136/200000）。
+  **调大仅用于本机验收**；生产按成本预算收敛。不要用“调高配额”让验收报告变绿——
+  脚本已把“未验到”（BLOCKED，退出码 2）与“失败”（退出码 1）分开。
+
 ### 7.0 一条来自实际踩坑的断言纪律（2026-10-01）
 
 **否证类断言不要用 `substring`**：想验证“助手没有声称已建单”，写成 `!reply.includes('已建单')`
