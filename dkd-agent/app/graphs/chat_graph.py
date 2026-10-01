@@ -182,27 +182,58 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
     }
 
 
-def _make_llm_node(tools: Any) -> Any:
-    """把工具列表闭包进节点函数（LangGraph 节点只接收 state，工具必须从外部带入）。"""
+def _make_llm_node(tools: Any, tools_by_scene: Any = None) -> Any:
+    """把工具列表闭包进节点函数（LangGraph 节点只接收 state，工具必须从外部带入）。
+
+    @param tools         固定工具集（未提供 `tools_by_scene` 时使用）
+    @param tools_by_scene 按场景选工具（**场景决定能力面**，2026-10-01）
+
+    为什么按场景选：补货场景不需要知道“怎么查故障案例”，诊断场景也不需要“补货建议清单”。
+    多绑一个工具就多一份 schema（每轮都进 prompt），还会把模型注意力引到无关问题上。
+    提示词里的工具名单来自同一份配置（`app/prompts/assistant_chat.TOOL_NAMES_BY_SCENE`），
+    且有一致性断言——两边漂移就是“提示与能力脱节”那个老 bug。
+    """
 
     async def _node(state: ChatState) -> dict[str, Any]:
+        if tools_by_scene is not None:
+            scene = int(state.get("scene", 0) or 0)
+            return await respond_with_llm(state, tools=tools_by_scene.get(scene, []))
         return await respond_with_llm(state, tools=tools)
 
     return _node
 
 
-def build_chat_graph(*, checkpointer: Any, use_llm: bool = False, tools: Any = None) -> Any:
+def build_chat_graph(
+    *,
+    checkpointer: Any,
+    use_llm: bool = False,
+    tools: Any = None,
+    tools_by_scene: dict[int, Any] | None = None,
+) -> Any:
     """编译对话图（带 checkpointer）。
 
     @param tools 只读工具列表（`StructuredTool`）；仅 LLM 分支生效。
-                 - 传具体列表 → 模型可调工具（生产路径：`main.py` 传 `build_assistant_tools()`）；
+                 - 传具体列表 → 所有场景都用这一套（测试用）；
                  - 传 `None`/`[]` → 纯对话（不挂 ToolNode，也不 bind_tools）。
                  默认 None 是刻意的：图的能力应当由**装配方显式给出**，
-                 而不是“默默具备”——尤这是给模型赋权（能读写什么）的地方。
+                 而不是“默默具备”——尤其是给模型赋权（能读写什么）的地方。
+    @param tools_by_scene 按场景给工具集（生产路径：`main.py` 传 `tools_for_scene` 的结果）。
+                 与 `tools` 二选一：给了它就以它为准。
+                 ⚠️ ToolNode 注册的是**全部场景的并集**（图只有一个 tools 节点），
+                 但每个场景只 bind 自己那份；模型只能调用被 bind 的工具。
     """
     builder = StateGraph(ChatState)
-    tool_list = list(tools or [])
-    builder.add_node("respond", _make_llm_node(tool_list) if use_llm else respond)
+    if tools_by_scene is not None:
+        union: dict[str, Any] = {}
+        for scene_tools in tools_by_scene.values():
+            for tool in scene_tools:
+                union[tool.name] = tool
+        tool_list = list(union.values())
+        node = _make_llm_node([], tools_by_scene) if use_llm else respond
+    else:
+        tool_list = list(tools or [])
+        node = _make_llm_node(tool_list) if use_llm else respond
+    builder.add_node("respond", node)
     builder.add_edge(START, "respond")
 
     if use_llm and tool_list:

@@ -27,7 +27,19 @@ from pydantic import BaseModel
 import app.graphs.chat_graph as chat_graph
 from app.checkpoint import SqliteCheckpointStore
 from app.graphs.chat_graph import MAX_TOOL_ROUNDS, build_chat_graph
-from app.tools.assistant_tools import build_assistant_tools
+from app.prompts.assistant_chat import (
+    SCENE_ANALYSIS,
+    SCENE_DIAGNOSE,
+    SCENE_GENERAL,
+    SCENE_RESTOCK,
+    system_prompt,
+    tool_names_for_scene,
+)
+from app.tools.assistant_tools import (
+    all_assistant_tools,
+    build_assistant_tools,
+    tools_for_scene,
+)
 
 
 class _Args(BaseModel):
@@ -110,13 +122,16 @@ def test_assistant_tools_are_read_only():
     为什么较真：模型一旦能写，就等于把“人工确认”这一环去掉了，
     而首期明确要求所有写操作 human-in-the-loop（放量需要 Phase 4 评审）。
     """
-    names = {t.name for t in build_assistant_tools()}
+    names = {t.name for t in all_assistant_tools()}
     assert names == {
         "list_restock_suggestions",
         "get_machine_inventory",
         "list_inflight_work_orders",
         "get_sales_summary",
-    }
+        "find_devices",
+        "list_device_anomalies",
+        "search_device_history",
+    }, "工具清单变了就要同步这份断言（它是“能力面”的唯一清单）"
     forbidden = ("create", "confirm", "adjust", "skip", "pause", "resume", "update", "delete")
     for name in names:
         assert not any(word in name for word in forbidden), f"工具 {name} 看起来是写操作"
@@ -390,3 +405,115 @@ def test_plans_tool_schema_exposes_detail_switch():
     tools = {t.name: t for t in build_assistant_tools()}
     schema = tools["list_restock_suggestions"].args_schema.model_json_schema()
     assert "detail" in schema.get("properties", {})
+
+
+# ------------------------------------------------------------------------------------
+# 场景 → 工具集：**提示词与绑定必须一致**（“提示与能力脱节”已踩过两次）
+# ------------------------------------------------------------------------------------
+
+
+def test_scene_tool_names_match_prompt_and_registry():
+    """唯一事实源三方一致：场景名单 == 实际绑定的工具集 == 提示词里提到的工具。
+
+    为什么这条最重要：本项目已经被“提示与能力脱节”咬过两次——
+      ① 提示词写着“能查数据”，但当时**没有工具**；
+      ② 工具挂上了，提示词却还写着“我看不了数据”。
+    两次都是配置/代码两边各写一份导致的。现在名单只有一份
+    （`app/prompts/assistant_chat.TOOL_NAMES_BY_SCENE`），本用例把它钉死。
+    """
+    registry = {t.name for t in all_assistant_tools()}
+    for scene in (SCENE_RESTOCK, SCENE_DIAGNOSE):
+        bound = {t.name for t in tools_for_scene(scene)}
+        declared = set(tool_names_for_scene(scene))
+        prompt = system_prompt(scene)
+        assert bound == declared, f"场景 {scene} 绑定与声明不一致：{bound} vs {declared}"
+        assert bound <= registry, f"场景 {scene} 声明了未实现的工具：{bound - registry}"
+        for name in declared:
+            assert f"`{name}`" in prompt, f"场景 {scene} 绑定了 {name}，但提示词没告诉模型有它"
+        # 反向：提示词不得提到本场景没绑的工具（否则模型会“去调”一个不存在的工具）
+        for name in registry - bound:
+            assert f"`{name}`" not in prompt, (
+                f"场景 {scene} 的提示词提到了未绑定的工具 {name}——模型会去调它然后失败"
+            )
+
+
+def test_scenes_without_tools_say_so_in_prompt():
+    """通用/运营分析场景不挂工具，提示词必须**如实说明**（否则模型凭印象编数字）。"""
+    for scene in (SCENE_GENERAL, SCENE_ANALYSIS):
+        assert tools_for_scene(scene) == []
+        assert "本场景没有挂" in system_prompt(scene)
+
+
+def test_diagnosis_scene_gets_diagnosis_tools_not_restock_plans():
+    """场景 3 拿到的是诊断工具（消歧/异常/历史），不是补货清单工具。"""
+    names = {t.name for t in tools_for_scene(SCENE_DIAGNOSE)}
+    assert {"find_devices", "list_device_anomalies", "search_device_history"} <= names
+    assert "list_restock_suggestions" not in names, (
+        "诊断场景不需要补货清单（省 schema token，也少干扰）"
+    )
+    assert "get_sales_summary" not in names
+    # 库存/在途两个工具诊断也需要（“货道还剩多少/有没有在途工单”是诊断高频问题）
+    assert {"get_machine_inventory", "list_inflight_work_orders"} <= names
+
+
+def test_missing_tool_declaration_fails_fast(monkeypatch):
+    """名单里写了但没实现的工具 → **报错**，而不是静默少一个。
+
+    静默少工具的后果就是“提示词声称有能力、实际没有”——正是上面那个 bug。
+    """
+    import app.tools.assistant_tools as at
+    from app.prompts import assistant_chat as prompts
+
+    monkeypatch.setitem(prompts.TOOL_NAMES_BY_SCENE, SCENE_RESTOCK, ("definitely_not_implemented",))
+    with pytest.raises(RuntimeError, match="未实现"):
+        at.tools_for_scene(SCENE_RESTOCK)
+
+
+async def test_graph_binds_only_the_scene_toolset(monkeypatch, tmp_path):
+    """图按场景 bind 工具：诊断场景里**看不到**补货清单工具（反之亦然）。
+
+    断言方式是看模型实际收到的工具名（桩模型记录 bind_tools 的参数）——
+    这比“看配置对不对”更接近真实行为：模型能看到什么，取决于 bind 了什么。
+    """
+    seen: list[set[str]] = []
+
+    class _RecordingModel:
+        def bind_tools(self, tools):  # noqa: ANN001, ANN202
+            seen.append({t.name for t in tools})
+            return self
+
+        async def ainvoke(self, messages):  # noqa: ANN001, ANN202
+            return AIMessage(
+                content="好的。",
+                usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                response_metadata={"model_name": "stub"},
+            )
+
+    model = _RecordingModel()
+    monkeypatch.setattr(chat_graph, "build_chat_model", lambda *a, **kw: model)
+
+    store = SqliteCheckpointStore(tmp_path / "cp-scene.db")
+    saver = await store.open()
+    try:
+        graph = build_chat_graph(
+            checkpointer=saver,
+            use_llm=True,
+            tools_by_scene={
+                SCENE_RESTOCK: tools_for_scene(SCENE_RESTOCK),
+                SCENE_DIAGNOSE: tools_for_scene(SCENE_DIAGNOSE),
+            },
+        )
+        for scene, expected_contains, expected_absent in (
+            (SCENE_RESTOCK, "list_restock_suggestions", "search_device_history"),
+            (SCENE_DIAGNOSE, "search_device_history", "list_restock_suggestions"),
+        ):
+            config = {"configurable": {"thread_id": f"scene-{scene}"}}
+            await graph.ainvoke(
+                {"messages": [{"role": "user", "content": "hi"}], "scene": scene}, config=config
+            )
+            assert seen, "模型必须被调用（否则本用例什么都没验）"
+            bound = seen[-1]
+            assert expected_contains in bound, f"场景 {scene} 少绑了 {expected_contains}：{bound}"
+            assert expected_absent not in bound, f"场景 {scene} 多绑了 {expected_absent}：{bound}"
+    finally:
+        await store.close()

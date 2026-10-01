@@ -38,6 +38,7 @@ from app.db import get_sessionmaker
 from app.graphs.restock_decisions import summarize_plan
 from app.graphs.restock_plan_store import SqlPauseStore, SqlPlanStore, plan_from_row
 from app.graphs.restock_state import status_label
+from app.prompts.assistant_chat import tool_names_for_scene
 from app.tools import read_tools
 from app.tools.read_tools import ToolError, default_sales_window
 
@@ -368,12 +369,291 @@ async def _get_sales_summary(inner_code: str, days: int = 7) -> str:
 
 
 # ----------------------------------------------------------------------------------
+# 诊断场景的三个只读工具（2-1 / 2-2 / 2-3 的入口）
+# ----------------------------------------------------------------------------------
+#
+# 为什么单独一组、而不是把全部工具都给模型：**场景决定能力面**。
+# 补货场景不需要知道“怎么查故障案例”，诊断场景也不需要“补货建议清单”——
+# 多挂一个工具就多一份 schema（每轮都进 prompt），而且会把模型注意力引到无关问题上。
+# 模型在每个场景只能看到该场景的工具（见 `tools_for_scene`），**提示词也按场景列工具**
+# （两边不一致就是“提示与能力脱节”——那个 bug 已经踩过两次）。
+
+# 异常/历史查询的默认窗口（天）。为什么两者不同：
+#   · 异常检测看“最近怎么了”——90 天足够且不会拉全表；
+#   · 历史案例很稀疏（本机 5 条全在 2023-03），窗口太短会得出“没有历史”的假结论。
+DEFAULT_ANOMALY_WINDOW_DAYS = 90
+# 历史检索默认窗口 2000 天（≈5.5 年）：比 read_tools 的程序化默认（1095）大，
+# 因为自然语言的“历史/以前”比程序调用含糊，窗口给小了会得到“没有历史”的假结论
+# （本机维修单全在 2023-03）。真实成本护栏仍是 per-device 过滤 + 超时熔断。
+DEFAULT_CASE_WINDOW_DAYS = 2000
+
+MAX_ANOMALY_ITEMS = 5
+
+
+def _clip_reason(text: Any, limit: int = 90) -> str | None:
+    """异常理由可能很长（带日志 id/前后库存），截断后仍保留可复核的关键数字。"""
+    if text is None:
+        return None
+    value = str(text).strip()
+    return value if len(value) <= limit else value[:limit] + "…（已截断）"
+
+
+class _FindDevicesArgs(BaseModel):
+    query: str = Field(
+        description="用户口述的设备线索：编号 / 地址 / 点位名，例如“五道口”或“A1000001”"
+    )
+
+
+async def _find_devices(query: str) -> str:
+    """按用户口述定位设备（实体消歧，2-3）。**绝不允许模型自己编一个编号。**"""
+    text_query = (query or "").strip()
+    if not text_query:
+        return _json({"error": "请给出设备线索（编号 / 地址 / 点位名）"})
+    try:
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            matches = await read_tools.find_devices(session, query=text_query)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("助手工具 find_devices 失败：%s", type(exc).__name__)
+        return _json({"error": f"查询设备失败（{type(exc).__name__}）"})
+
+    payload: dict[str, Any] = {
+        "query": text_query,
+        "matchCount": len(matches),
+        "devices": [
+            {
+                "innerCode": m.inner_code,
+                "addr": m.addr,
+                "nodeName": m.node_name,
+                "regionName": m.region_name,
+                "vmTypeName": m.vm_type_name,
+                "vmStatus": m.vm_status,
+                "matchReason": m.match_reason,
+            }
+            for m in matches[:10]
+        ],
+        "caliber": "按编号精确 → 编号前缀 → 点位名 → 地址 的顺序**真查**设备档案（不是猜编号）。",
+    }
+    if not matches:
+        payload["hint"] = (
+            "没有匹配到设备。**不要自己编一个设备编号**；请让用户换一种说法"
+            "（例如报编号前缀，或说出市区/点位名称）。"
+        )
+    elif len(matches) > 1:
+        payload["hint"] = (
+            f"有 {len(matches)} 台设备匹配，**必须让用户确认是哪一台**（报 innerCode）；"
+            "未确认前不要继续查异常/历史，否则会把诊断做在错的设备上。"
+        )
+    return _json(payload)
+
+
+class _AnomalyArgs(BaseModel):
+    inner_code: str = Field(description="售货机编码（如 A1000001）；未确认时先用 find_devices 定位")
+    days: int = Field(
+        default=DEFAULT_ANOMALY_WINDOW_DAYS,
+        description="回看天数（1-3650），默认 90；用户问“近几年/历史上有没有异常”时给大一些",
+    )
+
+
+async def _list_device_anomalies(inner_code: str, days: int = DEFAULT_ANOMALY_WINDOW_DAYS) -> str:
+    """设备的订单/库存异常（2-1）——“这台机器到底出了什么问题”。"""
+    code = (inner_code or "").strip()
+    if not code:
+        return _json({"error": "缺少设备编码（inner_code）"})
+    try:
+        # 上限 10 年：**不是**为了让模型随便拉大窗口，而是因为维修/异常数据天生稀疏——
+        # 本机全部订单都在 2023 年，365 天的上限会让“查历史异常”永远返回空，
+        # 用户会据此以为设备没问题（假阴性）。真正的成本护栏是 per-device 过滤 +
+        # 时间范围下推到索引 + `read_query_timeout_s` 熔断（AGENTS §10），不是窗口长度。
+        window_days = max(1, min(int(days), 3650))
+    except (TypeError, ValueError):
+        window_days = DEFAULT_ANOMALY_WINDOW_DAYS
+    requested_days = days if isinstance(days, int) else None
+
+    start, end = read_tools.default_sales_window(days=window_days)
+    try:
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            orders = await read_tools.list_order_anomalies(
+                session, inner_codes=[code], start=start, end=end
+            )
+            inventory = await read_tools.list_inventory_anomalies(
+                session, inner_codes=[code], start=start, end=end
+            )
+    except read_tools.ToolError as exc:
+        logger.warning("助手工具 list_device_anomalies 被拒/超时：%s", exc)
+        return _json({"error": f"异常检测被拒或超时：{exc}"})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("助手工具 list_device_anomalies 失败：%s", type(exc).__name__)
+        return _json({"error": f"异常检测失败（{type(exc).__name__}）"})
+
+    by_kind: dict[str, int] = {}
+    for item in [*orders, *inventory]:
+        by_kind[item.kind] = by_kind.get(item.kind, 0) + 1
+
+    payload: dict[str, Any] = {
+        "innerCode": code,
+        "window": {"days": window_days, "start": start, "end": end},
+        "orderAnomalyCount": len(orders),
+        "inventoryAnomalyCount": len(inventory),
+        "byKind": by_kind,
+        "orderAnomalies": [
+            {
+                "kind": a.kind,
+                "orderNo": a.order_no,
+                "channelCode": a.channel_code,
+                "status": a.status,
+                "payStatus": a.pay_status,
+                "ageMinutes": a.age_minutes,
+                "reason": _clip_reason(a.reason),
+            }
+            for a in orders[:MAX_ANOMALY_ITEMS]
+        ],
+        "inventoryAnomalies": [
+            {
+                "kind": a.kind,
+                "changeType": a.change_type,
+                "changeAmount": a.change_amount,
+                "orderId": a.order_id,
+                "reason": _clip_reason(a.reason),
+            }
+            for a in inventory[:MAX_ANOMALY_ITEMS]
+        ],
+        "caliber": "订单异常 = status=1 超过阀值仍未出货（卡单）或 status=3 且未退款（出货失败）；"
+        "库存异常 = 无单扣减 / 记录自相矛盾 / 无说明扣减（均来自 tb_inventory_log）。",
+        "dataWarning": "本机 tb_inventory_log 为空表（0 行）：库存异常恒为 0 **不代表货道没问题**，"
+        "只是该类日志尚未被采集。",
+    }
+    if requested_days is not None and requested_days != window_days:
+        # 静默夹取会让模型把“实际只查了 N 天”说成“查了 M 天”（口径失真）
+        payload["windowClampedFromDays"] = requested_days
+    if len(orders) > MAX_ANOMALY_ITEMS:
+        payload["orderAnomaliesTruncatedFrom"] = len(orders)
+    if len(inventory) > MAX_ANOMALY_ITEMS:
+        payload["inventoryAnomaliesTruncatedFrom"] = len(inventory)
+    if not orders and not inventory:
+        payload["hint"] = (
+            "窗口内没有检测到异常。这不等于设备没问题（本平台的异常检测只看订单状态与库存日志）；"
+            "请结合用户描述的现象判断，并**明确告知用户“本次检测未发现问题”**。"
+        )
+    return _json(payload)
+
+
+class _HistoryArgs(BaseModel):
+    inner_code: str = Field(description="售货机编码；未确认时先用 find_devices 定位")
+    days: int = Field(default=DEFAULT_CASE_WINDOW_DAYS, description="回看天数（1-2000），默认 1095")
+
+
+async def _search_device_history(inner_code: str, days: int = DEFAULT_CASE_WINDOW_DAYS) -> str:
+    """历史维修单检索（2-2）——“同类故障以前怎么处理的”。
+
+    ⚠️ 本工具的重点不是“能检索到”，而是**如实说出检索结果能不能当证据**：
+    本平台维修工单普遍没有结构化的现象/原因/处置（FIX-22），所以 `usableCaseCount` 常为 0，
+    此时**必须**走保守话术。把 `111` 这种占位文本当“同类现象”讲出来就是编造证据。
+    """
+    code = (inner_code or "").strip()
+    if not code:
+        return _json({"error": "缺少设备编码（inner_code）"})
+    try:
+        window_days = max(1, min(int(days), 2000))
+    except (TypeError, ValueError):
+        window_days = DEFAULT_CASE_WINDOW_DAYS
+    requested_days = days if isinstance(days, int) else None
+    start, end = read_tools.default_case_window(days=window_days)
+
+    try:
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            result = await read_tools.search_history_cases(
+                session, inner_code=code, start=start, end=end, with_anomalies=False
+            )
+    except read_tools.ToolError as exc:
+        logger.warning("助手工具 search_device_history 被拒/超时：%s", exc)
+        return _json({"error": f"历史检索被拒或超时：{exc}"})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("助手工具 search_device_history 失败：%s", type(exc).__name__)
+        return _json({"error": f"历史检索失败（{type(exc).__name__}）"})
+
+    payload: dict[str, Any] = {
+        "innerCode": code,
+        "window": {"days": window_days, "start": start, "end": end},
+        "totalCases": result.total_cases,
+        "usableCaseCount": result.usable_case_count,
+        "matchedByCounts": result.matched_by_counts,
+        "cases": [
+            {
+                "taskCode": c.task_code,
+                "device": c.inner_code,
+                "vmTypeName": c.vm_type_name,
+                "matchedBy": c.matched_by,
+                "confidence": c.confidence,
+                "confidenceBasis": c.confidence_basis,
+                "phenomenon": c.phenomenon,
+                "phenomenonUsable": c.phenomenon_usable,
+                "taskStatus": c.task_status_label,
+            }
+            for c in result.cases[:MAX_ANOMALY_ITEMS]
+        ],
+        "caliber": result.caliber,
+    }
+    if requested_days is not None and requested_days != window_days:
+        payload["windowClampedFromDays"] = requested_days
+    if len(result.cases) > MAX_ANOMALY_ITEMS:
+        payload["casesTruncatedFrom"] = result.total_cases
+    if result.no_evidence_hint:
+        # 这条提示必须原样进 prompt：它是“不编造历史案例”的唯一护栏
+        payload["noEvidenceHint"] = result.no_evidence_hint
+        payload["mustSay"] = (
+            "回答时**必须**说明“没有可用的历史案例/现象”这一点，不要让用户以为有历史依据；"
+            "`phenomenonUsable=false` 的描述只能当“有过维修记录”用，不得当作故障现象引用。"
+        )
+    return _json(payload)
+
+
+def build_diagnosis_tools() -> list[StructuredTool]:
+    """诊断场景（scene=3）的只读工具集（2-1/2-2/2-3）。
+
+    ⚠️ 同样**只放只读工具**：建维修单仍然要在页面上人工确认（AGENTS §7.9）。
+    助手能做的最后一公里是“把现象、异常、历史记录说清楚，并告诉你去哪里动手”。
+    """
+    return [
+        StructuredTool.from_function(
+            coroutine=_find_devices,
+            name="find_devices",
+            description=(
+                "按用户口述定位设备：设备编号 / 地址 / 点位名（如“五道口”“A1000001”）。"
+                "用户没给编号时必须先用它，**不要自己编设备编号**；返回多台时要让用户确认是哪台。"
+            ),
+            args_schema=_FindDevicesArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_list_device_anomalies,
+            name="list_device_anomalies",
+            description=(
+                "检测某台设备近 N 天（默认 90）的异常：支付成功未出货（卡单）、出货失败未退款、"
+                "库存无单扣减/账实不符。问“这台机器出了什么问题/为什么不出货/有没有异常”时用它。"
+            ),
+            args_schema=_AnomalyArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_search_device_history,
+            name="search_device_history",
+            description=(
+                "检索某台设备的历史维修工单（含同型号/同区域降级），返回工单号与描述原文，"
+                "并明确标注描述**能不能当故障现象用**。问“以前有没有遇到过/历史怎么处理的”时用它。"
+            ),
+            args_schema=_HistoryArgs,
+        ),
+    ]
+
+
+# ----------------------------------------------------------------------------------
 # 工具注册
 # ----------------------------------------------------------------------------------
 
 
 def build_assistant_tools() -> list[StructuredTool]:
-    """构造助手可用的工具列表。
+    """构造**补货场景**（scene=2）的只读工具集。
 
     ⚠️ **只放只读工具**。加任何写工具（建单/确认/调整）之前先回答两个问题：
     ① 写操作的 human-in-the-loop 放在哪里（AGENTS §7.9 要求首期必须有人工确认）；
@@ -421,4 +701,47 @@ def build_assistant_tools() -> list[StructuredTool]:
     ]
 
 
-__all__ = ["PRIORITY_LABELS", "build_assistant_tools"]
+# ----------------------------------------------------------------------------------
+# 场景 → 工具集（唯一的装配入口）
+# ----------------------------------------------------------------------------------
+#
+# 名单本身在 `app/prompts/assistant_chat.py`（哪里放“场景能力”的定义，就要能同时约束
+# 提示词与绑定，否则两边一定会漂移）。这里只负责把名单换成真工具对象。
+#
+# 为什么所有工具都注册进 ToolNode、但只 bind 该场景的子集：
+#   · 图只有一个 `tools` 节点，它必须认识所有工具；
+#   · 模型只能调用"bind 给它的"工具（schema 也才不被多余工具占掉 token）。
+# 代价（已知且接受）：理论上模型可以"猜"一个本场景未绑定的工具名而仍被执行——
+# 但这些工具全部只读且鉴权在同一层，不构成越权；真正需要严格能力面的写工具
+# 不应该走这条路径（且当前根本没有写工具）。
+
+
+def tools_for_scene(scene: int) -> list[StructuredTool]:
+    """该场景应绑定的工具列表（顺序与名单一致）。
+
+    名单里出现了但没实现的名字 → 直接报错（而不是静默少一个工具）：
+    静默少工具会让提示词声称能力、实际却没有——那正是我们踩过两次的 bug。
+    """
+    registry = {tool.name: tool for tool in [*build_assistant_tools(), *build_diagnosis_tools()]}
+    names = tool_names_for_scene(scene)
+    missing = [name for name in names if name not in registry]
+    if missing:
+        raise RuntimeError(
+            f"场景 {scene} 声明的工具未实现：{missing}；"
+            "请先在 app/tools/assistant_tools.py 实现，或从 prompts 的 TOOL_NAMES_BY_SCENE 里删掉"
+        )
+    return [registry[name] for name in names]
+
+
+def all_assistant_tools() -> list[StructuredTool]:
+    """全部已实现的助手工具（供启动自检与 ToolNode 注册）。"""
+    return [*build_assistant_tools(), *build_diagnosis_tools()]
+
+
+__all__ = [
+    "PRIORITY_LABELS",
+    "all_assistant_tools",
+    "build_assistant_tools",
+    "build_diagnosis_tools",
+    "tools_for_scene",
+]

@@ -1284,6 +1284,110 @@ def _case_confidence(
     return "low", "仅同区域匹配（不是同设备也不是同型号），只能作环境参考"
 
 
+# ----------------------------------------------------------------------------------
+# 任务 2-3 的第一块：设备实体消歧（“3 号门那台机器” → inner_code）
+# ----------------------------------------------------------------------------------
+#
+# ## 为什么要单独一个工具，而不是让模型猜
+#
+# 诊断场景里用户几乎不会报设备编号，而是报“3 号门那台”“洛阳那台饮料机”。
+# 若让模型自己“猜一个编号”，它会猜出**看起来很像的假编号**（如 A1000002），
+# 后面的库存/异常查询就会错到别的设备上——而我们无法从答案里看出来。
+# 所以消歧必须是**真查询**：`inner_code` 精确 → 编号前缀 → 地址/点位模糊匹配，
+# 并如实返回多个候选让用户确认。
+
+
+class DeviceMatch(BaseModel):
+    """一条设备匹配结果（带**为什么匹配上**，便于向用户解释与让其确认）。"""
+
+    inner_code: str
+    addr: str | None = None
+    node_name: str | None = None
+    region_name: str | None = None
+    vm_type_name: str | None = None
+    vm_status: int | None = None
+    match_reason: str
+    matched_text: str | None = None
+
+
+MATCH_INNER_CODE_EXACT = "inner_code_exact"
+MATCH_INNER_CODE_PREFIX = "inner_code_prefix"
+MATCH_ADDR = "addr"
+MATCH_NODE_NAME = "node_name"
+_MATCH_RANK = {
+    MATCH_INNER_CODE_EXACT: 0,
+    MATCH_INNER_CODE_PREFIX: 1,
+    MATCH_NODE_NAME: 2,
+    MATCH_ADDR: 3,
+}
+
+
+async def find_devices(session: Any, *, query: str, limit: int = 10) -> list[DeviceMatch]:
+    """按用户口述定位设备（设备编号 / 地址 / 点位名），返回候选 + 匹配原因。
+
+    为什么一定要返回多个候选：模糊地址天然可能命中多台（“洛阳”有好几台），
+    直接取第一条就是“静默选一个”，而选错设备的诊断结论看起来仍然很自信。
+    匹配顺序（即优先级）：编号精确 → 编号前缀 → 点位名 → 地址。
+
+    时间窗口？本工具不需要：设备档案是**当前态**（不是流水），不存在“扫描大表”的问题；
+    但仍受 `read_row_limit` 封顶（白名单 + 行数上限照旧生效）。
+    """
+    text_query = (query or "").strip()
+    if not text_query:
+        raise ToolError("查询关键字不能为空（设备编号 / 地址 / 点位名）")
+    settings = get_settings()
+    like_query = f"%{text_query}%"
+    rows = await _fetch_all(
+        session,
+        """
+        select v.inner_code, v.addr, v.vm_status, n.node_name, r.region_name,
+               ty.name as vm_type_name
+        from tb_vending_machine v
+        left join tb_node n on n.id = v.node_id
+        left join tb_region r on r.id = v.region_id
+        left join tb_vm_type ty on ty.id = v.vm_type_id
+        where v.inner_code = :exact
+           or v.inner_code like :prefix
+           or n.node_name like :like_query
+           or v.addr like :like_query
+        limit :limit
+        """,
+        {
+            "exact": text_query,
+            "prefix": f"{text_query}%",
+            "like_query": like_query,
+            "limit": min(limit, settings.read_row_limit),
+        },
+        tables=("tb_vending_machine", "tb_node", "tb_region", "tb_vm_type"),
+    )
+
+    matches: list[DeviceMatch] = []
+    for row in rows:
+        data = dict(row)
+        if data.get("inner_code") == text_query:
+            reason, matched = MATCH_INNER_CODE_EXACT, str(data.get("inner_code"))
+        elif str(data.get("inner_code") or "").startswith(text_query):
+            reason, matched = MATCH_INNER_CODE_PREFIX, str(data.get("inner_code"))
+        elif text_query in str(data.get("node_name") or ""):
+            reason, matched = MATCH_NODE_NAME, data.get("node_name")
+        else:
+            reason, matched = MATCH_ADDR, data.get("addr")
+        matches.append(
+            DeviceMatch(
+                inner_code=str(data.get("inner_code") or ""),
+                addr=data.get("addr"),
+                node_name=data.get("node_name"),
+                region_name=data.get("region_name"),
+                vm_type_name=data.get("vm_type_name"),
+                vm_status=data.get("vm_status"),
+                match_reason=reason,
+                matched_text=str(matched) if matched else None,
+            )
+        )
+    matches.sort(key=lambda m: _MATCH_RANK.get(m.match_reason, 9))
+    return matches
+
+
 def default_sales_window(*, days: int, today: date | None = None) -> tuple[datetime, datetime]:
     """默认分析窗口：[today-days, today) 的零点，半开区间便于拼接与对账。
 

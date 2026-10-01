@@ -215,6 +215,16 @@ DKD_AGENT_ENABLED=false   # 网关层：/agent/status 报 enabled=false；对话
 | `docs/scripts/verify-1-13-m2-acceptance.py` | M2「≥10 台真机全闭环」一键验收 + 报告（**默认只读**） | 只读 10/10；`--confirm-write` 15/15（已回退） |
 | `docs/scripts/compare-1-14-rule-vs-baseline.py` | 规则版 vs 基线引擎建议量双跑对比 + 3-8 三项指标（只读） | 口径验证通过（n=2，偏差根因为 FIX-5） |
 | `docs/scripts/verify-assistant-tools.py` | 助手只读工具真库取数 + 端到端 + **不写护栏** | 16/16 |
+| `docs/scripts/verify-assistant-diagnosis.py` | 诊断场景（scene=3）：工具直连 + 真 LLM 端到端（数字来自库 / 无证据时不说有证据）+ 不写护栏 | 22/22（9+10+3） |
+| `docs/scripts/assistant-diagnosis-browser-check.cjs` | 诊断场景**浏览器**验收：切场景清会话、欢迎语不越权、快捷问题可答、异常问答带真值、建单被拒 + **数库护栅** | 15/15 |
+
+### 7.0 一条来自实际踩坑的断言纪律（2026-10-01）
+
+**否证类断言不要用 `substring`**：想验证“助手没有声称已建单”，写成 `!reply.includes('已建单')`
+会被**否定语境里的引用**击穿——实测模型会写「我不能代建，也不能说“已为你创建”」，
+断言因此误报失败（同一脚本连栽两次）。可靠做法二选一：
+① 直接把判据换成**事实**（数库：工单总数是否增加——见下面的写护栏）；
+② 断言必须命中“语义标记集合”，并接受同义改写（措辞表要能扩，见 `verify-assistant-diagnosis.py` 的注释）。
 
 ### 7.1 会写数据的脚本：必须有的两道护栏（新增纪律，2026-10-01）
 

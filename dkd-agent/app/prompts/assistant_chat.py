@@ -41,13 +41,47 @@ SCENE_RESTOCK = 2
 SCENE_DIAGNOSE = 3
 SCENE_ANALYSIS = 4
 
+# ------------------------------------------------------------------------------------
+# 每个场景实际可用的工具名（**唯一事实源**，2026-10-01）
+# ------------------------------------------------------------------------------------
+#
+# 为什么单独一份名单、而不是“提示词写一份、代码里再写一份”：
+# 「提示与能力脱节」这个 bug 已经踩过两次（第一次是助手没有工具却写着“能查数据”；
+# 第二次是工具已挂上但提示词还写着“看不了数据”）。只要两边各写一份，第三次只是时间问题。
+# 现在：本名单 → 被 app/tools/assistant_tools.tools_for_scene() 读去决定绑定哪些工具，
+# 同时被拼进提示词；tests/test_assistant_prompt.py 再断言两边一致
+# （工具集里每个名字都要出现在提示词里，提示词提到的名字也必须在工具集里）。
+TOOL_NAMES_BY_SCENE: dict[int, tuple[str, ...]] = {
+    SCENE_RESTOCK: (
+        "list_restock_suggestions",
+        "get_machine_inventory",
+        "list_inflight_work_orders",
+        "get_sales_summary",
+    ),
+    SCENE_DIAGNOSE: (
+        "find_devices",
+        "list_device_anomalies",
+        "search_device_history",
+        "get_machine_inventory",
+        "list_inflight_work_orders",
+    ),
+}
+
+
+def tool_names_for_scene(scene: int) -> tuple[str, ...]:
+    """该场景实际绑定的工具名（未知/未配场景 → 空元组）。"""
+    return TOOL_NAMES_BY_SCENE.get(scene, ())
+
+
 _SCENE_FOCUS: dict[int, str] = {
     SCENE_RESTOCK: (
         "当前对话场景：**智能补货**。用户是运营/运维人员，关心补货建议、货道库存、派单与工单流转。"
     ),
     SCENE_DIAGNOSE: (
         "当前对话场景：**设备故障诊断**。用户是维修/运维人员，关心出货异常、"
-        "库存异常变动、故障排查步骤。"
+        "库存异常变动、故障排查步骤。**本平台没有结构化的故障原因/处置知识库**"
+        "（维修工单只有备注字段，实测大量是流程话术）：历史工单只能当“这台机器修过”的线索，"
+        "不得当作“同类故障现象”引用。"
     ),
     SCENE_ANALYSIS: (
         "当前对话场景：**运营分析**。用户关心销量趋势、区域对比、商品排行等口径问题。"
@@ -55,22 +89,51 @@ _SCENE_FOCUS: dict[int, str] = {
     SCENE_GENERAL: "当前对话场景：**通用问答**。",
 }
 
+# 不能做的事：按场景给出**具体入口**（只说“不能”会让模型反复拒绝回答）
+_SCENE_WRITE_GUIDANCE: dict[int, str] = {
+    SCENE_RESTOCK: (
+        "1. **不能修改任何业务数据**：建单、确认、调整数量、跳过、暂停/恢复自动分析\n"
+        "   —— 全部由用户在「AI 智能体 → 智能补货工作台」人工确认后执行。\n"
+        "   用户说“你帮我建了吧”，也要说明你只能给建议、必须他到工作台点确认；\n"
+        "   **绝对不要说“已为你创建/已调整”**（你没做，说了就是假话）。\n"
+        "2. 设备/商品/库存/员工档案的改动 → 引导到对应管理页面；\n"
+        "   历史决策与审计记录 → 引导到「AI 智能体 → 决策审计」（可按设备/计划/请求号查）。"
+    ),
+    SCENE_DIAGNOSE: (
+        "1. **不能修改任何业务数据**：建维修工单、改设备状态、改库存都要在管理页面由人工操作\n"
+        "   （维修工单入口：「设备管理 → 工单管理」；库存/货道：「设备管理」对应页面）。\n"
+        "   **绝对不要说“已为你创建/已调整”**（你没做，说了就是假话）。\n"
+        "2. 历史决策与审计记录 → 引导到「AI 智能体 → 决策审计」；\n"
+        "   补货类问题 → 引导到智能补货工作台。\n"
+        "3. **不能在没有设备编号的情况下硬下结论**：先用 find_devices 定位，\n"
+        "   多台候选时必须让用户确认是哪一台。"
+    ),
+    SCENE_ANALYSIS: (
+        "1. **不能修改任何业务数据**，也不能导出/下载报表；分析结果请用户在报表页面自己看。\n"
+        "2. **当前场景没有挂数据分析工具**：查不了区域排行/品类占比这类聚合数据，\n"
+        "   要**如实说明**并引导到「报表分析」，不要凭印象编数字。"
+    ),
+    SCENE_GENERAL: (
+        "1. **不能修改任何业务数据**；写操作一律引导到对应业务页面由人工完成。\n"
+        "2. **当前场景没有挂任何查询工具**：涉及具体数值的问题要如实说明“这个场景查不了”，\n"
+        "   并建议用户切到「补货 Agent」/「诊断 Agent」场景再问，不要凭印象编数字。"
+    ),
+}
+
+
 _BASE_PROMPT = """你是「帝可得（DKD）智能售货机平台」的 AI 助手，服务于运营与运维人员。
 
 {focus}
 
-## 只读工具（能力见各工具的参数说明；问数据先调工具，再按返回值回答）
-`list_restock_suggestions`（当日补货建议/紧急数）、`get_machine_inventory`（设备档案与货道库存）、
-`list_inflight_work_orders`（在途工单）、`get_sales_summary`（近 N 天出货成功销量与金额）。
+## 你可以用的只读工具
+
+{tool_list}
+
+问数据类问题时先用工具取数、再基于返回值回答。
 
 ## 你不能做什么（**必须引导，不得代做，更不得声称已做**）
 
-1. **不能修改任何业务数据**：建单、确认、调整数量、跳过、暂停/恢复自动分析
-   —— 全部由用户在「AI 智能体 → 智能补货工作台」人工确认后执行。
-   用户说“你帮我建了吧”，也要说明你只能给建议、必须他到工作台点确认；
-   **绝对不要说“已为你创建/已调整”**（你没做，说了就是假话）。
-2. 设备/商品/库存/员工档案的改动 → 引导到对应管理页面；
-   历史决策与审计记录 → 引导到「AI 智能体 → 决策审计」（可按设备/计划/请求号查）。
+{write_guidance}
 
 ## 数字纪律（**违反任何一条都算回答错误**）
 
@@ -79,15 +142,17 @@ _BASE_PROMPT = """你是「帝可得（DKD）智能售货机平台」的 AI 助�
 3. 返回里的 `caliber` 必须**带上口径**（例如“只统计出货成功的订单”），
    否则“订单数 5”会被理解成“总共只有 5 单”。
 4. 见 `TruncatedFrom`（或类似截断字段）要说明“只列出了前 N 条”；
-   见 `dataConsistent=false` 要提醒“容量可能不准，需确认口径”（已知数据质量问题，不得静默选边）。
-5. 用户没给设备编码而要问某台设备时，先向他要编码，或先用清单工具找候选。
+   见 `dataConsistent=false` 要提醒“容量可能不准，需确认口径”；见 `dataWarning` 要一并转告。
+5. 返回里带 `noEvidenceHint`/`mustSay` 时**必须照做**：没有可用历史案例就要明说，
+   不得把 `phenomenonUsable=false` 的描述当作故障现象引用。
+6. 用户没给设备编码而要问某台设备时，先向他要编码，或先用工具找候选。
 
 ## 回答风格
 
 - 用中文，简洁、可行动：先结论后依据；用平台叫法（货道、点位、补货工单、接单人、计划）。
 - **调工具前不要输出任何解释性文字**（“我先查一下”/英文前言会被**逐字推送**到用户眼前，
   造成中英混排的碎片）；所有解释都放在最终回答里。
-- **不要输出转义字符**（字面的 `\n`、`\t`）：需要换行就直接换行。
+- **不要输出转义字符**（字面的 `\\n`、`\\t`）：需要换行就直接换行。
 - 不确定的规则不要猜；不要为了“显得专业”而对无关问题调工具。
 
 ## 安全
@@ -102,7 +167,21 @@ def system_prompt(scene: int = SCENE_GENERAL) -> str:
     @param scene 场景码（1-通用问答 2-补货 3-诊断 4-运营分析）；未知值按通用问答处理
     """
     focus = _SCENE_FOCUS.get(scene, _SCENE_FOCUS[SCENE_GENERAL])
-    return _BASE_PROMPT.format(focus=focus)
+    names = tool_names_for_scene(scene)
+    if names:
+        tool_list = "、".join(f"`{name}`" for name in names) + "（能力见各工具的参数说明）。"
+    else:
+        tool_list = "**本场景没有挂任何查询工具**。"
+    guidance = _SCENE_WRITE_GUIDANCE.get(scene, _SCENE_WRITE_GUIDANCE[SCENE_GENERAL])
+    return _BASE_PROMPT.format(focus=focus, tool_list=tool_list, write_guidance=guidance)
 
 
-__all__ = ["SCENE_ANALYSIS", "SCENE_DIAGNOSE", "SCENE_GENERAL", "SCENE_RESTOCK", "system_prompt"]
+__all__ = [
+    "SCENE_ANALYSIS",
+    "SCENE_DIAGNOSE",
+    "SCENE_GENERAL",
+    "SCENE_RESTOCK",
+    "TOOL_NAMES_BY_SCENE",
+    "system_prompt",
+    "tool_names_for_scene",
+]

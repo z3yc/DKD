@@ -108,17 +108,47 @@ Python 侧日志与 `agent_decision_log.request_id` 都带它。**排障时先�
 
 ---
 
-## 二·补、助手的能力边界与只读工具（2026-10-01 新增）
+## 二·补、助手的能力边界与只读工具（2026-10-01 新增；同日升级为**按场景**挂载）
 
 `/agent/chat` 在 `DKD_AGENT_USE_LLM=1` 时会挂**只读工具**，助手因此能真取数再回答。
 **写操作一律不在对话里**（AGENTS §7.9：首期所有写操作必须 human-in-the-loop）。
 
+### 场景 → 工具矩阵（**场景决定能力面**）
+
+| 场景（`scene`） | 可用工具 | 说明 |
+| --- | --- | --- |
+| 1 通用问答 | **无** | 提示词如实说明“本场景查不了”，让用户切到 2/3 场景；不许凭印象编数 |
+| 2 补货 Agent | `list_restock_suggestions` / `get_machine_inventory` / `list_inflight_work_orders` / `get_sales_summary` | 补货数据类问题 |
+| 3 诊断 Agent | `find_devices` / `list_device_anomalies` / `search_device_history` + `get_machine_inventory` / `list_inflight_work_orders` | 设备消歧 + 异常检测 + 历史维修单（见下） |
+| 4 分析 Copilot | **无** | 未接数据分析工具；只能解释口径/指出该去哪个页面看 |
+
+> 为什么按场景挂、而不是一次给全部：多挂一个工具就多一份 schema（每轮都进 prompt），
+> 还会把模型注意力引到无关问题上。**绑定名单与提示词名单来自同一处配置**
+> （`app/prompts/assistant_chat.TOOL_NAMES_BY_SCENE`），并有单测断言两边一致——
+> “提示与能力脱节”这个 bug 本项目已经踩过两次。
+
+#### 场景 2（补货）
+
 | 工具 | 能回答什么 | 返回要点 |
 | --- | --- | --- |
-| `list_restock_suggestions` | 某日（默认今天）补货建议：待处理/紧急条数、各设备货道建议与理由、接单人、自动分析是否暂停 | 带 `caliber`（紧急=priority 4，只含未完成计划）；无计划时给 `hint`（暂停 or 定时任务未跑） |
+| `list_restock_suggestions` | 某日（默认今天）补货建议：待处理/紧急条数、各设备货道建议与理由、接单人、自动分析是否暂停 | 带 `caliber`（紧急=priority 4，只含未完成计划）；**默认只回未完成计划**，明细只给含紧急货道的计划（`detail=true` 才全给）；无计划时给 `hint`（暂停 or 定时任务未跑） |
 | `get_machine_inventory` | 设备档案（点位/区域/运行状态）+ 各货道当前库存与容量 | 带 `dataConsistent`：库存表与货道档案不一致时如实标记（FIX-5），不静默选边 |
 | `list_inflight_work_orders` | 在途工单（1-待接单 / 2-进行中） | 带口径说明：在途工单会让新建单被 Java 防重拒绝 |
 | `get_sales_summary` | 近 N 天（默认 7，上限 30）出货成功销量与金额，按货道汇总 | 带 `caliber`：只统计 `status=2`；不可归因货道的订单不计入 byChannel |
+
+#### 场景 3（诊断）
+
+| 工具 | 能回答什么 | 返回要点 / 诚实标记 |
+| --- | --- | --- |
+| `find_devices` | 按**口述线索**定位设备：编号精确 → 编号前缀 → 点位名 → 地址（如“五道口”） | 带 `matchReason`；多台命中时给 `hint` 要求用户确认；**一条都没有时明确禁止模型自己编号** |
+| `list_device_anomalies` | 某设备近 N 天（默认 90，上限 3650）的异常：卡单（`status=1` 超阈值）、出货失败未退款（`status=3` 且 `pay_status∈{1,2}`）、库存无单扣减/账实不符 | 带 `byKind` 分组计数、`caliber`、`dataWarning`（`tb_inventory_log` 为空时“0 条 ≠ 没问题”）；窗口被夹取时给 `windowClampedFromDays` |
+| `search_device_history` | 历史维修工单检索（**规则库**，不是语义检索）：`same_device → same_model → same_region` 三级降级 | 每条带 `phenomenonUsable`（描述能不能当故障现象）与 `confidence`+`confidenceBasis`；无可用案例时给 `noEvidenceHint` + `mustSay`（提示词要求必须照做） |
+
+> ⚠️ 诊断场景的**诚实契约比能力本身重要**：本平台维修工单只有备注字段（FIX-22），
+> 实测 5 条维修单的描述是 `111`×4 + `后台工作人员取消`×1——**没有一条是故障现象**。
+> 因此 `phenomenonUsable=false` 的描述只能当“这台机器修过”的线索，**不得当故障现象引用**；
+> 助手必须主动说出“没有可用的历史案例”。实测回复样例：
+> 「…查到 2 条历史维修工单，但**没有一条能当故障现象用**，所以答案是：**没有可参考的历史案例**。」
 
 **行为契约（有测试锁定）**
 
@@ -129,7 +159,12 @@ Python 侧日志与 `agent_decision_log.request_id` 都带它。**排障时先�
 - **模型不支持 function calling**：服务**启动即拒绝**（不是每条消息 502）。
 - **模式可见**：`meta.mode=echo` 表示服务跑在链路自检模式（不调模型），前端会显示提示条；
   `mode=llm` 时前端显示服务端实际返回的模型名（实测配置 `deepseek-chat` 会路由到 `deepseek-flash`）。
-- **成本**：带工具的一轮 ≈ 3.5k input token（system + 工具 schema + 工具返回值），约为普通对话的 10 倍。
+- **成本**：带工具的一轮 ≈ **3.5k input token**（system + 工具 schema + 工具返回值）。
+  2026-10-01 已做一轮优化（只回未完成计划 / 按需给货道明细 / reason 截断 / 提示词瘦身），
+  **实测同一句「先看紧急的」input token 3934 → 3470（-11.8%）**；按场景挂工具后，
+  单场景只承担自己那份 schema。
+- **诊断场景的独立性**：`scene=3` 的工具集与 `scene=2` **不共享**（除库存/在途两个通用件），
+  所以“补货场景问诊断问题”不会悄悄去查故障案例——那份 schema 根本没给它。
 
 ## 三、状态码语义（前端必须按这个提示，不能一律说“操作失败”）
 

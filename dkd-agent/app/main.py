@@ -25,8 +25,9 @@ from app.db import dispose_engine
 from app.graphs.chat_graph import build_chat_graph
 from app.llm import build_chat_model
 from app.logging_conf import RequestContextMiddleware, setup_logging
+from app.prompts.assistant_chat import SCENE_DIAGNOSE, SCENE_RESTOCK
 from app.services.restock_analyzer import build_default_analyzer
-from app.tools.assistant_tools import build_assistant_tools
+from app.tools.assistant_tools import all_assistant_tools, tools_for_scene
 
 logger = logging.getLogger("dkd.agent")
 
@@ -51,7 +52,9 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     # 而运维要在一堆正常启动日志里找到“模型不支持工具”这条线索。
     # 探测不发网络请求（bind_tools 只做本地包装），代价可忽略。
     if s.use_llm:
-        probe_tools = build_assistant_tools()
+        # 探测**全部**可能被绑定的工具（不只补货那份）：任何一个工具的 schema 不被支持都要启动即拒，
+        # 否则就会变成“诊断场景第一条消息才 502”，而那是个更难定位的失败。
+        probe_tools = all_assistant_tools()
         try:
             build_chat_model().bind_tools(probe_tools)
         except NotImplementedError as exc:
@@ -63,14 +66,20 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
 
     store = await open_checkpoint_store(s)
     app.state.checkpoint_store = store
-    # 给 LLM 分支挂上**只读工具**（2026-10-01 补齐智能功能）：
-    # 助手因此能真取数（补货清单/设备库存/在途工单/近期销量）并基于真实数据作答，
-    # 而不再是“我看不了数据”。写操作**不在这里**：建单/确认/调整一律走补货工作台的人工确认
-    # （AGENTS §7.9）。工具集里没有任何写工具，且有测试断言这一点。
+    # 给 LLM 分支挂上**只读工具**（2026-10-01 补齐智能功能；同日升级为**按场景**挂）：
+    #   场景 2（补货）= 补货清单/设备库存/在途工单/近期销量；
+    #   场景 3（诊断）= 设备消歧/异常检测/历史维修单 + 库存/在途；
+    #   场景 1/4 = 不挂工具（提示词也如实说“本场景查不了”，不许凭印象编数）。
+    # 写操作**不在这里**：建单/确认/调整一律走页面人工确认（AGENTS §7.9），
+    # 工具集里没有任何写工具，且有测试断言这一点。
     app.state.chat_graph = build_chat_graph(
         checkpointer=store.saver,
         use_llm=s.use_llm,
-        tools=build_assistant_tools() if s.use_llm else None,
+        tools_by_scene=(
+            {scene: tools_for_scene(scene) for scene in (SCENE_RESTOCK, SCENE_DIAGNOSE)}
+            if s.use_llm
+            else None
+        ),
     )
     # 补货工作台服务（1-7）：真实 store + 真实只读依赖；测试可用 app.state.restock_service 整体替换
     app.state.restock_service = restock.build_default_service()
