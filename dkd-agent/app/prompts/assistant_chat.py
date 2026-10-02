@@ -176,12 +176,26 @@ _FOCUS_LINE = (
     "但用户提到**另一个**编号或另一个点位时，以他说的为准，不要硬套这个。"
 )
 
+# 本轮窗口（FIX-28）：由 `app/services/time_hint.py` 从**用户原话**解析，并按同一事实源覆盖
+# 工具参数。为什么要在提示词里也写一遍：模型不写的话，它会在回答里给出**另一个**窗口
+# （把 90 天的结果说成 5 年，实测发生过）。工具那一侧已经有硬规则兜底，
+# 提示词这一侧是为了让**措辞**与**实际查询**一致。
+_WINDOW_LINE = (
+    "\n\n## 本轮用户提到的时间范围\n\n"
+    "用户原话里的时间范围已被解析为 **{days} 天**，本轮所有带 `days` 参数的工具都会以它为准。\n"
+    "回答时请直接用「近 {days} 天」这个口径说明查询范围，"
+    "**不要**改写成别的天数，也不要自己推算起止日期（工具会返回真实起止日期）。"
+)
 
-def system_prompt(scene: int = SCENE_GENERAL, *, focus_inner_code: str = "") -> str:
+
+def system_prompt(
+    scene: int = SCENE_GENERAL, *, focus_inner_code: str = "", window_days: int | None = None
+) -> str:
     """按场景生成 system 提示词。
 
     @param scene 场景码（1-通用问答 2-补货 3-诊断 4-运营分析）；未知值按通用问答处理
     @param focus_inner_code 本次会话正在诊断的设备（空 = 未确定）；多轮追问靠它落到同一台设备
+    @param window_days 本轮用户原话里的时间窗口（`time_hint.parse_window_days` 的结果，None = 没提）
     """
     focus_code = (focus_inner_code or "").strip()
     focus = _SCENE_FOCUS.get(scene, _SCENE_FOCUS[SCENE_GENERAL])
@@ -194,6 +208,8 @@ def system_prompt(scene: int = SCENE_GENERAL, *, focus_inner_code: str = "") -> 
     prompt = _BASE_PROMPT.format(focus=focus, tool_list=tool_list, write_guidance=guidance)
     if focus_code:
         prompt += _FOCUS_LINE.format(code=focus_code)
+    if window_days:
+        prompt += _WINDOW_LINE.format(days=int(window_days))
     return prompt
 
 

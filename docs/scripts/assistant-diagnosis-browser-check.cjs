@@ -16,6 +16,8 @@
  *   5) 要“诊断结论”→ 渲染结构化结论卡片（置信度条 / 未知项 / 动作，2-4 的前端契约）；
  *   6) 让助手建维修工单 → 拒绝 + 引导到人工入口（控制台无错误），并**数库**确认工单总数未增加
  *      （文本匹配区分不了“拒绝时的引用”与“真的声称”，所以判据是库不是话术）。
+ *   7) 多轮问诊的前端半场（2-3）：「当前诊断设备」提示条必须显示真实编号；
+ *      「本次查询口径」必须显示**工具实际生效**的窗口与来源工具名（FIX-27/28 的用户可见面）。
  *
  * 用法：
  *   PW_CORE=<tmp>/node_modules/playwright-core node docs/scripts/assistant-diagnosis-browser-check.cjs
@@ -117,6 +119,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   ok(reply.length > 0, '异常问答有回复')
   ok(/异常|卡单|出货失败/.test(reply), '回复在讲异常')
   ok(/\d/.test(reply), '回复带具体数字（不是“请稍后”）')
+
+  // ---- 4b) 焦点提示条 + 口径帧（2-3 前端半场 / FIX-27）----
+  // 为什么要在 DOM 层验这两条：后端字段已经在了（API 层验过），但**用户看不见**就没价值。
+  // 焦点条尤其重要：用户不知道自己说“它”会不会指错，就不敢放心追问。
+  const focusBar = page.locator('.focus-bar')
+  const focusVisible = await focusBar.isVisible().catch(() => false)
+  const focusText = focusVisible ? ((await focusBar.textContent()) || '').replace(/\s+/g, ' ') : ''
+  ok(focusVisible, '显示「当前诊断设备」提示条（数据源：done 帧 focusInnerCode）')
+  ok(
+    focusText.includes(DEVICE),
+    `提示条里是真实设备编号：${focusText.slice(0, 60)}`
+  )
+  const caliber = page.locator('.msg.assistant .caliber').last()
+  const caliberVisible = await caliber.isVisible().catch(() => false)
+  const caliberText = caliberVisible ? ((await caliber.textContent()) || '').replace(/\s+/g, ' ') : ''
+  ok(caliberVisible, '显示「本次查询口径」（窗口来自工具，不是模型转述）')
+  ok(
+    /1825\s*天/.test(caliberText),
+    `口径帧里的窗口是工具实际生效的值：${caliberText.slice(0, 90)}`
+  )
+  ok(
+    /list_device_anomalies|build_device_diagnosis/.test(caliberText),
+    '口径帧写明了来源工具名（审计/复核要看这一条）'
+  )
 
   // ---- 5) 结构化结论卡片（2-4：置信度条 + 未知项 + 动作）----
   // 窗口必须写进问题里：工具默认 90 天，本机历史数据在 2023 年 → 短窗口会得到“无异常证据”，

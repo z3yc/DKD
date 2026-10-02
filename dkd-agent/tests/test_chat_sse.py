@@ -38,6 +38,22 @@ def test_chat_streams_echo_with_meta_first(client: TestClient):
     assert events[0][1]["mode"] == "echo"
     assert events[-1][0] == "done"
     assert "".join(d["text"] for e, d in events if e == "delta") == "[echo] hello"
+    # 口径/保真/焦点三个字段必须**恒在**（前端不必写“字段可能不存在”的分支）：
+    # 没调工具时是空口径 + grounded，而不是缺字段。
+    done = events[-1][1]
+    assert done["dataCaliber"] == []
+    assert done["grounding"] == {"grounded": True, "ungroundedNumbers": [], "checked": 0}
+    assert done["focusInnerCode"] == ""
+
+
+def test_done_frame_carries_focus_for_the_frontend(client: TestClient):
+    """焦点的帧级管道（2-3）：用户原话里有合法编号 → done 帧带回焦点，前端据此显示“当前设备”。"""
+    resp = client.post(
+        "/agent/chat",
+        json={"message": "看看 A1000001 的库存", "conversation_id": "c-focus", "scene": 3},
+    )
+    done = next(d for e, d in _frames(resp.text) if e == "done")
+    assert done["focusInnerCode"] == "A1000001"
 
 
 def test_chat_generates_conversation_id_when_missing(client: TestClient):

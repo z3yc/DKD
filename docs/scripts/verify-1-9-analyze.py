@@ -341,4 +341,12 @@ if __name__ == "__main__":
     _calibration = args.calibration
     if _calibration:
         os.environ["DKD_AGENT_RESTOCK_CALIBRATION_ENABLED"] = "1"
+    # ⚠️ 必须在 `asyncio.run()` **之前**调用：本脚本会在进程内 `create_app()`，
+    # 而 PG 后端的 checkpointer 在 Windows 上要求 SelectorEventLoop（psycopg 异步的硬约束）。
+    # 不调这一步时的报错是 psycopg 内部的 Proactor 提示，与真因（事件循环策略）相距很远——
+    # 与 `app/__main__.py` 是同一个坑（排期 FIX-20）；运行服务用 `python -m app` 就自带这一步。
+    from app.checkpoint import ensure_windows_event_loop_policy
+    from app.config import get_settings
+
+    ensure_windows_event_loop_policy(get_settings())
     sys.exit(asyncio.run(run()))

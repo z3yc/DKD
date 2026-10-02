@@ -765,3 +765,276 @@ def test_tool_calls_are_recorded_for_audit():
     )
     assert len(str(_extract_tool_calls([huge])[0]["args"])) <= 401
     assert _extract_tool_calls([]) == []
+
+
+# ------------------------------------------------------------------------------------
+# 本轮边界：结构化帧只覆盖本轮（2026-10-01 修的两个静默错误）
+# ------------------------------------------------------------------------------------
+
+
+async def test_structured_frames_do_not_leak_across_turns(monkeypatch, tmp_path):
+    """第二轮**没调工具**时，不得再带第一轮的结论/工具调用。
+
+    为什么必须锁住（两个都是静默错误，不写断言就永远发现不了）：
+      1. **验收假绿**：多轮追问的断言是“第 3 轮带着焦点设备去查了异常”，
+         而 `final_state["messages"]` 是**整个会话**——第 2 轮的工具调用会被算进第 3 轮，
+         于是“第 3 轮根本没查”也能通过；
+      2. **前端陈旧卡片**：第一轮画出的结论卡会跟着后面每一轮（哪怕只说了句“谢谢”）再来一次。
+    """
+    from app.api.chat import (
+        _current_turn_messages,
+        _extract_calibers,
+        _extract_conclusion,
+        _extract_tool_calls,
+    )
+
+    payload = {
+        "innerCode": "A1000001",
+        "confidence": "high",
+        "unknowns": [],
+        "recommendedActions": [],
+        "evidence": [],
+        "window": {"days": 1825, "start": "2021-10-02"},
+        "confidenceBasis": "存在 2 条订单异常",
+    }
+    fake = _ToolCallingFake(
+        messages=iter(
+            [
+                _tool_call("build_device_diagnosis", {"inner_code": "A1000001"}),
+                AIMessage(content="结论如上。"),
+                AIMessage(content="不客气，还有其他设备要看吗？"),
+            ]
+        )
+    )
+    monkeypatch.setattr(chat_graph, "build_chat_model", lambda *a, **kw: fake)
+
+    store = SqliteCheckpointStore(tmp_path / "cp-turn-scope.db")
+    saver = await store.open()
+    try:
+        graph = build_chat_graph(
+            checkpointer=saver,
+            use_llm=True,
+            tools=[
+                _stub_tool(
+                    name="build_device_diagnosis",
+                    result=json.dumps(payload, ensure_ascii=False),
+                )
+            ],
+        )
+        config = {"configurable": {"thread_id": "t-turn-scope"}}
+        await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "给个结论"}], "scene": SCENE_DIAGNOSE},
+            config=config,
+        )
+        turn1 = _current_turn_messages((await graph.aget_state(config)).values.get("messages"))
+        assert _extract_conclusion(turn1) is not None, "第一轮确实调了诊断工具"
+        assert _extract_tool_calls(turn1), "第一轮的工具调用要进留痕"
+
+        await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "谢谢"}], "scene": SCENE_DIAGNOSE},
+            config=config,
+        )
+        turn2 = _current_turn_messages((await graph.aget_state(config)).values.get("messages"))
+        assert _extract_conclusion(turn2) is None, "没调工具的那一轮不得再带上一轮的结论卡"
+        assert _extract_tool_calls(turn2) == [], "上一轮的工具调用不得算进这一轮"
+        assert _extract_calibers(turn2) == [], "上一轮的口径帧不得算进这一轮"
+    finally:
+        await store.close()
+
+
+def test_current_turn_messages_slices_after_last_human_message():
+    """切片规则：最后一次 HumanMessage **之后**的部分（含工具消息与最终回复）。"""
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    from app.api.chat import _current_turn_messages
+
+    history = [
+        HumanMessage(content="第一轮"),
+        AIMessage(content="回答一"),
+        HumanMessage(content="第二轮"),
+        ToolMessage(content="{}", name="x", tool_call_id="c1"),
+        AIMessage(content="回答二"),
+    ]
+    assert [m.content for m in _current_turn_messages(history)] == ["{}", "回答二"]
+    # 没有 HumanMessage（异常/空历史）时不越界，原样返回
+    assert _current_turn_messages([AIMessage(content="a")]) == [AIMessage(content="a")]
+    assert _current_turn_messages([]) == []
+
+
+# ------------------------------------------------------------------------------------
+# FIX-28：窗口跟随（用户原话 > 模型请求），且两个值都留痕
+# ------------------------------------------------------------------------------------
+
+
+async def test_window_hint_reaches_tool_through_graph(monkeypatch, tmp_path):
+    """ContextVar 必须能穿过 LangGraph 到达工具本体。
+
+    这条测的是**集成面**而不是规则本身：规则写得再对，如果值传不到工具里，
+    FIX-28 依旧发生（而现象只是“窗口还是 90 天”，没有报错）。
+    """
+    from app.services import time_hint
+
+    seen: list[int | None] = []
+
+    async def _run(inner_code: str = "") -> str:
+        days = time_hint.current_window_hint_days()
+        seen.append(days)
+        return json.dumps({"window": {"days": days or 90}, "orderAnomalyCount": 0})
+
+    tool = StructuredTool.from_function(
+        coroutine=_run,
+        name="list_device_anomalies",
+        description="桩工具",
+        args_schema=_Args,
+    )
+    fake = _ToolCallingFake(
+        messages=iter(
+            [
+                _tool_call("list_device_anomalies", {"inner_code": "A1000001"}),
+                AIMessage(content="查完了。"),
+            ]
+        )
+    )
+    monkeypatch.setattr(chat_graph, "build_chat_model", lambda *a, **kw: fake)
+    store = SqliteCheckpointStore(tmp_path / "cp-window.db")
+    saver = await store.open()
+    token = time_hint.set_window_hint_days(time_hint.parse_window_days("那它近五年有哪些异常？"))
+    try:
+        graph = build_chat_graph(checkpointer=saver, use_llm=True, tools=[tool])
+        await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "那它近五年有哪些异常？"}], "scene": 3},
+            config={"configurable": {"thread_id": "t-window"}},
+        )
+    finally:
+        time_hint.reset_window_hint_days(token)
+        await store.close()
+    assert seen == [1825], "工具没拿到用户说的窗口（规则就不会生效）"
+
+
+async def test_anomaly_tool_prefers_user_window_and_records_both(monkeypatch):
+    """工具层的硬规则：用户说“近五年” → 真按 1825 天查，且写清“覆盖了模型的 90”。"""
+    import app.tools.assistant_tools as assistant_tools
+    from app.services import time_hint
+
+    captured: dict[str, int] = {}
+
+    async def _fake_orders(session, *, inner_codes, start, end):  # noqa: ANN001, ANN202
+        captured["days"] = (end - start).days
+        return []
+
+    async def _fake_inventory(session, *, inner_codes, start, end):  # noqa: ANN001, ANN202
+        return []
+
+    class _Session:
+        async def __aenter__(self):  # noqa: ANN204
+            return self
+
+        async def __aexit__(self, *exc: object) -> bool:  # noqa: ANN401
+            return False
+
+    monkeypatch.setattr(assistant_tools.read_tools, "list_order_anomalies", _fake_orders)
+    monkeypatch.setattr(assistant_tools.read_tools, "list_inventory_anomalies", _fake_inventory)
+    monkeypatch.setattr(assistant_tools, "get_sessionmaker", lambda: _Session)
+
+    # 1) 用户没提时间 → 模型请求的窗口生效（不改变既有行为）
+    plain = json.loads(await assistant_tools._list_device_anomalies("A1000001", days=90))
+    assert plain["window"]["days"] == 90
+    assert plain["windowSource"] == "model"
+    assert "windowOverriddenFromDays" not in plain
+
+    # 2) 用户说了“近五年” → 覆盖模型请求的 90，并把模型值一起记下来
+    token = time_hint.set_window_hint_days(time_hint.parse_window_days("那它近五年有哪些异常？"))
+    try:
+        overridden = json.loads(await assistant_tools._list_device_anomalies("A1000001", days=90))
+    finally:
+        time_hint.reset_window_hint_days(token)
+    assert overridden["window"]["days"] == 1825
+    assert overridden["windowSource"] == "userTimeHint"
+    assert overridden["windowOverriddenFromDays"] == 90
+    assert captured["days"] == 1825, "真正的查询窗口必须是 1825 天（不是只改了返回值）"
+
+
+def test_prompt_carries_window_only_when_parsed():
+    """提示词也要写同一口径（工具已经硬兜底，这里是为了让**措辞**与实际查询一致）。"""
+    assert "本轮用户提到的时间范围" not in system_prompt(SCENE_DIAGNOSE)
+    with_window = system_prompt(SCENE_DIAGNOSE, window_days=1825)
+    assert "1825 天" in with_window
+    assert "不要" in with_window
+
+
+# ------------------------------------------------------------------------------------
+# FIX-29：工具轮次上限是**每一句问话**的预算，不是整个会话的配额
+# ------------------------------------------------------------------------------------
+
+
+async def test_tools_still_work_on_later_turns(monkeypatch, tmp_path):
+    """第 2 句问话必须**仍然有工具可用**（实测缺陷：第三句起助手静默失去查询能力）。
+
+    为什么这个缺陷极难发现：上限按会话累计时，第三轮开始时历史里已经有 ≥3 条 ToolMessage
+    → `bind_tools` 被跳过 → 模型只能“凭印象作答”，而**没有任何报错**。
+    实测的表现是第三轮回复只剩 `A1000001 1825` 这种碎片（模型在无工具情况下想执行工具调用）。
+    """
+    calls: list[str] = []
+
+    async def _run(inner_code: str = "") -> str:
+        calls.append(inner_code)
+        return json.dumps({"innerCode": inner_code or "A1000001", "window": {"days": 90}})
+
+    tool = StructuredTool.from_function(
+        coroutine=_run,
+        name="list_device_anomalies",
+        description="桩工具",
+        args_schema=_Args,
+    )
+    # 两轮，每轮都是「要工具 → 作答」：第 1 轮的 3 条 ToolMessage 不得吃掉第 2 轮的预算
+    fake = _ToolCallingFake(
+        messages=iter(
+            [
+                _tool_call("list_device_anomalies", {"inner_code": "A1000001"}, "c-1"),
+                _tool_call("list_device_anomalies", {"inner_code": "A1000002"}, "c-2"),
+                AIMessage(content="第一轮答完。"),
+                _tool_call("list_device_anomalies", {"inner_code": "A1000003"}, "c-3"),
+                AIMessage(content="第二轮答完。"),
+            ]
+        )
+    )
+    monkeypatch.setattr(chat_graph, "build_chat_model", lambda *a, **kw: fake)
+    store = SqliteCheckpointStore(tmp_path / "cp-rounds-per-turn.db")
+    saver = await store.open()
+    try:
+        graph = build_chat_graph(checkpointer=saver, use_llm=True, tools=[tool])
+        config = {"configurable": {"thread_id": "t-rounds"}}
+        await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "第一句"}], "scene": 3}, config=config
+        )
+        await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "第二句"}], "scene": 3}, config=config
+        )
+    finally:
+        await store.close()
+    assert calls == ["A1000001", "A1000002", "A1000003"], (
+        f"第 2 轮必须还能调工具（实际只跑了 {calls}）"
+    )
+
+
+def test_tool_rounds_are_counted_per_turn():
+    """计数口径：同一轮内累计，换一轮归零。"""
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    from app.graphs.chat_graph import _tool_rounds_used
+
+    def _tool_msg(call_id: str) -> ToolMessage:
+        return ToolMessage(content="{}", name="x", tool_call_id=call_id)
+
+    state = {
+        "messages": [
+            HumanMessage(content="第一句"),
+            _tool_msg("a"),
+            _tool_msg("b"),
+            AIMessage(content="答一"),
+            HumanMessage(content="第二句"),
+        ]
+    }
+    assert _tool_rounds_used(state) == 0, "新一轮开始时应归零（否则上限成了跨轮配额）"
+    state["messages"].append(_tool_msg("c"))
+    assert _tool_rounds_used(state) == 1

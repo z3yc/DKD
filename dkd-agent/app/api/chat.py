@@ -19,11 +19,11 @@ import logging
 import re
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -39,6 +39,7 @@ from app.db import get_sessionmaker
 from app.llm import LlmError
 from app.logging_conf import current_request_id
 from app.security import HEADER_REQUEST_ID, parse_user_context
+from app.services import grounding, time_hint
 
 router = APIRouter(prefix="/agent", tags=["chat"])
 logger = logging.getLogger("dkd.agent.chat")
@@ -168,10 +169,50 @@ def _chunks(text: str) -> list[str]:
     return [text[i : i + _CHUNK] for i in range(0, len(text), _CHUNK)] or [""]
 
 
-async def _load_turn_from_checkpoint(
-    graph: object, config: dict
-) -> tuple[str, int, str | None, dict | None]:
-    """断线重连：从 checkpoint 读回上一轮回复、历史长度与实际模型（不重跑图，避免重复追加上下文）。
+def _last_human_text(messages: object) -> str:
+    """本轮用户的原话（取证与“用户自己给的数字”都要用它）。"""
+    for msg in reversed(list(messages or [])):  # type: ignore[arg-type]
+        if isinstance(msg, HumanMessage):
+            return str(msg.content)
+    return ""
+
+
+def _current_turn_messages(messages: object) -> list[Any]:
+    """只取**本轮**的消息（最后一次 HumanMessage 之后的部分）。
+
+    为什么必须限定本轮（2026-10-01 修）：`final_state["messages"]` 是**整个会话**
+    （checkpointer 恢复历史 + add_messages 累加），而留痕的语义是“**这一轮**回答了哪个问题、
+    基于哪几次查询”。不限定就会出现两个静默错误：
+
+      1. **验收假绿**：多轮追问的断言是“第 3 轮带着焦点设备去查了异常”，
+         而第 2 轮的那次 `find_devices`/`list_device_anomalies` 会被算进第 3 轮——
+         即使第 3 轮根本没查，断言也会通过；
+      2. **前端显示陈旧卡片**：某一轮调过 `build_device_diagnosis` 后，
+         后续每一轮（哪怕只说了句“谢谢”）的 done 帧都会**再带一次**那张结论卡。
+    """
+    items = list(messages or [])  # type: ignore[arg-type]
+    for index in range(len(items) - 1, -1, -1):
+        if isinstance(items[index], HumanMessage):
+            return items[index + 1 :]
+    return items
+
+
+class _TurnSnapshot(NamedTuple):
+    """断线续传要从 checkpoint 取回的东西（与正常路径同一套提取函数，避免两边漂移）。"""
+
+    reply: str
+    history_len: int
+    model: str | None
+    conclusion: dict | None
+    calibers: list[dict[str, Any]]
+    grounding: dict[str, Any]
+    focus_inner_code: str
+
+
+async def _load_turn_from_checkpoint(graph: object, config: dict) -> _TurnSnapshot:
+    """断线重连：从 checkpoint 读回上一轮回复、历史长度、实际模型与结构化字段。
+
+    不重跑图（避免重复追加上下文）。
 
     为什么连模型一起读回：meta/done 帧要如实标注本轮是不是走了真 LLM（`mode`），
     而续传路径不重跑图，模型名只能从 checkpoint 取。
@@ -179,13 +220,18 @@ async def _load_turn_from_checkpoint(
     snapshot = await graph.aget_state(config)  # type: ignore[attr-defined]
     values = getattr(snapshot, "values", None) or {}
     model = values.get("model")
-    return (
-        str(values.get("reply", "")),
-        len(values.get("messages", [])),
-        (str(model) if model else None),
-        # 续传不重跑图，结论只能从 checkpoint 的消息里取（与正常路径同一套提取函数，
-        # 避免“续传看到的是另一种结论”这种只有断线时才暴露的偏差）
-        _extract_conclusion(values.get("messages")),
+    messages = values.get("messages")
+    turn = _current_turn_messages(messages)
+    return _TurnSnapshot(
+        reply=str(values.get("reply", "")),
+        history_len=len(values.get("messages", [])),
+        model=(str(model) if model else None),
+        conclusion=_extract_conclusion(turn),
+        calibers=_extract_calibers(turn),
+        # 保真核对的证据取**整个会话**（引用上一轮的查询结果不算无出处），
+        # 而用户原话要取整段会话里最后一条（turn 切片里已经没有 HumanMessage 了）
+        grounding=_extract_grounding(messages, user_message=_last_human_text(messages)),
+        focus_inner_code=str(values.get("focus_inner_code") or ""),
     )
 
 
@@ -286,6 +332,51 @@ def _extract_conclusion(messages: object) -> dict | None:
     return None
 
 
+def _extract_calibers(messages: object) -> list[dict[str, Any]]:
+    """本轮工具返回的权威口径（FIX-27）：窗口与计数，供前端展示与留痕/验收判定。
+
+    为什么必须是“工具算的”而不是“模型说的”：实测模型会改写/拼接工具结果（把 90 天窗口的 0 条
+    套到 1825 天窗口上），而窗口与计数是工具自己算出来的事实，不存在被措辞污染的可能。
+    """
+    return grounding.collect_calibers(messages)
+
+
+def _extract_grounding(messages: object, *, user_message: str, reply: str = "") -> dict[str, Any]:
+    """回复里的数字有没有出处（FIX-27 的**检测**面，不是修复面）。
+
+    ⚠️ `messages` 要传**整个会话**（不只是本轮）：模型的回答里引用**上一轮**查到的数字
+    是正当的（实测：“和上一轮 90 天窗口的结果不同…90 天窗口内是 0 条”），
+    只看本轮会把这句真话标成“无出处”（误报）。留痕里的 `dataCaliber` 仍然是**本轮**的
+    （那是“这次查了什么”），两者语义不同、故意不共用一份输入。
+
+    为什么只“标出”不“改写”：改写用户看到的内容比说错更糟——用户会以为模型没说错、
+    也失去了“这个模型在这件事上不可靠”的信号。标出来 + 给出权威口径，用户自己能判断。
+    """
+    evidence = grounding.build_evidence(messages, user_message=user_message)
+    report = grounding.check_reply_numbers(
+        reply or _last_assistant_text(messages), evidence=evidence
+    )
+    if not report.grounded:
+        # 只记数字，不记回复正文（AGENTS §6.1：日志不出完整正文）
+        logger.warning(
+            "回复含无出处的数字（以口径帧为准）：checked=%s ungrounded=%s",
+            report.checked,
+            report.ungrounded,
+        )
+    return grounding.as_frame(report)
+
+
+def _last_assistant_text(messages: object) -> str:
+    """本轮最后一条助手正文（续传路径拿不到 `outcome.reply` 时的兜底）。"""
+    for msg in reversed(list(messages or [])):  # type: ignore[arg-type]
+        if isinstance(msg, ToolMessage):
+            continue
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
 class _TurnOutcome:
     """一轮生成的收尾信息（流式期间逐步填充，供 done 帧与留痕/计量共用）。
 
@@ -303,6 +394,9 @@ class _TurnOutcome:
         "tokens_out",
         "conclusion",
         "tool_calls",
+        "calibers",
+        "grounding",
+        "focus_inner_code",
     )
 
     def __init__(self) -> None:
@@ -316,6 +410,12 @@ class _TurnOutcome:
         self.conclusion: dict | None = None
         # 本轮的工具调用（名称+参数，已截断）：写进留痕，供审计与该验的确定性判定
         self.tool_calls: list[dict[str, object]] = []
+        # 本轮工具返回的权威口径（FIX-27）：窗口/计数，不经模型措辞
+        self.calibers: list[dict[str, Any]] = []
+        # 回复数字的出处核对结果（FIX-27）
+        self.grounding: dict[str, Any] = {}
+        # 本轮结束时的诊断焦点（多轮问诊对用户可见，2-3）
+        self.focus_inner_code = ""
 
 
 def _chunk_text(token: object) -> str:
@@ -381,8 +481,18 @@ async def _stream_graph_tokens(
     outcome.model = str(model) if model else None
     outcome.tokens_in = int(final_state.get("tokens_in", 0) or 0)
     outcome.tokens_out = int(final_state.get("tokens_out", 0) or 0)
-    outcome.conclusion = _extract_conclusion(final_state.get("messages"))
-    outcome.tool_calls = _extract_tool_calls(final_state.get("messages"))
+    # ⚠️ 结构化字段一律只看**本轮**（见 `_current_turn_messages`：整会话会把上几轮算进来，
+    # 既会让“第 3 轮带着焦点设备去查”假绿，也会给前端发上一轮的陈旧结论卡）
+    turn = _current_turn_messages(final_state.get("messages"))
+    outcome.conclusion = _extract_conclusion(turn)
+    outcome.tool_calls = _extract_tool_calls(turn)
+    outcome.calibers = _extract_calibers(turn)
+    outcome.grounding = _extract_grounding(
+        final_state.get("messages"),
+        user_message=_last_human_text(final_state.get("messages")),
+        reply=outcome.reply,
+    )
+    outcome.focus_inner_code = str(final_state.get("focus_inner_code") or "")
 
 
 async def _meter(session: object, *, settings: Settings, scene: int, user_id: int | None) -> None:
@@ -406,8 +516,8 @@ async def _resume_stream(
     offset: int,
 ) -> AsyncIterator[str]:
     """断线续传：从 checkpoint 读回本轮回复，只补发客户端未收到的帧。"""
-    reply, history_len, model, conclusion = await _load_turn_from_checkpoint(graph, config)
-    if not reply:
+    snap = await _load_turn_from_checkpoint(graph, config)
+    if not snap.reply:
         yield _sse("error", {"msg": "会话不存在或无可续传内容", "code": 404})
         return
     yield _sse(
@@ -417,14 +527,14 @@ async def _resume_stream(
             "request_id": rid,
             "scene": payload.scene,
             "user": parse_user_context(request).user_name or "system",
-            "mode": _mode_of(model),
-            "model": model,
+            "mode": _mode_of(snap.model),
+            "model": snap.model,
             "resumed": True,
-            "history_len": history_len,
+            "history_len": snap.history_len,
         },
     )
     frames = 0
-    for index, chunk in enumerate(_chunks(reply), start=1):
+    for index, chunk in enumerate(_chunks(snap.reply), start=1):
         frames = index
         if index <= offset:  # 已收到的帧不重发
             continue
@@ -436,12 +546,17 @@ async def _resume_stream(
     yield _sse(
         "done",
         {
-            "finish_reason": _mode_of(model),
-            "history_len": history_len,
+            "finish_reason": _mode_of(snap.model),
+            "history_len": snap.history_len,
             "frames": frames,
-            "model": model,
+            "model": snap.model,
             "resumed": True,
-            "conclusion": conclusion,
+            "conclusion": snap.conclusion,
+            # 续传与正常路径必须给出**同样**的口径/保真/焦点字段：只给正常路径会给前端
+            # 留下一类“断线后提示条消失”的偏差（只有断线时才能复现）。
+            "dataCaliber": snap.calibers,
+            "grounding": snap.grounding,
+            "focusInnerCode": snap.focus_inner_code,
         },
     )
 
@@ -473,6 +588,11 @@ async def _record_turn(
                     # “这个回答是基于哪几次查询得出的”，而不是只知道“它回答了”
                     "toolCalls": outcome.tool_calls,
                     "toolCallCount": len(outcome.tool_calls),
+                    # 那几次查询**实际生效的口径**（窗口来自工具而非模型措辞，FIX-27/28）：
+                    # 有了它，“模型说 5 年、实际查了 90 天”这种偏差在留痕里一眼可见。
+                    "dataCaliber": outcome.calibers,
+                    # 回复里无出处的数字（保真核对）：用于事后统计这类失败的发生率
+                    "grounding": outcome.grounding,
                 },
                 llm_output={"reply": outcome.reply, "model": outcome.model},
                 target_type="conversation",
@@ -563,6 +683,9 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
 
     outcome = _TurnOutcome()
     frames = 0
+    # FIX-28：把**用户原话**里的时间窗口注入本轮上下文（工具层与提示词层读同一个值，
+    # 避免“提示词一个口径、工具另一个口径”）。解析不出或有两个窗口时是 None（不猜）。
+    window_token = time_hint.set_window_hint_days(time_hint.parse_window_days(payload.message))
     try:
         # 2) 执行图并逐 token 下发（checkpointer 自动持久化本轮状态）
         async for text in _stream_graph_tokens(
@@ -630,6 +753,9 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
             },
         )
         return
+    finally:
+        # 上下文必须复位：不复位会把本轮窗口泄漏给同一进程里后续请求（尤其异常路径）
+        time_hint.reset_window_hint_days(window_token)
 
     # 3) 留痕与计量（旁路能力，失败降级放行）
     await _record_turn(
@@ -653,6 +779,13 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
             "resumed": False,
             # 结构化诊断结论（2-4）：前端据此画置信度条；没有该工具调用时严格为 None
             "conclusion": outcome.conclusion,
+            # 权威口径（FIX-27）：窗口/计数由**工具**算出，不受模型措辞影响；
+            # 前端用它与回复里的数字对照显示
+            "dataCaliber": outcome.calibers,
+            # 回复数字的出处核对（FIX-27）：grounded=false 时前端提示“以口径帧为准”
+            "grounding": outcome.grounding,
+            # 多轮问诊的焦点（2-3）：让用户看得见“助手记住的是哪台”（后端早已生效，前端此前不可见）
+            "focusInnerCode": outcome.focus_inner_code,
         },
     )
 

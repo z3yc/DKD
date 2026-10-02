@@ -62,7 +62,7 @@ Python 侧日志与 `agent_decision_log.request_id` 都带它。**排障时先�
 | --- | --- | --- |
 | `meta` | `conversation_id / request_id / scene / user / mode / model / history_len` | 首帧。`mode` 为 `llm` 或 `echo`；`model` 在 done 帧补全（按**服务端实际返回**的模型计费，不按配置猜） |
 | `delta` | `{"text": "..."}` | token 级分片，带 `id:` 供断点续传 |
-| `done` | 最终统计 | 正常结束 |
+| `done` | 最终统计（含 `conclusion` / `dataCaliber` / `grounding` / `focusInnerCode`） | 正常结束 |
 | `error` | `{"msg","code","retryable"}` | **失败也以 error 帧收尾**（不留悬挂气泡）；存储类异常 `code=503` 且文案指向“会话存储”，其它 `code=500`，均带 `retryable=true` |
 
 **断点续传**：请求头带 `Last-Event-ID: <最后一个 delta 的 id>` → 服务端**不重跑本轮**，只补发未收到的帧。
@@ -141,9 +141,44 @@ Python 侧日志与 `agent_decision_log.request_id` 都带它。**排障时先�
 | 工具 | 能回答什么 | 返回要点 / 诚实标记 |
 | --- | --- | --- |
 | `find_devices` | 按**口述线索**定位设备：编号精确 → 编号前缀 → 点位名 → 地址（如“五道口”） | 带 `matchReason`；多台命中时给 `hint` 要求用户确认；**一条都没有时明确禁止模型自己编号** |
-| `list_device_anomalies` | 某设备近 N 天（默认 90，上限 3650）的异常：卡单（`status=1` 超阈值）、出货失败未退款（`status=3` 且 `pay_status∈{1,2}`）、库存无单扣减/账实不符 | 带 `byKind` 分组计数、`caliber`、`dataWarning`（`tb_inventory_log` 为空时“0 条 ≠ 没问题”）；窗口被夹取时给 `windowClampedFromDays` |
+| `list_device_anomalies` | 某设备近 N 天（默认 90，上限 3650）的异常：卡单（`status=1` 超阈值）、出货失败未退款（`status=3` 且 `pay_status∈{1,2}`）、库存无单扣减/账实不符 | 带 `byKind` 分组计数、`caliber`、`dataWarning`（`tb_inventory_log` 为空时“0 条 ≠ 没问题”）；窗口被夹取时给 `windowClampedFromDays`；**窗口来源**见 `windowSource` / `windowOverriddenFromDays`（见下） |
 | `search_device_history` | 历史维修工单检索（**规则库**，不是语义检索）：`same_device → same_model → same_region` 三级降级 | 每条带 `phenomenonUsable`（描述能不能当故障现象）与 `confidence`+`confidenceBasis`；无可用案例时给 `noEvidenceHint` + `mustSay`（提示词要求必须照做） |
 | `build_device_diagnosis` | **结构化诊断结论**（2-4）：证据清单 + 未知项 + 可执行的平台动作 + 由证据强度算出的 `confidence` | **刻意没有病因字段**（本平台无结构化故障知识库，FIX-22）：`evidence[]` 每条带来源表与口径、`unknowns[]` 显式列出平台观测不到的部分（如库存日志未采集）、`recommendedActions[]` 只指向平台真实入口；`confidenceBasis` 说明置信度源自哪几条证据。附带 `mustSay` 要求模型不得自行补病因/处置步骤 |
+
+### 窗口参数的“谁说了算”（FIX-28）
+
+带 `days` 参数的诊断类工具（`list_device_anomalies` / `search_device_history` / `build_device_diagnosis`）
+会以**用户原话里的时间窗口**为准，并把两个值都写进返回值：
+
+| 字段 | 含义 |
+| --- | --- |
+| `windowSource` | `model`（用模型请求的窗口）或 `userTimeHint`（用户原话里解析出的窗口生效） |
+| `windowOverriddenFromDays` | 被覆盖的**模型请求值**（仅当两者不同时出现） |
+| `windowClampedFromDays` | 模型请求值超工具上限被夹取（与上者是两个不同来源，不会同时表示同一件事） |
+
+口径：中文数字也算（“近五年”=1825）；一句话里出现**两个不同窗口**则不覆盖（歧义不猜）；
+**不跨轮沿用**（窗口属于这次提问，需要跨轮记住的是设备焦点）。
+
+### `done` 帧的 `dataCaliber` 与 `grounding`（FIX-27）
+
+两个字段**恒在**（没调工具时分别是空数组与 `grounded=true`），前端与验收脚本可以无条件读：
+
+| 字段 | 含义 |
+| --- | --- |
+| `dataCaliber[]` | **本轮**工具返回的权威口径：`tool` / `windowDays` / `windowStart` / `windowEnd` / `windowSource` / `counts`（各类计数）。**窗口与计数由工具算出**，不受模型措辞影响 |
+| `grounding` | 回复里数字的**出处核对**：`grounded`（是否全部有出处）/ `ungroundedNumbers[]`（无出处的数字，如 `1825 天`）/ `checked`（核对了几个） |
+| `focusInnerCode` | 本次会话正在诊断的设备（2-3，前端用来画“当前诊断设备”提示条） |
+
+出处的范围（**会话级**）：工具返回值 + 工具参数 + **用户原话**；
+**不包含助手自己说过的话**（否则上一轮说错的数字会被当成出处，形成自我洗白），
+也不包含 `windowOverriddenFromDays` / `mustSay` / `caliber` 这类元数据键。
+
+> 为什么只标不改：改写用户看到的内容比说错更糟——用户会以为模型没说错，
+> 也失去了“这台机器在这件事上不可靠”的信号。正确做法是：把**工具的权威数字**展示出来（口径条），
+> 把**无法溯源的数字**标出来（提示条），让人自己判断。
+
+> ⚠️ 已知取舍：回复里写**中文数字**（“五年”）不参与核对（故意漏报，避免误报）；
+> “前 5 条”这类截断说明与序号（“第 3 条”）也不算数据声明。
 
 ### `done` 帧的 `conclusion`（2-4 的前端契约）
 

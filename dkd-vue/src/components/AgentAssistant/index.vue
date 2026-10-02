@@ -60,6 +60,18 @@
       <!-- 真模型时只做一个轻量标识：模型名按**服务端实际返回**显示（可能与配置不同，用于核对计费口径） -->
       <div v-else-if="turnModel" class="model-badge">模型：{{ turnModel }}</div>
 
+      <!--
+        当前诊断设备提示（2-3 的前端半场）。
+
+        为什么必须有：后端从 2-3 起就把“正在诊断哪台设备”做成了会话状态（`focus_inner_code`），
+        追问“那它呢”不会再索要编号——但**用户看不见助手记住了哪台**，体验上是割裂的：
+        他无法知道自己说“它”会不会指错，也不敢放心追问。
+        来源是 done 帧的 `focusInnerCode`（服务端用确定性规则算出，不是模型的话术）。
+      -->
+      <div v-if="focusCode" class="focus-bar">
+        <span class="txt">当前诊断设备：<strong>{{ focusCode }}</strong>（说“这台/它”指它）</span>
+      </div>
+
       <div ref="bodyRef" class="chat-body">
         <div v-if="messages.length === 0" class="msg ai">
           <div class="ava">🤖</div>
@@ -121,6 +133,38 @@
                 </span>
                 · <span class="muted">置信度 = 证据强度刻度，不是概率；本结论不含病因推断</span>
               </div>
+            </div>
+            <!--
+              本次查询口径（FIX-27）。
+
+              为什么必须有：实测模型会把工具结果**改写/拼接**（把 90 天窗口的 0 条说成
+              “近五年都没异常”）。模型的措辞不可控，但**工具返回的窗口与条数是事实**——
+              把它直接展示出来，用户不必相信模型的那句话也能得出正确结论。
+            -->
+            <div v-if="(msg.dataCaliber || []).length" class="caliber">
+              <div class="t">本次查询口径（来自工具，非模型转述）</div>
+              <div v-for="(item, i) in msg.dataCaliber" :key="i" class="caliber-row">
+                <code>{{ item.tool }}</code>
+                <span v-if="item.windowDays" class="muted">
+                  窗口 {{ item.windowDays }} 天
+                  <template v-if="item.windowStart && item.windowEnd">
+                    （{{ shortDate(item.windowStart) }} ~ {{ shortDate(item.windowEnd) }}）
+                  </template>
+                </span>
+                <span v-if="countText(item.counts)" class="muted">{{ countText(item.counts) }}</span>
+                <span v-if="item.windowSource === 'userTimeHint'" class="muted">按你提的时间范围</span>
+              </div>
+            </div>
+            <!--
+              数字保真提示（FIX-27）：回复里的数字在本次查询结果里没有出处。
+              为什么只提示、不遮挡/不改写模型的回答：改写会让用户以为模型没说错，
+              也会让人失去“这台机器在这件事上不可靠”的信号。提示 + 权威口径交给用户判断。
+            -->
+            <div v-if="msg.grounding && msg.grounding.grounded === false" class="grounding-warn">
+              <span class="txt">
+                提示：回复里的 {{ (msg.grounding.ungroundedNumbers || []).join('、') }}
+                没有出现在本次查询结果中，请以上面的「本次查询口径」为准。
+              </span>
             </div>
             <div v-if="msg.error" class="bubble-err">{{ msg.error }}</div>
           </div>
@@ -216,6 +260,11 @@ const degradedReason = computed(() => agentStore.degradedReason)
 const turnMode = ref('')
 /** 服务端实际返回的模型名（来自 done 帧；echo 模式为空） */
 const turnModel = ref('')
+/**
+ * 本会话当前诊断的设备（来自 done 帧的 focusInnerCode，2-3）。
+ * 为什么放在会话级而不是气泡级：它表达的是“助手现在记的是哪台”，换会话才重置。
+ */
+const focusCode = ref('')
 const messages = ref([])
 const bodyRef = ref(null)
 // 会话上下文：首轮由服务端下发 conversation_id（Python 侧 thread_id），后续轮次复用实现多轮
@@ -267,6 +316,20 @@ function renderMarkdown(text) {
   return DOMPurify.sanitize(marked.parse(text))
 }
 
+/** 口径帧里的窗口起止只要日期（完整 ISO 时间戳对阅读没帮助） */
+function shortDate(value) {
+  const text = String(value || '')
+  return text.length >= 10 ? text.slice(0, 10) : text
+}
+
+/** 计数项 → 一行中文（“订单异常 0 / 库存异常 0”）；空计数返回空串，不画空行 */
+function countText(counts) {
+  if (!counts) return ''
+  return Object.keys(counts)
+    .map((key) => `${key} ${counts[key]}`)
+    .join(' / ')
+}
+
 function scrollToBottom() {
   nextTick(() => {
     const el = bodyRef.value
@@ -276,7 +339,17 @@ function scrollToBottom() {
 
 function pushMessage(role, content) {
   messageSeq += 1
-  const msg = { id: messageSeq, role, content, streaming: false, error: '', conclusion: null }
+  const msg = {
+    id: messageSeq,
+    role,
+    content,
+    streaming: false,
+    error: '',
+    conclusion: null,
+    // 口径帧与保真核对（FIX-27）：没调工具时为空数组/空对象，前端据此不画
+    dataCaliber: [],
+    grounding: null
+  }
   messages.value.push(msg)
   return msg
 }
@@ -286,6 +359,7 @@ function resetConversation() {
   messages.value = []
   conversationId.value = undefined
   lastEventId.value = undefined
+  focusCode.value = ''
   draft.value = ''
 }
 
@@ -337,6 +411,11 @@ function handleFrame(frame, assistantMsg) {
     if (data.model) turnModel.value = data.model
     // 结构化诊断结论（2-4）：服务端只在真调了诊断工具时带，否则严格为 null
     if (data.conclusion) assistantMsg.conclusion = data.conclusion
+    // 口径帧（FIX-27）：**本轮**工具返回的窗口与计数（服务端已按“本轮”限定，不会带上几轮的）
+    if (data.dataCaliber) assistantMsg.dataCaliber = data.dataCaliber
+    if (data.grounding) assistantMsg.grounding = data.grounding
+    // 多轮问诊的焦点（2-3）：后端确定性算出，前端只负责显示
+    if (typeof data.focusInnerCode === 'string') focusCode.value = data.focusInnerCode
     if (data.mode && !turnMode.value) turnMode.value = data.mode
   } else if (frame.event === 'error') {
     assistantMsg.error = data.msg || '智能体返回错误'
@@ -548,6 +627,19 @@ onBeforeUnmount(stop)
   color: #909399;
 }
 
+/* 当前诊断设备提示条（2-3）：后端早已记住，这里只是把它变成“看得见” */
+.focus-bar {
+  padding: 6px 16px;
+  background: #f0f9eb;
+  border-bottom: 1px solid #e1f3d8;
+  font-size: 12px;
+  color: #529b2e;
+
+  strong {
+    font-weight: 600;
+  }
+}
+
 .chat-body {
   flex: 1;
   overflow-y: auto;
@@ -683,6 +775,50 @@ onBeforeUnmount(stop)
         font-size: 11px;
         color: #909399;
       }
+    }
+
+    /* 口径帧（FIX-27）：灰色底 + 代码字体，与“模型说的话”视觉上区分开 */
+    .caliber {
+      margin-top: 8px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      background: #f4f4f5;
+      border: 1px solid #e9e9eb;
+      font-size: 12px;
+      color: #606266;
+
+      .t {
+        font-weight: 600;
+        color: #303133;
+        margin-bottom: 2px;
+      }
+
+      .caliber-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        line-height: 1.7;
+      }
+
+      code {
+        background: #fff;
+        border: 1px solid #e9e9eb;
+        border-radius: 3px;
+        padding: 0 4px;
+      }
+    }
+
+    /* 数字保真提示（FIX-27）：模型措辞与工具事实不一致时的提示 */
+    .grounding-warn {
+      margin-top: 6px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      background: #fdf6ec;
+      border: 1px solid #faecd8;
+      border-left: 3px solid #e6a23c;
+      font-size: 12px;
+      color: #b88230;
+      line-height: 1.6;
     }
 
     .bubble-err {

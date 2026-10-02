@@ -39,6 +39,7 @@ from app.graphs.restock_decisions import summarize_plan
 from app.graphs.restock_plan_store import SqlPauseStore, SqlPlanStore, plan_from_row
 from app.graphs.restock_state import status_label
 from app.prompts.assistant_chat import tool_names_for_scene
+from app.services import time_hint
 from app.services.diagnosis import compose_diagnosis
 from app.tools import read_tools
 from app.tools.read_tools import ToolError, default_sales_window
@@ -387,6 +388,11 @@ DEFAULT_ANOMALY_WINDOW_DAYS = 90
 # 因为自然语言的“历史/以前”比程序调用含糊，窗口给小了会得到“没有历史”的假结论
 # （本机维修单全在 2023-03）。真实成本护栏仍是 per-device 过滤 + 超时熔断。
 DEFAULT_CASE_WINDOW_DAYS = 2000
+# 各工具自己的窗口上限（下面是唯一的定义处，别再散落魔法数字）：
+#   异常 3650（10 年）——异常数据天生稀疏，窗口太短会得出“设备没问题”的假阴性；
+#   历史 2000（≈5.5 年）——与上面的默认值一致。
+MAX_ANOMALY_WINDOW_DAYS = 3650
+MAX_CASE_WINDOW_DAYS = 2000
 
 MAX_ANOMALY_ITEMS = 5
 
@@ -461,15 +467,19 @@ async def _list_device_anomalies(inner_code: str, days: int = DEFAULT_ANOMALY_WI
     code = (inner_code or "").strip()
     if not code:
         return _json({"error": "缺少设备编码（inner_code）"})
+    requested_days = days if isinstance(days, int) else None
     try:
         # 上限 10 年：**不是**为了让模型随便拉大窗口，而是因为维修/异常数据天生稀疏——
         # 本机全部订单都在 2023 年，365 天的上限会让“查历史异常”永远返回空，
         # 用户会据此以为设备没问题（假阴性）。真正的成本护栏是 per-device 过滤 +
         # 时间范围下推到索引 + `read_query_timeout_s` 熔断（AGENTS §10），不是窗口长度。
-        window_days = max(1, min(int(days), 3650))
+        window_days = max(1, min(int(days), MAX_ANOMALY_WINDOW_DAYS))
     except (TypeError, ValueError):
         window_days = DEFAULT_ANOMALY_WINDOW_DAYS
-    requested_days = days if isinstance(days, int) else None
+    # FIX-28：**用户原话里的窗口优先**于模型请求的窗口（实测模型跟不住“近五年”）。
+    # 两个值都写进返回值（`windowSource` / `windowOverriddenFromDays`），不留“谁改了什么”的暗账。
+    window = time_hint.resolve_window_days(window_days, maximum=MAX_ANOMALY_WINDOW_DAYS)
+    window_days = window.days
 
     start, end = read_tools.default_sales_window(days=window_days)
     try:
@@ -525,7 +535,12 @@ async def _list_device_anomalies(inner_code: str, days: int = DEFAULT_ANOMALY_WI
         "dataWarning": "本机 tb_inventory_log 为空表（0 行）：库存异常恒为 0 **不代表货道没问题**，"
         "只是该类日志尚未被采集。",
     }
-    if requested_days is not None and requested_days != window_days:
+    payload.update(window.as_payload_fields())
+    if (
+        window.source == time_hint.SOURCE_MODEL
+        and requested_days is not None
+        and requested_days != window_days
+    ):
         # 静默夹取会让模型把“实际只查了 N 天”说成“查了 M 天”（口径失真）
         payload["windowClampedFromDays"] = requested_days
     if len(orders) > MAX_ANOMALY_ITEMS:
@@ -555,11 +570,14 @@ async def _search_device_history(inner_code: str, days: int = DEFAULT_CASE_WINDO
     code = (inner_code or "").strip()
     if not code:
         return _json({"error": "缺少设备编码（inner_code）"})
+    requested_days = days if isinstance(days, int) else None
     try:
-        window_days = max(1, min(int(days), 2000))
+        window_days = max(1, min(int(days), MAX_CASE_WINDOW_DAYS))
     except (TypeError, ValueError):
         window_days = DEFAULT_CASE_WINDOW_DAYS
-    requested_days = days if isinstance(days, int) else None
+    # FIX-28：同 `list_device_anomalies`，用户说的窗口优先
+    window = time_hint.resolve_window_days(window_days, maximum=MAX_CASE_WINDOW_DAYS)
+    window_days = window.days
     start, end = read_tools.default_case_window(days=window_days)
 
     try:
@@ -597,7 +615,12 @@ async def _search_device_history(inner_code: str, days: int = DEFAULT_CASE_WINDO
         ],
         "caliber": result.caliber,
     }
-    if requested_days is not None and requested_days != window_days:
+    payload.update(window.as_payload_fields())
+    if (
+        window.source == time_hint.SOURCE_MODEL
+        and requested_days is not None
+        and requested_days != window_days
+    ):
         payload["windowClampedFromDays"] = requested_days
     if len(result.cases) > MAX_ANOMALY_ITEMS:
         payload["casesTruncatedFrom"] = result.total_cases
@@ -637,11 +660,16 @@ async def _build_device_diagnosis(
     if not code:
         return _json({"error": "缺少设备编码（inner_code）"})
     try:
-        window_days = max(1, min(int(days), 3650))
-        case_window_days = max(1, min(int(case_days), 2000))
+        window_days = max(1, min(int(days), MAX_ANOMALY_WINDOW_DAYS))
+        case_window_days = max(1, min(int(case_days), MAX_CASE_WINDOW_DAYS))
     except (TypeError, ValueError):
         window_days = DEFAULT_ANOMALY_WINDOW_DAYS
         case_window_days = DEFAULT_CASE_WINDOW_DAYS
+    # FIX-28：两个窗口都跟着用户原话走（“近五年”时异常与历史都按 1825 天算）
+    anomaly_window = time_hint.resolve_window_days(window_days, maximum=MAX_ANOMALY_WINDOW_DAYS)
+    case_window = time_hint.resolve_window_days(case_window_days, maximum=MAX_CASE_WINDOW_DAYS)
+    window_days = anomaly_window.days
+    case_window_days = case_window.days
 
     start, end = read_tools.default_sales_window(days=window_days)
     case_start, case_end = read_tools.default_case_window(days=case_window_days)
@@ -684,6 +712,8 @@ async def _build_device_diagnosis(
         },
     )
     payload: dict[str, Any] = conclusion.model_dump(mode="json", by_alias=True)
+    payload.update(anomaly_window.as_payload_fields())
+    payload.update(case_window.as_payload_fields(prefix="case"))
     payload["mustSay"] = (
         "**本结论不包含病因推断**（平台没有结构化的故障知识库，FIX-22）："
         "只能转述 evidence / unknowns / recommendedActions 与 confidenceBasis，"

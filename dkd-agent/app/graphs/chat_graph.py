@@ -29,9 +29,11 @@ from langgraph.prebuilt import ToolNode
 
 from app.llm import LlmError, build_chat_model
 from app.prompts.assistant_chat import SCENE_GENERAL, system_prompt
+from app.services import time_hint
 
 # 工具调用轮次上限（防“模型反复调工具烧 token”）。3 轮足够覆盖
 # “清单 → 查某台设备 → 查销量”这种最多三跳的问题；超出则强制作答。
+# ⚠️ 这是**每一句问话**的预算（不是整个会话的配额）——按会话累计会让第三句起彻底没工具（FIX-29）。
 MAX_TOOL_ROUNDS = 3
 
 logger = logging.getLogger("dkd.agent.chat_graph")
@@ -145,14 +147,37 @@ async def respond(state: ChatState) -> dict[str, Any]:
     }
 
 
+def _current_turn_messages(state: ChatState) -> list[AnyMessage]:
+    """只取**本轮**的消息（最后一次 HumanMessage 之后的部分）。
+
+    为什么要这个切片（2026-10-02 实测撞出来的 FIX-29）：state 里的 `messages` 是**整个会话**
+    （checkpointer 恢复历史 + add_messages 累加），所以“本轮”的一切推导都必须先切本轮；
+    把整会话当本轮用过的地方有两个，各自都造成了**静默**失效：
+
+      1. **工具轮次上限**（本文件的 `_tool_rounds_used`）：按会话累计时，第三轮开始时
+         历史上已经有 ≥3 条 ToolMessage → 直接**不再 bind_tools** → 助手从第三句起
+         彻底失去查询能力，而且没有任何报错（实测：第三轮回复只剩 `A1000001 1825` 这种碎片）；
+      2. **留痕/帧的结构化字段**（`app/api/chat.py` 的同名函数）：会把上几轮的结论/工具调用
+         算进本轮，既让验收假绿，也给前端发上一轮的陈旧结论卡。
+    """
+    items = list(state.get("messages") or [])
+    for index in range(len(items) - 1, -1, -1):
+        if isinstance(items[index], HumanMessage):
+            return items[index + 1 :]
+    return items
+
+
 def _tool_rounds_used(state: ChatState) -> int:
-    """已用掉的工具轮次 = 历史里的 ToolMessage 条数。
+    """**本轮**已用掉的工具轮次 = 本轮消息里的 ToolMessage 条数。
 
     为什么不新增 state 字段来计数：0-13 冻结了 state schema（新增字段要走兼容性评审），
-    而「已执行的工具调用」本来就完整存在于 `messages` 里——**能推导出来的计数不该新增字段**。
+    而「本轮已执行的工具调用」本来就完整存在于本轮 `messages` 里——**能推导出来的计数不该新增字段**。
     这也让旧 checkpoint 在升级后能直接被新代码读取（老会话里没有 ToolMessage，计数自然为 0）。
+
+    ⚠️ 必须只数**本轮**（见 `_current_turn_messages` 的注释）：按会话累计会让上限变成一个
+    “跨轮共享的配额”，第三句问话起助手就不再具备查询能力——而现象只是“答得含糊”，极难归因。
     """
-    return sum(1 for m in state.get("messages", []) if isinstance(m, ToolMessage))
+    return sum(1 for m in _current_turn_messages(state) if isinstance(m, ToolMessage))
 
 
 async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, Any]:
@@ -171,8 +196,9 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
 
     模型可调用**只读**工具（见 `app/tools/assistant_tools.py`）去真取数。三个关键设计：
 
-    1. **轮次上限靠推导、不新增 state 字段**：已用轮次 = messages 里的 ToolMessage 条数
-       （见 `_tool_rounds_used`）。达到上限时**不再 bind_tools**，强制模型基于已有信息作答——
+    1. **轮次上限靠推导、不新增 state 字段**：已用轮次 = **本轮** messages 里的 ToolMessage 条数
+       （必须切本轮，见 `_tool_rounds_used`：否则上限会变成跨轮共享的配额 → FIX-29）。
+       达到上限时**不再 bind_tools**，强制模型基于已有信息作答——
        这样既能防“模型反复调工具烧 token”，又不破坏 0-13 的 state 冻结。
     2. **token 跨轮累计**：多轮工具调用会产生多次 LLM 调用，而 `tokens_in/out` 是**后写覆盖**字段。
        若不累加，成本计量（0-12）只会记到最后一次调用的用量——即**系统性低估成本**。
@@ -198,6 +224,10 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
             content=system_prompt(
                 int(state.get("scene", SCENE_GENERAL)),
                 focus_inner_code=str(state.get("focus_inner_code") or ""),
+                # 本轮窗口来自用户原话（FIX-28）。为什么从 contextvar 读而不是进 state：
+                # 它**不是会话状态**（下一轮不该沿用上一轮的窗口，见 time_hint 模块注释），
+                # 进 state 反而会把它变成“会记住的东西”。
+                window_days=time_hint.current_window_hint_days(),
             )
         )
     ]
