@@ -610,6 +610,16 @@ async def _search_device_history(inner_code: str, days: int = DEFAULT_CASE_WINDO
                 "phenomenon": c.phenomenon,
                 "phenomenonUsable": c.phenomenon_usable,
                 "taskStatus": c.task_status_label,
+                # 为什么必须给时间（2026-10-02 实测补上，F-6）：
+                # ① 运营问的是“以前修过吗”——不带时间就只能回答“修过”，答不了“什么时候”；
+                # ② 少了它，模型只能从 `taskCode` 前缀（`202303240005`）推年份，写成“2023 年 3 月”，
+                #    而载荷里并没有这个数 → `grounding.check_reply_numbers` 当场判成
+                #    “没有出处的数字”并弹提示条（实测踩到）。该模块的底线是
+                #    「**宁可漏报，不可误报**」——误报会让提示条变成噪声、最终没人看。
+                #    根因在载荷缺字段，不是模型编造。
+                # 命名与 `list_inflight_work_orders` 的 `createTime` 保持一致（同为原始 datetime，
+                # 由 `_json` 的 `default=str` 序列化）。
+                "createTime": c.created_time,
             }
             for c in result.cases[:MAX_ANOMALY_ITEMS]
         ],
