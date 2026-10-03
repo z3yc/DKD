@@ -168,16 +168,51 @@
           </el-descriptions-item>
         </el-descriptions>
 
-        <div class="json-block">
-          <div class="json-block__title">输入上下文（input_context，脱敏后）</div>
-          <pre class="json-block__body">{{ pretty(detail.row.inputContext) }}</pre>
-        </div>
-        <div class="json-block">
-          <div class="json-block__title">
-            LLM 结构化输出（llm_output）
-            <span class="dim">人工干预恒为空——不把人工操作伪装成模型建议</span>
+        <!--
+          ⚠️ 未取到完整留痕前**不得渲染这两块**（否则会显示「（无）」）。
+
+          为什么（2026-10-03 实测）：`handleDetail` 先把列表行给 `detail.row`（列表 VO
+          **不含** `input_context`/`llm_output` 这两个大字段），再异步取单条详情回填。
+          中间那个窗口里 `pretty(undefined)` 输出的是「（无）」——在审计页上这等于
+          **把“还在加载”断言成了“这条留痕没有数据”**，而两者结论完全相反。
+          （该窗口是靠浏览器验收脚本的“块行数 [1,1] / 内容首行（无）”反复报状才定位到的。）
+          现改为：加载中不给块，取回后再渲染。
+        -->
+        <div v-loading="detail.loading" element-loading-text="正在加载完整留痕…">
+          <div v-if="detail.loading" class="json-loading-tip">
+            正在加载完整留痕（含 JSON 上下文）…
           </div>
-          <pre class="json-block__body">{{ pretty(detail.row.llmOutput) }}</pre>
+          <template v-else>
+            <div class="json-block">
+              <div class="json-block__title">输入上下文（input_context，脱敏后）</div>
+              <pre class="json-block__body">{{ pretty(detail.row.inputContext) }}</pre>
+            </div>
+            <div class="json-block">
+              <div class="json-block__title">
+                LLM 结构化输出（llm_output）
+                <span class="dim">人工干预恒为空——不把人工操作伪装成模型建议</span>
+              </div>
+              <pre class="json-block__body">{{ pretty(detail.row.llmOutput) }}</pre>
+              <!--
+                可读版正文。
+
+                为什么要多这一块（2026-10-03 报障）：`llm_output` 是 JSON，而模型的回答是一个
+                很长的 markdown 字符串——它的换行在 JSON 里必须写成 `\n` 转义，所以直接看上面那块
+                原文时**整段回复是一行**（实测 6447px）。审计既要「原样可查」（上面保留）也要
+                「人读得下去」（这里还原换行），两者不能互相替代：
+                · 只留原文 → 运营面对一行带 `\n` 的长文本，等于没给可读信息；
+                · 只留还原版 → 丢掉"上游到底写了什么"的凭证（审计场景不能这么做）。
+                本块**不做任何改写**（不脱敏/不裁剪/不重排），只把 `\n` 还原成真换行。
+              -->
+              <div v-if="replyText" class="json-block__sub">
+                <div class="json-block__title">
+                  回复正文
+                  <span class="dim">换行已还原便于阅读；内容未改写，以原始值为准</span>
+                </div>
+                <pre class="json-block__body">{{ replyText }}</pre>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
       <template #footer>
@@ -275,7 +310,26 @@ const showSearch = ref(true)
 const logList = ref([])
 const total = ref(0)
 const dateRange = ref([])
-const detail = reactive({ open: false, row: null })
+const detail = reactive({ open: false, row: null, loading: false })
+
+/**
+ * 详情弹窗里的「回复正文」：把 `llm_output.reply` 的 `\n` 还原成真换行。
+ *
+ * 只在**确实含换行**时才给：单行回复另开一块是噪声（审计页信息密度本来就高）。
+ * 解析失败一律返回空串——审计页面不能因为一条留痕格式异常就整页报错，原始值那块照常显示。
+ */
+const replyText = computed(() => {
+  const raw = detail.row && detail.row.llmOutput
+  if (!raw) return ''
+  let obj
+  try {
+    obj = typeof raw === 'string' ? JSON.parse(raw) : raw
+  } catch (e) {
+    return ''
+  }
+  const reply = obj && typeof obj.reply === 'string' ? obj.reply : ''
+  return reply.indexOf('\n') >= 0 ? reply : ''
+})
 /** 链路弹窗状态（requestId + 升序留痕行）；loading 必须在 finally 复位（AGENTS §2.2） */
 const trace = reactive({ open: false, loading: false, requestId: '', rows: [] })
 
@@ -388,9 +442,20 @@ function handleTrace(row) {
     })
 }
 
+/**
+ * 打开详情/回放。
+ *
+ * 两段式：先把**列表行**给 `detail.row`（弹窗立刻有摘要可看），再异步取**单条详情**回填
+ * （列表 VO 不含 `input_context`/`llm_output` 这两个大字段）。
+ *
+ * ⚠️ `loading` 不是锦上添花（2026-10-03 实测）：没有它时，取数返回前那一个窗口里模板把
+ * `pretty(undefined)` 渲染成「（无）」——在审计页上等于**把“还在加载”断言成“这条留痕没有数据”**，
+ * 两者结论完全相反。所以加载期间不给 JSON 块，并在 `finally` 里复位（AGENTS §2.2）。
+ */
 function handleDetail(row) {
   detail.row = row
   detail.open = true
+  detail.loading = true
   getDecisionLog(row.id)
     .then((response) => {
       if (response.data) detail.row = response.data
@@ -398,6 +463,9 @@ function handleDetail(row) {
     .catch(() => {
       // 详情失败不影响已展示的列表摘要，明确告知而不是静默
       ElMessage.warning('详情加载失败，当前展示的是列表摘要（不含 JSON 上下文）')
+    })
+    .finally(() => {
+      detail.loading = false
     })
 }
 
@@ -432,49 +500,83 @@ onMounted(() => {
   }
 }
 
-.agent-audit {
-  .dim {
-    color: var(--el-text-color-secondary);
-    font-size: 12px;
-    margin-left: 4px;
+/*
+ * ⚠️ 下面这些**不能**裹在页面根类（原写法 `.agent-audit { ... }`）里。
+ *
+ * 为什么（2026-10-03 实测的显示 bug，有选择器级证据）：页面根是
+ * `<div class="app-container agent-audit">`，而两个弹窗都带 `append-to-body`——
+ * el-dialog 会把内容 **teleport 到 `<body>`**，于是 `<pre>` 虽然仍带 `data-v-*`，
+ * 但**祖先 `.agent-audit` 已经不在它的路径上**。编译出来的选择器是
+ * `.agent-audit .json-block__body[data-v-a90add8f]` → 一律不匹配 →
+ * `white-space: pre-wrap` / `max-height` / `overflow` / 背景 / 内边距全部没生效。
+ *
+ * 现象：详情回放的 `llm_output.reply` 是一整段 markdown（换行是 JSON 字符串里的
+ * `\n` 转义），落到没样式的 `<pre>` 上就是**一条 6447px 宽的长行**（实测
+ * scrollWidth 6447 vs clientWidth 720），既看不到换行也读不下去。
+ * 页面上不被察觉是因为 `input_context` 恰好短；一旦内容是长文本就暴露。
+ *
+ * 去掉包裹层是安全的：`<style scoped>` 已经给规则加上 `[data-v-*]`，隔离不依赖祖先。
+ * 对照：同文件的 `.trace` 一直是顶层写的，所以链路弹窗的样式没问题——
+ * 两个弹窗、两种写法，差异只在这里。
+ */
+.dim {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+.mono {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 12px;
+}
+
+.err-text {
+  color: var(--el-color-danger);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 加载中的占位：与两块 JSON 同高量级，避免弹窗先矮后跳 */
+.json-loading-tip {
+  margin-top: 12px;
+  padding: 24px 10px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color-light);
+  border-radius: 4px;
+}
+
+.json-block {
+  margin-top: 12px;
+
+  /* 可读版正文与原始值同属一块，靠上边距与标题区分层级 */
+  &__sub {
+    margin-top: 10px;
   }
 
-  .mono {
-    font-family: Consolas, Monaco, monospace;
-    font-size: 12px;
+  &__title {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 6px;
+
+    .dim {
+      font-weight: 400;
+    }
   }
 
-  .err-text {
-    color: var(--el-color-danger);
+  &__body {
+    max-height: 260px;
+    overflow: auto;
+    background: var(--el-fill-color-light);
+    border-radius: 4px;
+    padding: 10px;
     font-size: 12px;
     line-height: 1.6;
-  }
-
-  .json-block {
-    margin-top: 12px;
-
-    &__title {
-      font-size: 13px;
-      font-weight: 600;
-      margin-bottom: 6px;
-
-      .dim {
-        font-weight: 400;
-      }
-    }
-
-    &__body {
-      max-height: 260px;
-      overflow: auto;
-      background: var(--el-fill-color-light);
-      border-radius: 4px;
-      padding: 10px;
-      font-size: 12px;
-      line-height: 1.6;
-      white-space: pre-wrap;
-      word-break: break-all;
-      margin: 0;
-    }
+    /* 换行由 JSON 的结构缩进提供；字符串里的 `\\n` 是转义，不在这里还原（见下方说明） */
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin: 0;
   }
 }
 </style>

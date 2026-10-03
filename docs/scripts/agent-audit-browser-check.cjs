@@ -25,17 +25,65 @@ const BASE = 'http://127.0.0.1'
 const SHOT_DIR = process.env.SHOT_DIR || os.tmpdir()
 let pass = 0
 let fail = 0
+let blocked = 0
 const ok = (c, m) => { console.log((c ? '  PASS  ' : '  FAIL  ') + m); c ? pass++ : fail++ }
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/**
+ * 「未验到」：与失败分开打印（AGENTS §10）——本脚本默认只验“当天前 10 条留痕”，
+ * 若这 10 条里没有 chat.respond，那“长回复换行”这条就是“没东西可验”，不是缺陷。
+ */
+const skipAs = (m) => { console.log('  BLOCKED  ' + m); blocked++ }
 
-async function step(name, fn) {
-  console.log(name)
-  try { await fn() } catch (e) { fail++; console.log('  ERROR  ' + name + ' :: ' + String(e).split('\n')[0]) }
-}
-
+/**
+ * 当前**可见**弹窗的快照（文本 + 每个 JSON 块的文本/计算样式/几何量）。
+ *
+ * 为什么所有取值都必须经过它：el-dialog 关闭后 DOM 仍在（destroy-on-close=false），
+ * 而本页同时挂着「详情」「链路」两个弹窗。用全局选择器
+ * （`page.textContent('.el-dialog')`、`$$eval('.json-block__body')`）会取到隐藏或正在淡出的
+ * 那一份——它的 innerText 是空串，于是断言以“块行数 [1,1]”这类看不懂的形式**随机**失败。
+ * 写这一版时反复踩到，最终确定“单一数据源 = 可见弹窗”。
+ */
 ;(async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true })
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } })
+
+  async function dialogSnapshot() {
+    return page.evaluate(() => {
+      const dlg = [...document.querySelectorAll('.el-dialog')].find((d) => d.offsetParent !== null)
+      if (!dlg) return { found: false, text: '', blocks: [] }
+      const blocks = [...dlg.querySelectorAll('.json-block__body')].map((el) => {
+        const c = getComputedStyle(el)
+        const text = el.innerText
+        return {
+          text,
+          lines: text ? text.split('\n').length : 0,
+          whiteSpace: c.whiteSpace,
+          maxHeight: c.maxHeight,
+          overflow: el.scrollWidth - el.clientWidth
+        }
+      })
+      return { found: true, text: dlg.innerText, blocks }
+    })
+  }
+
+  /** 等“可见弹窗已经有内容”（可选：再等它里面出现某个关键词）——避免量到淡出中的旧弹窗 */
+  async function waitVisibleDialog(contains) {
+    await page.waitForFunction(
+      (needle) => {
+        const dlg = [...document.querySelectorAll('.el-dialog')].find((d) => d.offsetParent !== null)
+        if (!dlg || !dlg.querySelector('.json-block')) return false
+        return !needle || dlg.innerText.includes(needle)
+      },
+      contains || null,
+      { timeout: 10000 }
+    )
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+  async function step(name, fn) {
+    console.log(name)
+    try { await fn() } catch (e) { fail++; console.log('  ERROR  ' + name + ' :: ' + String(e).split('\n')[0]) }
+  }
+
   const errors = []
   // warning 单独收集（2026-10-02 加）：Vue 的 prop 校验失败是 warning 不是 error，
   // 只查 error 会漏掉（实测 `el-tag type="primary"` 就是这么漏过去的）。
@@ -101,14 +149,68 @@ async function step(name, fn) {
 
   await step('[5] 详情/回放：JSON 上下文可读', async () => {
     await page.locator('button:has-text("详情")').first().click({ timeout: 10000 })
-    await page.waitForSelector('.json-block', { timeout: 10000 })
-    const body = await page.textContent('.el-dialog')
-    ok(/输入上下文/.test(body), '详情包含「输入上下文」区块')
-    ok(/llm_output/.test(body), '详情包含 LLM 输出区块')
-    const jsonText = await page.textContent('.json-block__body')
+    await waitVisibleDialog()
+    const first = await dialogSnapshot()
+    ok(/输入上下文/.test(first.text), '详情包含「输入上下文」区块')
+    ok(/llm_output/.test(first.text), '详情包含 LLM 输出区块')
+    const jsonText = first.blocks[0] ? first.blocks[0].text : ''
     ok(jsonText.trim().length > 5, `JSON 上下文已渲染：${jsonText.replace(/\s+/g, ' ').trim().slice(0, 60)}`)
     // 美化过的 JSON 应带缩进（说明走的是 JSON.parse + stringify，而不是裸文本）
     ok(/\n\s{2,}/.test(jsonText), 'JSON 已格式化缩进（便于人读，不是一坨）')
+
+    // ---- 弹窗里的样式真的生效了吗（2026-10-03 回来的回归，两类根因都能抓到）----
+    // 背景：详情弹窗带 `append-to-body`，el-dialog 会把内容 **teleport 到 <body>**。
+    // 当时本页把 `.json-block*` 的样式裹在页面根类 `.agent-audit` 下，编译出的选择器是
+    // `.agent-audit .json-block__body[data-v-*]` → 祖先不在路径上 → 一律不匹配：
+    // `white-space: pre-wrap` / `max-height` / `overflow` 全部失效，长文本变成一条
+    // 6447px 的宽行（实测），既看不到换行也读不下去。
+    // 这类“样式静默失效”在纯文本断言里**看不见**（文字内容一样），所以必须查计算样式
+    // 与几何量：只断言“有文字”是抓不到它的。
+    // ⚠️ 必须**限定到可见弹窗**：el-dialog 关闭后 DOM 仍在（destroy-on-close=false），
+    // 直接 `document.querySelectorAll('.json-block__body')` 会把已关闭弹窗里那些
+    // `display:none` 的块也量进来——它们的 `innerText` 是空串（行数恒为 1），
+    // 断言就会在“上一个弹窗还挂着”时莫名其妙地失败（写这条时真的踩到了）。
+    const styles = first.blocks
+    ok(
+      styles.every((s) => s.whiteSpace === 'pre-wrap'),
+      `弹窗内 <pre> 的 white-space 生效（teleport 不得切断 scoped 样式）：${JSON.stringify(styles.map((s) => s.whiteSpace))}`
+    )
+    ok(
+      styles.every((s) => s.maxHeight !== 'none'),
+      `max-height 生效（长文本有独立滚动区）：${JSON.stringify(styles.map((s) => s.maxHeight))}`
+    )
+    ok(
+      styles.every((s) => s.overflow <= 1),
+      `无横向溢出（长文本会换行）：scrollWidth-clientWidth = ${JSON.stringify(styles.map((s) => s.overflow))}`
+    )
+
+    // ---- 长回复的换行还原（llm_output.reply 是 JSON 字符串，`\\n` 是转义）----
+    // 只在真存在多行回复时才要求：详情弹窗打开的是**第一行**，可能是补货/分析类留痕（llm_output 为空）。
+    const chatRow = page.locator('tr', { hasText: 'chat.respond' }).first()
+    if ((await chatRow.count()) > 0) {
+      await page.locator('.el-dialog__footer button:has-text("关闭")').click({ timeout: 10000 })
+      // ⚠️ 必须等**真的关掉**再开下一个：el-dialog 关闭后 DOM 仍在，而 `waitForSelector('.json-block')`
+      // 会被旧 DOM 立刻满足——于是下面量到的是"正在淡出"的那个弹窗（innerText 已为空，
+      // 行数恒为 1），断言会以“块行数 [1,1]”这种看不懂的形式失败（写这条时真的踩到了）。
+      await page.waitForFunction(
+        () => ![...document.querySelectorAll('.el-dialog')].some((d) => d.offsetParent !== null),
+        null,
+        { timeout: 10000 }
+      )
+      await chatRow.locator('button:has-text("详情")').click({ timeout: 10000 })
+      await waitVisibleDialog('chat.respond')
+      const chat = await dialogSnapshot()
+      // 真换行还原后：回复正文块的行数应明显 >1，且开头不是 `{`（那是 JSON 原文块的特征）
+      ok(
+        chat.blocks.some((b) => b.lines >= 3 && !b.text.trim().startsWith('{')),
+        // 失败信息带上每块的首行片段：否则“块行数 [1,1]”这种报错根本看不出是哪个环节
+        `多行回复已还原换行（否则整段回复就是一行）：块行数 ${JSON.stringify(chat.blocks.map((b) => b.lines))}` +
+          `；内容首行 ${JSON.stringify(chat.blocks.map((b) => b.text.trim().slice(0, 24)))}` +
+          `；弹窗标题片段 ${JSON.stringify(chat.text.replace(/\s+/g, ' ').trim().slice(0, 60))}`
+      )
+    } else {
+      skipAs('当前页没有 chat.respond 留痕，长回复换行未验到')
+    }
 
     await page.screenshot({ path: path.join(SHOT_DIR, 'agent-audit-detail.png'), fullPage: false })
     await page.locator('.el-dialog__footer button:has-text("关闭")').click({ timeout: 10000 })
@@ -157,6 +259,7 @@ async function step(name, fn) {
   })
 
   await browser.close()
-  console.log(`\n结果：PASS=${pass} FAIL=${fail}`)
-  process.exit(fail ? 1 : 0)
+  console.log(`\n结果：PASS=${pass} FAIL=${fail} BLOCKED=${blocked}`)
+  // 退出码约定（AGENTS §10）：0=全绿 / 1=有失败 / 2=有未验到；有 FAIL 时优先报 1
+  process.exit(fail ? 1 : blocked ? 2 : 0)
 })()
