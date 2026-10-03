@@ -308,8 +308,17 @@ function resultLabel(value) {
   return hit ? hit.label : String(value)
 }
 
+/**
+ * 场景 → el-tag 配色。
+ *
+ * ⚠️ 运营分析（4）返回 `''` 而非 `'primary'`：element-plus 2.4.3 的 `ElTag.type`
+ * 只接受 ["success","info","warning","danger",""]，传 `'primary'` 会每次渲染触发
+ * Vue prop 校验告警。空字符串即默认主色，与 `system/dict/data.vue` 的写法一致。
+ */
 function sceneTagType(value) {
-  return { 1: 'info', 2: 'success', 3: 'warning', 4: 'primary' }[value] || 'info'
+  // `??` 而非 `||`：`''` 是 el-tag 的默认主色（合法取值）但 falsy，
+  // 用 `||` 会被兜底成 'info'（灰色）——配色会被静默改掉。
+  return { 1: 'info', 2: 'success', 3: 'warning', 4: '' }[value] ?? 'info'
 }
 
 function resultTagType(value) {

@@ -382,8 +382,20 @@ function priorityLabel(priority) {
   return { 4: '紧急', 3: '高', 2: '中', 1: '低' }[priority] || '低'
 }
 
+/**
+ * 优先级 → el-tag 配色。
+ *
+ * ⚠️ 为什么中优先级返回 `''` 而不是 `'primary'`：element-plus 2.4.3 的 `ElTag.type`
+ * 只接受 ["success","info","warning","danger",""]，传 `'primary'` 会每次渲染触发
+ * `[Vue warn]: Invalid prop: validation failed for prop "type"`（视觉侥幸不坏——
+ * `.el-tag--primary` 的 CSS 规则存在——但控制台持续告警，且让"控制台无错误"这类
+ * 验收断言形同虚设：vite/浏览器把 Vue warn 归为 warning，而脚本只查 error）。
+ * 空字符串即 element-plus 的默认主色样式，与 `system/dict/data.vue` 的既有写法一致。
+ */
 function priorityTagType(priority) {
-  return { 4: 'danger', 3: 'warning', 2: 'primary', 1: 'info' }[priority] || 'info'
+  // ⚠️ 必须用 `??` 而不是 `||`：`''` 是 el-tag 的**默认主色**（合法取值），但它 falsy，
+  // 用 `||` 会被兜底成 `'info'`（灰色）——那不是同一个配色，等于顺手改掉了视觉。
+  return { 4: 'danger', 3: 'warning', 2: '', 1: 'info' }[priority] ?? 'info'
 }
 
 function statusLabel(status) {
@@ -403,14 +415,16 @@ function statusLabel(status) {
 function statusTagType(status) {
   return (
     {
-      [STATUS.SUGGESTED]: 'primary',
+      // `''` = element-plus 默认主色（`'primary'` 不是合法 type，见 priorityTagType 注释）
+      [STATUS.SUGGESTED]: '',
       [STATUS.ADJUSTED]: 'warning',
       [STATUS.SKIPPED]: 'info',
       [STATUS.ORDERED]: 'success',
       [STATUS.REVIEWED]: 'success',
       [STATUS.UNASSIGNED]: 'warning',
       [STATUS.ORDERING]: 'warning'
-    }[status] || 'info'
+      // `??`：见 priorityTagType 注释（空串是默认主色，不能被 `||` 吃掉）
+    }[status] ?? 'info'
   )
 }
 
