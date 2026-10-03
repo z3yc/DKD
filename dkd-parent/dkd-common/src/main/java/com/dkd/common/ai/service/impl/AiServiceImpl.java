@@ -350,34 +350,91 @@ public class AiServiceImpl implements IAiService {
             
             String result = response.body();
             int status = response.getStatus();
-            
-            // 打印原始响应，排查报错原因
-            log.info("AI 接口响应: Status={}, Body={}", status, result);
-            
-            // 检查 HTTP 状态码
+
+            // ⚠️ 这里**不再打印上游响应体**（原来 `Body={}` 整段打印）。
+            // 理由（AGENTS §6.1「日志中禁止输出完整 LLM 请求/响应体」）：401 响应体里带
+            // 凭据指纹（实测 `Your api key: ****48a8 is invalid`），INFO 级别常开 = 凭据线索常年落在日志里。
+            // 仍保留可定位的最小上下文：状态码 + 上游给的可读原因（截断），原始体降级到 DEBUG。
             if (status != 200) {
-                return "AI 接口请求失败 (Status " + status + "): " + result;
+                log.warn("调用 AI 接口失败: status={}, upstreamMessage={}", status, extractErrorMessage(result));
+                log.debug("AI 接口原始响应体: {}", result);
+                return describeFailureByStatus(status);
             }
-            
+            log.debug("AI 接口响应: status={}, bodyLength={}", status,
+                    result == null ? 0 : result.length());
+
             // 解析 JSON
             JSONObject json = JSONUtil.parseObj(result);
             
             // 检查是否包含 API 返回的错误信息
+            // ⚠️ 原实现把上游 `error.message` 原样拼接后返回给前端渲染（实测走到了终端用户眼前）。
+            // 该字段由上游控制，可能含凭据指纹与内部请求 ID —— 改为"日志留真因、界面给可执行文案"。
             if (json.containsKey("error")) {
-                return "AI API 报错: " + json.getJSONObject("error").getStr("message");
+                log.warn("AI 接口返回错误对象（HTTP 200）: upstreamMessage={}", extractErrorMessage(result));
+                return "AI 服务返回错误，请联系管理员核对 API Key 与模型配置";
             }
             
             JSONArray choices = json.getJSONArray("choices");
             if (choices != null && !choices.isEmpty()) {
                 return choices.getJSONObject(0).getJSONObject("message").getStr("content");
             }
-            
-            return "AI 响应解析为空：" + result;
+
+            log.warn("AI 接口响应无 choices 字段: status={}, bodyLength={}", status,
+                    result == null ? 0 : result.length());
+            return "AI 服务返回内容为空，请稍后再试";
             
         } catch (Exception e) {
             log.error("调用 AI 发生异常", e);
-            // 捕获 JSON 解析异常或其他网络异常
-            return "系统处理失败：" + e.getMessage();
+            // 捕获 JSON 解析异常或其他网络异常。
+            // 不回传 `e.getMessage()`：异常文案可能含内部地址/实现细节，运营看不懂也帮不上排查。
+            return "AI 服务调用异常，请稍后再试（详情见服务端日志）";
         }
+    }
+
+    /**
+     * 按 HTTP 状态码给出**可直接行动**的用户文案（不把上游原始响应体回传前端）。
+     *
+     * 为什么分状态码而不是统一 "接口请求失败"：鉴权失败（运维要改 Key）、被限流（等一会儿
+     * 就行）、上游故障（报障）三者的下一步动作完全不同，合成一条会把"改配置"和"稍后重试"混在一起。
+     */
+    private static String describeFailureByStatus(int status) {
+        if (status == 401 || status == 403) {
+            return "AI 服务鉴权失败（HTTP " + status + "），请联系管理员核对 API Key 配置";
+        }
+        if (status == 429) {
+            return "AI 服务调用过于频繁（HTTP 429），请稍后再试";
+        }
+        if (status >= 500) {
+            return "AI 服务暂时不可用（HTTP " + status + "），请稍后再试";
+        }
+        return "AI 服务调用失败（HTTP " + status + "），请稍后再试";
+    }
+
+    /**
+     * 只提取上游错误对象里的 `message`（截断到 200 字）用于日志，避免整段响应体入日志。
+     *
+     * 解析失败时返回占位符而不是抛异常——错误路径上的解析不能再制造错误。
+     */
+    private static String extractErrorMessage(String body) {
+        if (body == null || body.isEmpty()) {
+            return "(空响应体)";
+        }
+        try {
+            JSONObject json = JSONUtil.parseObj(body);
+            JSONObject error = json.getJSONObject("error");
+            if (error != null && error.getStr("message") != null) {
+                return truncate(error.getStr("message"), 200);
+            }
+        } catch (Exception ignored) {
+            // 上游返回非 JSON（网关 HTML、超时占位等）：降级为截断原文，仍比整段入日志小
+        }
+        return truncate(body, 200);
+    }
+
+    private static String truncate(String text, int max) {
+        if (text == null) {
+            return "";
+        }
+        return text.length() <= max ? text : text.substring(0, max) + "…(truncated)";
     }
 }
