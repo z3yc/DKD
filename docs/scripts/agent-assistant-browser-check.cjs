@@ -33,7 +33,12 @@ async function step(name, fn) {
   const browser = await chromium.launch({ channel: 'chrome', headless: true })
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
   const errors = []
-  page.on('console', m => { if (m.type() === 'error') errors.push(m.text()) })
+  // warning 单独收集（2026-10-02 加）：Vue prop 校验失败是 warning，只查 error 会漏。
+  const warnings = []
+  page.on('console', m => {
+    if (m.type() === 'error') errors.push(m.text())
+    else if (m.type() === 'warning') warnings.push(m.text())
+  })
   page.on('pageerror', e => errors.push(String(e)))
 
   await step('[1] 登录并打开抽屉', async () => {
@@ -100,6 +105,8 @@ async function step(name, fn) {
   await step('[6] 控制台错误', async () => {
     const real = errors.filter(e => !/favicon|ResizeObserver|DevTools/i.test(e))
     ok(real.length === 0, `无前端错误（${real.length} 条）` + (real[0] ? ' :: ' + real[0].slice(0, 120) : ''))
+    const realWarn = warnings.filter(w => !/favicon|ResizeObserver|DevTools/i.test(w))
+    ok(realWarn.length === 0, `无前端警告（${realWarn.length} 条）` + (realWarn[0] ? ' :: ' + realWarn[0].slice(0, 120) : ''))
   })
 
   await browser.close()

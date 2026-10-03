@@ -31,7 +31,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   const browser = await chromium.launch({ channel: 'chrome', headless: true })
   const page = await browser.newPage({ viewport: { width: 1560, height: 980 } })
   const errors = []
-  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()) })
+  // warning 单独收集（2026-10-02 加）：Vue prop 校验失败是 warning，只查 error 会漏。
+  const warnings = []
+  page.on('console', (m) => {
+    if (m.type() === 'error') errors.push(m.text())
+    else if (m.type() === 'warning') warnings.push(m.text())
+  })
   page.on('pageerror', (e) => errors.push(String(e)))
 
   console.log(`\n[期望模式] ${EXPECT}`)
@@ -86,6 +91,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   await page.screenshot({ path: `f:/tmp/assistant-mode-${EXPECT}.png`, fullPage: false })
   const real = errors.filter((e) => !/favicon|ResizeObserver/i.test(e))
   ok(real.length === 0, real.length ? `控制台错误：${real.slice(0, 2).join(' | ')}` : '控制台无错误')
+  const realWarn = warnings.filter((w) => !/favicon|ResizeObserver/i.test(w))
+  ok(realWarn.length === 0, realWarn.length ? `控制台警告：${realWarn.slice(0, 2).join(' | ')}` : '控制台无警告')
 
   await browser.close()
   console.log(`\n结果：PASS=${pass} FAIL=${fail}`)

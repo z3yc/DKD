@@ -37,7 +37,13 @@ async function step(name, fn) {
   const browser = await chromium.launch({ channel: 'chrome', headless: true })
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } })
   const errors = []
-  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()) })
+  // warning 单独收集（2026-10-02 加）：Vue 的 prop 校验失败是 warning 不是 error，
+  // 只查 error 会漏掉（实测 `el-tag type="primary"` 就是这么漏过去的）。
+  const warnings = []
+  page.on('console', (m) => {
+    if (m.type() === 'error') errors.push(m.text())
+    else if (m.type() === 'warning') warnings.push(m.text())
+  })
   page.on('pageerror', (e) => errors.push(String(e)))
 
   await step('[1] 登录 → AI 智能体 → 决策审计（菜单与动态路由）', async () => {
@@ -146,6 +152,8 @@ async function step(name, fn) {
     console.log('      截图：' + path.join(SHOT_DIR, 'agent-audit.png'))
     const real = errors.filter((e) => !/favicon|ResizeObserver/i.test(e))
     ok(real.length === 0, real.length ? `控制台错误 ${real.length} 条：${real.slice(0, 2).join(' | ')}` : '控制台无错误')
+    const realWarn = warnings.filter((w) => !/favicon|ResizeObserver/i.test(w))
+    ok(realWarn.length === 0, realWarn.length ? `控制台警告 ${realWarn.length} 条：${realWarn.slice(0, 2).join(' | ')}` : '控制台无警告')
   })
 
   await browser.close()

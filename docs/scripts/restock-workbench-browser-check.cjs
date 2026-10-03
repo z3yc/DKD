@@ -30,7 +30,20 @@ const BASE = 'http://127.0.0.1'
 const SHOT_DIR = process.env.SHOT_DIR || os.tmpdir()
 let pass = 0
 let fail = 0
+/**
+ * 「未验到」计数（AGENTS §10）：与失败**分开**统计，并用不同退出码（0 全绿 / 1 有失败 / 2 有未验到）。
+ *
+ * 为什么必须分开（2026-10-03 实测踩到）：本脚本按**当日**取计划，而当日 06:00 的定时分析
+ * 尚未跑（凌晨 1 点复跑）时计划数为 0，于是 [3]~[6] 连带报出 **7 条 FAIL**——看起来像是
+ * “补货工作台坏了”，实际只是“今天还没生成计划，没东西可验”。
+ * 把“环境还没准备好”报成“产品有缺陷”，后果是团队开始忽略这套脚本（真回归反而没人看），
+ * 接着就会有人为了让报告变绿而改断言——那正好毁掉门禁。
+ */
+let blocked = 0
 const ok = (c, m) => { console.log((c ? '  PASS  ' : '  FAIL  ') + m); c ? pass++ : fail++ }
+const skipAs = (m) => { console.log('  BLOCKED  ' + m); blocked++ }
+/** 当日没有计划 → 数据相关步骤一律记 BLOCKED，而不是让它们连带报 FAIL */
+let noPlansForDay = false
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 /**
@@ -82,7 +95,16 @@ function countOpenTasks() {
   const page = await browser.newPage({ viewport: { width: 1560, height: 980 } })
   const openTasksBefore = countOpenTasks()
   const errors = []
-  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()) })
+  // 为什么要单独收集 warning（2026-10-02 加）：element-plus 的 prop 校验失败只产生
+  // `[Vue warn] ...`（type=warning），**不是 error**，只查 error 的断言永远为绿。
+  // 实测踩到过一次真遗漏：`el-tag type="primary"` 在 element-plus 2.4.3 属非法 type，
+  // 本页每次渲染都打警告，而本脚本报“控制台无错误”——视觉侥幸没坏（`.el-tag--primary`
+  // 的 CSS 规则确实存在），所以只有断言层拦得住这类问题。
+  const warnings = []
+  page.on('console', (m) => {
+    if (m.type() === 'error') errors.push(m.text())
+    else if (m.type() === 'warning') warnings.push(m.text())
+  })
   page.on('pageerror', (e) => errors.push(String(e)))
 
   await step('[1] 登录并进入补货工作台（菜单走 sys_menu 动态路由）', async () => {
@@ -120,6 +142,19 @@ function countOpenTasks() {
 
   await step('[3] 真实数据渲染（来自 /agent/restock/plans）', async () => {
     const rows = await page.locator('.el-table__body-wrapper tbody tr.el-table__row').count()
+    if (rows === 0) {
+      // 前置未就绪：当日计划为空（多为“当日 06:00 定时分析尚未跑”或已暂停自动分析）。
+      // 此时“验不到”才是事实，不能写成产品 FAIL。
+      noPlansForDay = true
+      const bodyText = (await page.textContent('body')) || ''
+      // 页面文案是「计划日期 2026-10-03共 0 台设备」，只取日期本体（`\S+` 会多吞一个「共」）
+      const shown = (bodyText.match(/计划日期\s*(\d{4}-\d{2}-\d{2})/) || [])[1] || '今日'
+      skipAs(
+        `当日（${shown}）无补货计划，本步骤及后续数据相关断言**未验到**；` +
+          '先跑 `POST /agents/restock/analyze`（或选一个有计划的历史日期）再复跑本脚本'
+      )
+      return
+    }
     ok(rows === 3, `计划行数 = ${rows}（与 agent_restock_plan 当日 3 行一致）`)
 
     const body = await page.textContent('.restock-page')
@@ -132,6 +167,7 @@ function countOpenTasks() {
   })
 
   await step('[4] 展开「依据」可见 Agent 理由', async () => {
+    if (noPlansForDay) return skipAs('[4] 跳过：当日无计划（见 [3]）')
     const expander = page.locator('.el-table__expand-icon').first()
     await expander.click({ timeout: 10000 })
     await sleep(600)
@@ -143,6 +179,7 @@ function countOpenTasks() {
   })
 
   await step('[5] 调整弹窗：两种模式互斥 + 原因必填客户端拦截', async () => {
+    if (noPlansForDay) return skipAs('[5] 跳过：当日无计划（见 [3]）')
     await page.locator('button:has-text("调整")').first().click({ timeout: 10000 })
     await page.waitForSelector('.adjust-dlg', { timeout: 10000 })
     ok(true, '调整弹窗打开')
@@ -176,6 +213,7 @@ function countOpenTasks() {
   })
 
   await step('[6] 跳过弹窗：原因必填 + 快选 chips', async () => {
+    if (noPlansForDay) return skipAs('[6] 跳过：当日无计划（见 [3]）')
     // ⚠️ 选择器坑（本轮实测踩到）：Playwright 的 `:has-text()` 是**子串**匹配，
     // `button:has-text("跳过")` 会先命状态筛选 chip「已跳过」（DOM 顺序在表格之前），
     // 于是点到了筛选器而不是行内按钮——表现是"弹窗没出来"，很容易误判成产品 bug。
@@ -242,6 +280,9 @@ function countOpenTasks() {
     console.log('      截图：' + path.join(SHOT_DIR, 'restock-paused.png'))
     const real = errors.filter((e) => !/favicon|ResizeObserver/i.test(e))
     ok(real.length === 0, real.length ? `控制台错误 ${real.length} 条：${real.slice(0, 3).join(' | ')}` : '控制台无错误')
+    // 与 errors 分开计分：warning 多为“能跑但写法有问题”，混在一起会让人不知道先修哪个
+    const realWarn = warnings.filter((w) => !/favicon|ResizeObserver/i.test(w))
+    ok(realWarn.length === 0, realWarn.length ? `控制台警告 ${realWarn.length} 条：${realWarn.slice(0, 3).join(' | ')}` : '控制台无警告')
   })
 
   await step('[9] 写入护栏：本次运行不得新增活跃工单', async () => {
@@ -253,7 +294,51 @@ function countOpenTasks() {
     ok(after <= openTasksBefore, `活跃工单数 ${openTasksBefore} -> ${after}（脚本不应产生业务写入）`)
   })
 
+  await step('[10] 会话过期时给「可重新登录」的处置（FIX-39 回归）', async () => {
+    // 为什么必须有这一条（2026-10-03 实测报障）：本工作台的 API 层（`api/manage/restock.js`）
+    // **刻意绕开 axios** 以保住后端给的真实状态码与业务文案（400/409/422/502），
+    // 而 axios 拦截器正是承载「登录状态已过期 → 重新登录」的地方。
+    // 绕开之后只往返回值里塞了个 `unauthorized` 标记，而**没有任何视图消费它**，
+    // 于是运营看到的是 RuoYi 原文「请求访问：/agent/restock/plans/97/adjust，认证失败，
+    // 无法访问系统资源」——既不知道是自己登录过期，也没有重新登录的入口。
+    const original = await page.evaluate(
+      () => (document.cookie.match(/Admin-Token=([^;]+)/) || [])[1] || ''
+    )
+    if (!original) {
+      skipAs('读不到 Admin-Token（未登录态），会话过期用例未验到')
+      return
+    }
+    try {
+      // 伪造过期令牌：只改 cookie，不动真实会话（finally 里恢复）
+      await page.evaluate(() => { document.cookie = 'Admin-Token=garbage.expired.token;path=/' })
+      await page.locator('button:has-text("调整")').first().click({ timeout: 10000 })
+      await page.waitForSelector('.adjust-dlg', { timeout: 10000 })
+      await page.locator('.adjust-dlg__chips .el-button').first().click()
+      await page.locator('.el-dialog button:has-text("保存调整")').first().click({ timeout: 10000 })
+      await page.waitForSelector('.el-message-box', { timeout: 10000 })
+      const box = (await page.textContent('.el-message-box')) || ''
+      const flat = box.replace(/\s+/g, ' ').trim()
+      ok(/登录状态已过期/.test(box), `过期时弹出可行动的重新登录提示：${flat.slice(0, 40)}`)
+      ok(!/请求访问：|认证失败，无法访问系统资源/.test(box), '不再把框架原文用给用户')
+      await page.locator('.el-message-box button:has-text("取消")').click({ timeout: 10000 })
+      await page.locator('.el-message-box').first().waitFor({ state: 'hidden', timeout: 10000 })
+      await visibleCancel(page).click({ timeout: 10000 })
+      await page.locator('.adjust-dlg').first().waitFor({ state: 'hidden', timeout: 10000 })
+    } finally {
+      // 脚本不得把环境留在过期态（否则后续步骤/下一轮运行全部误报）
+      await page.evaluate((t) => { document.cookie = 'Admin-Token=' + t + ';path=/' }, original)
+    }
+    const restored = await page.evaluate(
+      () => (document.cookie.match(/Admin-Token=([^;]+)/) || [])[1] || ''
+    )
+    ok(restored.length === original.length, '会话令牌已恢复（未把环境留在过期态）')
+  })
+
   await browser.close()
-  console.log(`\n结果：PASS=${pass} FAIL=${fail}`)
-  process.exit(fail ? 1 : 0)
+  console.log(`\n结果：PASS=${pass} FAIL=${fail} BLOCKED=${blocked}`)
+  if (blocked) {
+    console.log('提示：BLOCKED 表示“本机没有可验数据”，不是缺陷（AGENTS §10）；退出码 2 便于与 FAIL 区分')
+  }
+  // 退出码约定（AGENTS §10）：0=全绿 / 1=有失败 / 2=有未验到。有 FAIL 时优先报 1。
+  process.exit(fail ? 1 : blocked ? 2 : 0)
 })()
