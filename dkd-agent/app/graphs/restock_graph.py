@@ -564,7 +564,7 @@ def build_restock_graph(
 
     graph = StateGraph(RestockState)
     graph.add_node("analyze", analyze)
-    graph.add_node("calibrate", _wrap_calibration(model))
+    graph.add_node("calibrate", _wrap_calibration(deps, model))
     graph.add_node("await_confirmation", await_confirmation)
     graph.add_node("apply_decisions", apply_decisions)
     graph.add_node("create_tasks", create_tasks)
@@ -578,11 +578,29 @@ def build_restock_graph(
     return graph.compile(checkpointer=checkpointer)
 
 
-def _wrap_calibration(model: Any | None) -> Callable[[RestockState], Awaitable[dict[str, Any]]]:
-    """把 1-5 的校准节点包成图节点（注入假模型，测试不打真实 LLM）。"""
+def _wrap_calibration(
+    deps: RestockDeps, model: Any | None
+) -> Callable[[RestockState], Awaitable[dict[str, Any]]]:
+    """把 1-5 的校准节点包成图节点（注入假模型，测试不打真实 LLM）。
+
+    除调用校准外，本包装还要把**校准后的计划回写数据库**（F-8，具体原因见函数内注释）：
+    `calibrate_state_node` 自己只改 state、不碰存储，而它是唯一能看到校准结果的地方。
+    """
 
     async def calibrate(state: RestockState) -> dict[str, Any]:
-        return await calibrate_state_node(state, model=model)
+        result = await calibrate_state_node(state, model=model)
+        # ⚠️ 为什么必须在这里回写（F-8，2026-10-03 真环境实测）：
+        # 落库发生在 `analyze` 节点，而校准在它**之后**——原实现只把校准结果写进 state。
+        # 后果是两个数同时存在且都“看上去对”：
+        #   · 工作台读 `agent_restock_plan` → 校准**前**的建议量（实测 7/8/5 = 20 件）；
+        #   · 中断载荷 / `create_tasks` 用 state → 校准**后**的建议量（实测 7/8/6 = 21 件）。
+        # 运营在界面上看到 20 件、点确认，系统按 21 件建单（AGENTS §1 把数据一致性排在
+        # 安全红线之后第二位）。同样地，1-5 要求“依据”能看到校准理由——依据也存在库里，
+        # 不回写就等于校准对运营不可见。
+        # 幂等性：`upsert_plan` 本身幂等，且本节点在中断**之前**，不会因恢复而重复触发。
+        for raw in result.get("plans") or []:
+            await deps.save_plan(_as_plan(raw))
+        return result
 
     return calibrate
 

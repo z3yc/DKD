@@ -127,6 +127,18 @@ def _settings(**overrides: object) -> Settings:
     return Settings(_env_file=None, **base)  # type: ignore[arg-type]
 
 
+def _last_saved(deps: FakeDeps, vm_id: int) -> Any:
+    """取某设备**最后一次**落库的计划。
+
+    同一 vm 在一次运行里会被保存两次（F-8 后的刻意设计）：
+    `analyze` 存统计基线 → `calibrate` 存校准后的建议。
+    真正生效（= 工作台展示、与实际建单一致）的是最后一次。
+    """
+    saved = [p for p in deps.saved_plans if p.vm_id == vm_id]
+    assert saved, f"vm {vm_id} 没有任何落库记录"
+    return saved[-1]
+
+
 async def _interrupt_value(result: dict[str, Any]) -> dict[str, Any]:
     """取出 interrupt 载荷。
 
@@ -167,11 +179,18 @@ async def test_graph_pauses_at_confirmation_and_persists_suggested_plan(tmp_path
     assert payload["plan_date"] == PLAN_DATE
     assert len(payload["plans"]) == 1
 
-    # 中断前必须已经落库：06:00 定时任务即使没人确认，工作台也要能看到待确认清单
-    assert len(deps.saved_plans) == 1
-    plan = deps.saved_plans[0]
+    # 中断前必须已经落库：06:00 定时任务即使没人确认，工作台也要能看到待确认清单。
+    # 落**两次**是刻意的（F-8）：analyze 存统计基线，calibrate 存校准后的建议——
+    # 只存前者会让库里（工作台）与 state（实际建单）各说一个数。
+    assert len(deps.saved_plans) == 2, "analyze（基线）+ calibrate（校准后）各落一次"
+    plan = _last_saved(deps, 80)
     assert plan.status == PLAN_STATUS_SUGGESTED
     assert plan.items[0].suggested_quantity > 0
+    # ★ F-8 不变量：**库里那条**必须与中断载荷（= 运营看到并确认的量、= 实际建单采用的量）逐字一致。
+    # 本用例的假模型不做校准，所以两次落库同值；带系数的场景见
+    # `test_calibrated_quantity_is_persisted_so_ui_matches_state`。
+    assert plan.items[0].suggested_quantity == payload["plans"][0]["items"][0]["suggestedQuantity"]
+    assert plan.total_quantity == payload["plans"][0]["totalQuantity"]
     # 无接单人（1-8 未落地）：不得伪造
     assert plan.assignee_id is None
     assert deps.created == [], "未确认前不得建单"
@@ -326,7 +345,7 @@ async def test_interrupt_survives_process_restart(tmp_path):
             new_restock_state(plan_date=PLAN_DATE, request_id="rid-restart"), config
         )
         assert await _interrupt_value(paused), "第一次运行应停在人工确认"
-        assert len(deps1.saved_plans) == 1
+        assert len(deps1.saved_plans) == 2, "analyze（基线）+ calibrate（校准后）"
     finally:
         await store1.close()
 
@@ -399,6 +418,47 @@ async def test_repeat_invoke_same_thread_reupserts_without_error(tmp_path):
         await store.close()
 
     assert await _interrupt_value(first) == await _interrupt_value(second)
-    assert len(deps.saved_plans) == 2, "两次都跑了取数+落库（幂等由存储层的唯一键保证，不是靠跳过）"
-    assert [plan.vm_id for plan in deps.saved_plans] == [80, 80]
+    # 每次运行都完整跑「取数 → 基线落库 → 校准 → 校准后落库」（幂等由存储层唯一键保证，不是靠跳过）
+    assert len(deps.saved_plans) == 4, "两次运行 × （基线 + 校准后）"
+    assert [plan.vm_id for plan in deps.saved_plans] == [80, 80, 80, 80]
     assert second.get("failures") == [], "重跑不得把第一次的结果记成失败"
+
+
+async def test_calibrated_quantity_is_persisted_so_ui_matches_state(tmp_path):
+    """F-8 回归：校准后的建议量必须**落库**，否则工作台与实际建单是两个数。
+
+    实测形态（2026-10-03 真环境）：库中 7/8/5 = 20 件，而 state / 中断载荷 = 21 件——
+    因为落库发生在 `analyze`、校准在它之后，且校准结果从不回写。
+    运营在界面上看到 20 件并点确认，`create_tasks` 却按 21 件建单。
+
+    本用例用**带系数**的假模型让两次落库真的不同，从而：
+      ① 断言最后一次落库 = 校准后的量（只看 `deps.saved_plans[0]` 会假绿）；
+      ② 断言库中那条与中断载荷逐字一致（这才是运营对得上的那个数）。
+    """
+    deps = FakeDeps(stock=_stock(), daily=_daily(), assignee=(10, "孙权"))
+    # 假模型把货道 1-1 的系数放大到上限 1.5，保证校准后的量与基线**不同**
+    model = FakeModel(
+        content='{"calibrations": [{"channelCode": "1-1", "factor": 1.5, "reason": "节前客流"}]}'
+    )
+    graph, store = await _open_graph(tmp_path / "f8.db", deps, model=model)
+    try:
+        result = await graph.ainvoke(
+            new_restock_state(plan_date=PLAN_DATE, request_id="rid-f8"),
+            {"configurable": {"thread_id": THREAD}},
+        )
+    finally:
+        await store.close()
+
+    payload = await _interrupt_value(result)
+    baseline = deps.saved_plans[0].items[0].suggested_quantity
+    calibrated = _last_saved(deps, 80).items[0].suggested_quantity
+
+    assert len(deps.saved_plans) == 2, "两次落库都要发生（基线 + 校准后）"
+    assert calibrated != baseline, (
+        "本用例必须让校准真的改变数量（否则「回写」与「不回写」结果相同，断言失去意义）"
+    )
+    # ★ 库里的量 == 中断载荷的量 == 未来建单采用的量
+    assert calibrated == payload["plans"][0]["items"][0]["suggestedQuantity"]
+    assert _last_saved(deps, 80).total_quantity == payload["plans"][0]["totalQuantity"]
+    # 反向：基线值**不能**是最终留在库里的那个（这正是 F-8 的错法）
+    assert baseline not in {p.items[0].suggested_quantity for p in [deps.saved_plans[-1]]}
