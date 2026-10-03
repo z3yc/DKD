@@ -71,7 +71,7 @@
       :closable="false"
       show-icon
       title="审计留痕只读"
-      description="本页展示智能体对业务数据的每一次写操作决策（含成功 / 幂等 / 被拒绝 / 失败四条路径）。留痕由智能体服务写入，后台不提供修改与删除。"
+      description="本页展示智能体的完整决策留痕：业务写操作（含成功 / 幂等 / 被拒绝 / 失败四条路径）与会话问答（chat.respond，用于链路追踪与 token 计量）。留痕由智能体服务写入，后台不提供修改与删除。"
     />
 
     <el-table v-loading="loading" :data="logList" border size="small" row-key="id">
