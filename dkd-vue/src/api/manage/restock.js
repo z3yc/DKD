@@ -1,4 +1,5 @@
 import { getToken } from '@/utils/auth'
+import { handleSessionExpired, SESSION_EXPIRED_MSG } from '@/utils/sessionExpired'
 
 /**
  * 智能补货工作台 API（后端：排期任务 1-7；前端：1-10 / 1-11）
@@ -72,10 +73,16 @@ async function call(url, opts) {
   }
   // RuoYi 的认证失败是 HTTP 200 + code=401，必须先看信封 code（0-11 已踩过同款坑）
   if (payload.code === 401) {
+    // ⚠️ 不能只把这个标记扔在返回值里（2026-10-03 实测报障）：本文件刻意绕开了 axios 拦截器，
+    // 而拦截器正是承载「提示 + 重新登录」的地方。此前没有任何视图消费 `unauthorized`，
+    // 于是运营看到的是 RuoYi 原文「请求访问：/agent/restock/plans/97/adjust，认证失败，
+    // 无法访问系统资源」——既不知道是自己登录过期，也没有重新登录的入口。
+    // 现在统一走 utils/sessionExpired（与 axios 链路同一份实现），并把文案换成可行动的。
+    handleSessionExpired()
     return {
       ok: false,
       code: 401,
-      msg: payload.msg || '登录状态已过期，请重新登录',
+      msg: SESSION_EXPIRED_MSG + '，请重新登录后再操作',
       unauthorized: true
     }
   }

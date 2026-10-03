@@ -12,6 +12,9 @@
  *   3) 心跳/空闲超时：长时间收不到任何字节即中止，避免"假死"占住界面。
  */
 
+// 会话过期处置（绕开 axios 的链路共用同一份实现，理由见 utils/sessionExpired.js）
+import { handleSessionExpired } from '@/utils/sessionExpired'
+
 import { getToken } from '@/utils/auth'
 import { extractFrames, parseFrame, parseData } from '@/utils/sseFrames'
 
@@ -118,6 +121,11 @@ export function openSseStream(options) {
       } catch (e) {
         // 响应体不是 JSON，保留默认提示（不得把原始报文透给用户）
         message = message + '（HTTP ' + response.status + '）'
+      }
+      if (unauthorized) {
+        // 对话中途过期（长会话很常见）：与 axios 链路同一份处置，
+        // 否则用户只能对着一个"认证失败"的错误气泡，无从下手。
+        handleSessionExpired()
       }
       const degradeError = new Error(message)
       degradeError.code = code

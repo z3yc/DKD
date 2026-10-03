@@ -1,5 +1,6 @@
 import { openSseStream } from '@/utils/sse'
 import { getToken } from '@/utils/auth'
+import { handleSessionExpired } from '@/utils/sessionExpired'
 
 /**
  * 智能体网关 API（排期任务 0-11）
@@ -80,6 +81,9 @@ export function probeAgentStatus() {
     .then((payload) => {
       // RuoYi 的认证失败是 HTTP 200 + code=401，必须先看信封 code，否则会把"登录过期"误报成"服务不可用"
       if (payload && payload.code === 401) {
+        // 探活时就把「重新登录」摆出来：抽屉横幅文案已经是"登录状态已过期"，
+        // 但此前只是告知、没有入口（用户唯一能做的只有刷新页面）。
+        handleSessionExpired()
         return { enabled: false, upstream: 'down', unauthorized: true }
       }
       const data = (payload && payload.data) || {}
