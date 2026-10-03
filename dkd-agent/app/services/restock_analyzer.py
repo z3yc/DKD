@@ -178,10 +178,20 @@ class RestockAnalyzer:
         plans = list(result.get("plans") or [])
         device_count = len(plans)
         channel_count = sum(len(plan.get("items") or []) for plan in plans)
-        total_quantity = sum(int(plan.get("total_quantity") or 0) for plan in plans)
+        # ⚠️ 必须逐**货道**累加，不能读 `plan["total_quantity"]`（F-7，2026-10-03 实测）。
+        # 冻结 state schema 写明 `plans` 是 `RestockPlan.model_dump()` 列表，而 `total_quantity`
+        # 是 `RestockPlan` 上的 **@property**（不是字段）——property 不会进 model_dump，
+        # 所以 `plan.get("total_quantity")` 恒为 None → 该字段**恒报 0**。
+        # 危害不是“数字难看”，而是**观测失真**：库中真生成了 20 件建议，定时任务日志与留痕却写 0，
+        # 出事时“建议数突然掉了”这类信号根本不会出现（AGENTS §6.4 要的就是告警可信）。
+        total_quantity = sum(
+            int(item.get("suggested_quantity") or 0)
+            for plan in plans
+            for item in (plan.get("items") or [])
+        )
         interrupted = bool(result.get("__interrupt__"))
         logger.info(
-            "补货分析完成 plan_date=%s 设备=%s 货道=%s 建议总数=%s 中断=%s",
+            "补货分析完成 plan_date=%s 设备=%s 货道=%s 建议总量=%s 中断=%s",
             date_text,
             device_count,
             channel_count,

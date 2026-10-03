@@ -143,14 +143,56 @@ async def test_explicit_plan_date_overrides_today_provider():
 
 
 def _plans_payload() -> dict[str, Any]:
+    """图返回的 plans **必须逐字按生产形状**构造（F-7 的教训）。
+
+    旧固件写的是 `{"total_quantity": 12, "items": [...]}`——这个键**生产中根本不存在**：
+    冻结 state schema 里 `plans` 是 `RestockPlan.model_dump()` 列表，而 `total_quantity`
+    是 Pydantic **@property**，不会出现在 dump 里。于是固件造出了一个假形状、单测全绿，
+    而线上 `totalQuantity` 恒报 0（库里有 20 件）。
+
+    本固件现在照抄真实 dump 的字段名（见 `RestockPlan` / `RestockItem` 的 snake_case 字段），
+    并额外加一条**防漂移断言**：只要有人再往固件里塞属性名而非字段名，`test_plans_payload_matches_real_dump`
+    会当场失败。
+    """
     return {
         "plans": [
-            {"total_quantity": 12, "items": [{"channelCode": "1-1"}, {"channelCode": "1-2"}]},
-            {"total_quantity": 5, "items": [{"channelCode": "2-1"}]},
+            {
+                "vm_id": 80,
+                "inner_code": "A1000001",
+                "items": [
+                    {"channel_code": "1-1", "suggested_quantity": 7},
+                    {"channel_code": "1-2", "suggested_quantity": 5},
+                ],
+            },
+            {
+                "vm_id": 86,
+                "inner_code": "aim5xu4I",
+                "items": [{"channel_code": "2-1", "suggested_quantity": 5}],
+            },
         ],
         "calibration_notes": {"80": {"factors": []}},
         "__interrupt__": ("interrupt-payload",),
     }
+
+
+def test_plans_payload_matches_real_dump():
+    """固件里的 plan 键必须与 `RestockPlan.model_dump()` 的字段集合一致（防再次造出假形状）。
+
+    这条断言专治 F-7 那类“固件比生产更宽松”的假绿：手写 dict 永远能自洽，
+    只有跟真实模型对账才能发现“这个键生产里没有”。
+    """
+    from app.graphs.restock_state import RestockPlan
+
+    field_names = set(RestockPlan.model_fields.keys())
+    for plan in _plans_payload()["plans"]:
+        unknown = set(plan.keys()) - field_names
+        assert not unknown, (
+            f"固件里出现了 RestockPlan 没有的字段 {unknown}（例如属性 total_quantity）——"
+            "这会让单测通过而生产静默报 0"
+        )
+    assert "total_quantity" not in field_names, (
+        "total_quantity 是 @property 而不是字段：读它必须逐货道累加 suggested_quantity"
+    )
 
 
 async def test_analyzed_run_reports_counts_and_audits():

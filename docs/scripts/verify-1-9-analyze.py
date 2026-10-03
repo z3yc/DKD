@@ -261,6 +261,16 @@ async def run() -> int:
                     len(live) == data.get("deviceCount"),
                     f"库中 {len(live)} 行 / 返回 {data.get('deviceCount')} 台设备",
                 )
+                # F-7（2026-10-03 实测）：此前 `totalQuantity` **恒报 0**——分析器读了 `total_quantity`，
+                # 而它是 RestockPlan 的 @property，不会进 model_dump（图里传的是 dump 后的 dict）。
+                # 库中真生成了 20 件建议，响应却写 0：定时任务日志/留痕全被污染。
+                # 所以这个字段必须与**库中实值**对账，而不是跟自己打印的数字对账（后者读不出发报错）。
+                db_total = sum(int(r["total_quantity"] or 0) for r in live)
+                check(
+                    "返回的建议总量与库中实值一致（F-7 回归）",
+                    data.get("totalQuantity") == db_total,
+                    f"返回 {data.get('totalQuantity')} / 库中 {db_total}",
+                )
 
                 section("[D] 任务重入安全（同一日期重复触发）")
                 rid_repeat = f"{RUN_TAG}-repeat"
