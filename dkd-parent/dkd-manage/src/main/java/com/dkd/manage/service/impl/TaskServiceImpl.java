@@ -307,28 +307,59 @@ public class TaskServiceImpl implements ITaskService
         return date + StrUtil.padPre(redisTemplate.opsForValue().increment(key).toString(), 4, "0");
     }
     /**
-     * 校验工单信息
+     * 校验「设备状态 × 工单类型」是否允许建单。
+     *
+     * <p>2026-10-26 变更（业务决策，故障诊断 → 派单场景的前置条件）：**维修工单允许"停机"设备创建**。
+     * 原实现要求维修工单必须 `vm_status=1（运行中）`，但现场停机（未撤机）的设备恰恰最需要维修，
+     * 于是形成"停机 → 建不了维修单 → 永远停机"的死循环。现允许 {1-运行中, 2-停机}，
+     * 仍拒绝 0-未投放（还没装）与 3-已撤机（已撤走），两者都不属于维修范围。
+     *
+     * <p>为什么改用常量.equals 而不是 ==：productTypeId / vmStatus 都是 Long 包装类型，
+     * `==` 比的是引用，只因 Long 的 -128~127 缓存才碰巧成立；换 `.equals` 后不再依赖缓存实现，
+     * 也不会在 productTypeId 为 null 时 NPE（常量在左侧）。
+     *
+     * @param vmStatus 售货机当前状态（tb_vending_machine.vm_status）
+     * @param productTypeId 工单类型（1-投放 2-补货 3-维修 4-撤机）
      */
-    private void checkCreateTask(Long vmStatus,Long productTypeId){
-
-         //如果是投放工单，设备在运行当中，抛出异常
-        if (productTypeId == DkdContants.TASK_TYPE_DEPLOY && vmStatus == DkdContants.VM_STATUS_RUNNING){
+    private void checkCreateTask(Long vmStatus, Long productTypeId)
+    {
+        // 投放：设备已在运行中，重复投放没有意义
+        if (DkdContants.TASK_TYPE_DEPLOY.equals(productTypeId)
+                && DkdContants.VM_STATUS_RUNNING.equals(vmStatus))
+        {
             throw new ServiceException("设备正在运行中，请勿重复投放");
-
         }
-        //如果是投放工单，设备不在运行当中，抛出异常
-        if (productTypeId == DkdContants.TASK_TYPE_REPAIR && vmStatus != DkdContants.VM_STATUS_RUNNING){
+        // 维修：运行中或停机均可（停机≠撤机，现场仍需维修）
+        if (DkdContants.TASK_TYPE_REPAIR.equals(productTypeId) && !isRepairAllowed(vmStatus))
+        {
+            throw new ServiceException("设备未投放或已撤机，无法创建维修工单");
+        }
+        // 补货：必须在运行中（给停机设备补货没有意义，还会掩盖故障）
+        if (DkdContants.TASK_TYPE_SUPPLY.equals(productTypeId)
+                && !DkdContants.VM_STATUS_RUNNING.equals(vmStatus))
+        {
             throw new ServiceException("设备不在运行中，请勿重复补货");
         }
-        //如果是补货工单，设备不在运行当中，抛出异常
-        if (productTypeId == DkdContants.TASK_TYPE_SUPPLY && vmStatus != DkdContants.VM_STATUS_RUNNING){
-            throw new ServiceException("设备不在运行中，请勿重复补货");
-        }
-        //如果是撤机工单，设备不在运行当中，抛出异常
-        if (productTypeId == DkdContants.TASK_TYPE_REVOKE && vmStatus != DkdContants.VM_STATUS_RUNNING){
+        // 撤机：必须在运行中（未投放无需撤机；已撤机不可重复撤机）
+        if (DkdContants.TASK_TYPE_REVOKE.equals(productTypeId)
+                && !DkdContants.VM_STATUS_RUNNING.equals(vmStatus))
+        {
             throw new ServiceException("设备不在运行中，请勿重复撤机");
         }
+    }
 
-
+    /**
+     * 维修工单允许的设备状态：运行中（1）与停机（2）。
+     *
+     * <p>为什么显式列出允许集合，而不是"只要不是 0/3 就放行"：将来新增状态（如报废）时，
+     * 显式集合会**默认拒绝**并强制回来做一次判断；"非 0/3"这种写法会让新状态静默变成"可维修"。
+     *
+     * @param vmStatus 售货机状态
+     * @return true 表示允许创建维修工单
+     */
+    private boolean isRepairAllowed(Long vmStatus)
+    {
+        return DkdContants.VM_STATUS_RUNNING.equals(vmStatus)
+                || DkdContants.VM_STATUS_STOPPED.equals(vmStatus);
     }
 }

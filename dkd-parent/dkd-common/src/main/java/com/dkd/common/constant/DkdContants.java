@@ -51,6 +51,14 @@ public class DkdContants {
      */
     public static final Long VM_STATUS_RUNNING = 1l;
     /**
+     * 售货机状态：停机（现场停用但未撤机）。
+     *
+     * <p>口径来源：设备管理页的状态字典 `vm_status`（0-未投放 1-运行中 2-停机 3-已撤机）。
+     * ⚠️ 存量业务表 DDL 未入库（AGENTS §1 约束 5），本常量于 2026-10-26 按字典口径补充；
+     * 若库里 `sys_dict_data` 的 `vm_status` 定义与此不同，只需改这一处（调用点是 TaskServiceImpl.isRepairAllowed）。
+     */
+    public static final Long VM_STATUS_STOPPED = 2l;
+    /**
      * 售货机状态：撤机
      */
     public static final Long VM_STATUS_REVOKE = 3l;
