@@ -117,7 +117,9 @@ pagehelper:
 # Swagger配置
 swagger:
   # 是否开启swagger
-  enabled: true
+  # 为什么默认 false（2026-10-21 审计 F9）：接口文档 = 全部路由与参数清单，
+  # 生产环境没有对公网开放的理由；本地/联调需要时显式设置 DKD_SWAGGER_ENABLED=true
+  enabled: ${DKD_SWAGGER_ENABLED:false}
   # 请求前缀
   pathMapping: /
 
