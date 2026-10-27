@@ -12,8 +12,17 @@ dkd:
     port: 6379
     # 为什么用占位符：同上，Redis 密码由环境变量注入
     password: ${DKD_REDIS_PASSWORD}
+  jwt:
+    # 为什么用占位符：AGENTS.md §7.1——签名密钥禁止硬编码入仓。
+    # 原实现是 HS256 常量 "dkd"（3 字节），任何人拿到源码即可伪造任意 userId 的令牌。
+    secret: ${DKD_APP_JWT_SECRET}
+    # 令牌有效期（分钟），默认 12 小时；原实现写死 7 天且无吊销机制
+    expire-minutes: ${DKD_APP_JWT_EXPIRE_MINUTES:720}
   sms:
     key:
     secret:
     sign-name: 阿里云短信测试
     template-code: SMS_154950909
+    # 仅本地/联调可开：true 时验证码不真实下发（仍随机生成、不落日志）。
+    # 生产必须为 false，否则等于没有第二因子（审计 2026-10-21 F3）
+    mock: ${DKD_SMS_MOCK:false}
