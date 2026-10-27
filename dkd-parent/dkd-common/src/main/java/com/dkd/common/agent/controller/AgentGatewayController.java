@@ -3,9 +3,12 @@ package com.dkd.common.agent.controller;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
@@ -20,6 +23,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 import com.alibaba.fastjson2.JSON;
 import com.dkd.common.agent.config.AgentProperties;
@@ -32,6 +36,8 @@ import com.dkd.common.agent.support.AgentRequestId;
 import com.dkd.common.agent.support.AgentUpstreamClient;
 import com.dkd.common.agent.support.AgentUpstreamException;
 import com.dkd.common.core.domain.AjaxResult;
+import com.dkd.common.core.domain.model.LoginUser;
+import com.dkd.common.utils.SecurityUtils;
 
 /**
  * 智能体网关（任务 0-6，方案 §3.3）：前端 /agent/** 一律经此转发到 Python 智能体服务。
@@ -54,6 +60,22 @@ import com.dkd.common.core.domain.AjaxResult;
  *   <li>上游 4xx（参数错误/限额 429）：**原样透传**，因为它携带明确的业务语义，替换成 503 会让前端丢失原因。</li>
  * </ul>
  *
+ * <p>越权防护（P0 安全修复，2026-10-21）：
+ * <ul>
+ *   <li>**为什么取消 {@code /**} 泛化代理**：泛化代理会把 Python 未来新增的任何路由自动暴露给“只要登录”的
+ *       后台账号；越权问题不会在网关层报错，而是等业务在 Python 侧被调用后才发生，属于最隐蔽的一类。
+ *       因此改为**显式路径白名单**：只有下面列出的路由会被转发，白名单外一律 404（fail-closed），
+ *       新增接口必须回来改这里（多一步评审，换来“默认拒绝”）。</li>
+ *   <li>**为什么权限点判断放在 Controller 内而不是 SecurityConfig**：SecurityConfig 的
+ *       {@code /agent/** authenticated()} 是“登录即可”的通用规则，若在此收窄会连带影响
+ *       {@code /agent/status}、{@code /agent/chat}（前端依赖“登录即可”）；而补货的读/写权限点是
+ *       本网关特有的路由语义，就近判断可把“路径 → 权限点”的映射与白名单放在同一张表里，
+ *       避免两处配置漂移。</li>
+ *   <li>权限点口径：读（补货清单 / 暂停状态，GET）→ {@code manage:task:list}；
+ *       写（confirm/adjust/skip/restore/pause/resume，POST）→ {@code manage:task:add}。
+ *       超管（userId=1）直接放行，与 RuoYi {@code @ss.hasPermi} 的语义保持一致。</li>
+ * </ul>
+ *
  * @author ruoyi
  * @date 2026-09-21
  */
@@ -67,6 +89,38 @@ public class AgentGatewayController
      * 上游对话路径（Python app/api/chat.py 的 router 前缀 + 路由）
      */
     private static final String CHAT_PATH = "/agent/chat";
+
+    /**
+     * 补货读接口（GET）：需要 {@code manage:task:list}
+     */
+    private static final String PATH_RESTOCK_PLANS = "/agent/restock/plans";
+
+    private static final String PATH_RESTOCK_PAUSE = "/agent/restock/pause";
+
+    /**
+     * 补货写接口：需要 {@code manage:task:add}
+     */
+    private static final String PATH_RESTOCK_RESUME = "/agent/restock/resume";
+
+    /**
+     * 计划级写动作路径正则：confirm / adjust / skip / restore。
+     *
+     * <p>为什么用“数字 planId + 固定动作名”的白名单正则而不是 startsWith：startsWith 会把
+     * {@code /agent/restock/plans/1/delete} 之类的未来路径也当成写操作放过去；显式枚举动作名 +
+     * {@code \d+} 才能保证“路径形状”本身也是白名单的一部分（fail-closed）。
+     */
+    private static final Pattern RESTOCK_PLAN_ACTION = Pattern.compile(
+            "^/agent/restock/plans/\\d+/(confirm|adjust|skip|restore)$");
+
+    /**
+     * 读权限点（补货清单、暂停状态）
+     */
+    private static final String PERMISSION_RESTOCK_READ = "manage:task:list";
+
+    /**
+     * 写权限点（确认建单、调整、跳过、恢复、暂停/恢复自动分析）
+     */
+    private static final String PERMISSION_RESTOCK_WRITE = "manage:task:add";
 
     /**
      * 回调路径前缀：回调是 Python → Java 的单向通道，绝不经网关暴露给前端（防御性兜底）
@@ -150,12 +204,24 @@ public class AgentGatewayController
     }
 
     /**
-     * 泛化代理：除 SSE 与回调外的 /agent/** 一律按原方法转发。
+     * 白名单代理：只有这里显式列出的补货工作台路由才会被转发到 Python。
+     *
+     * <p>为什么把路径写在注解里而不是保留 {@code /**} 再在方法内判断：注解是**路由层的白名单**，
+     * 未列出的路径根本不会进入本方法（Spring 直接 404），不给“判断写漏一个分支”留空间；
+     * 本方法内还会再按 method + path 校验一次（双保险，也便于单测直接调用本方法验证拒绝路径）。
      *
      * @param request 当前请求
      * @return 上游响应（或降级 JSON）
      */
-    @RequestMapping("/**")
+    @RequestMapping(value = {
+            "/restock/plans",
+            "/restock/plans/{planId:\\d+}/confirm",
+            "/restock/plans/{planId:\\d+}/adjust",
+            "/restock/plans/{planId:\\d+}/skip",
+            "/restock/plans/{planId:\\d+}/restore",
+            "/restock/pause",
+            "/restock/resume" },
+            method = { RequestMethod.GET, RequestMethod.POST })
     public ResponseEntity<byte[]> proxy(HttpServletRequest request)
     {
         String path = resolvePath(request);
@@ -164,6 +230,22 @@ public class AgentGatewayController
             log.warn("拒绝经网关访问回调路径 path={}", path);
             return jsonResponse(HttpStatus.NOT_FOUND,
                     AjaxResult.error(HttpStatus.NOT_FOUND.value(), "回调路径不可经网关访问"));
+        }
+        // 失败关闭（fail-closed）：白名单外的路径不转发、不探开关、不回显上游任何信息。
+        // 这里只记 method + path，**不记请求体**：请求体可能含业务数据/个人信息（AGENTS §6.1）。
+        String permission = requiredPermission(request.getMethod(), path);
+        if (permission == null)
+        {
+            log.warn("拒绝未在白名单内的智能体接口 method={} path={}", request.getMethod(), path);
+            return jsonResponse(HttpStatus.NOT_FOUND,
+                    AjaxResult.error(HttpStatus.NOT_FOUND.value(), "智能体接口不存在或方法不支持"));
+        }
+        // 权限点判断必须在转发之前：越权请求不应触达 Python、更不应产生建单等副作用。
+        if (!hasPermission(permission))
+        {
+            log.warn("拒绝越权访问智能体接口 method={} path={} permission={}", request.getMethod(), path, permission);
+            return jsonResponse(HttpStatus.FORBIDDEN,
+                    AjaxResult.error(HttpStatus.FORBIDDEN.value(), "无权限访问该智能体接口"));
         }
         if (!properties.getEnabled())
         {
@@ -193,6 +275,102 @@ public class AgentGatewayController
             return jsonResponse(HttpStatus.SERVICE_UNAVAILABLE,
                     AjaxResult.error(HttpStatus.SERVICE_UNAVAILABLE.value(), DEGRADE_MSG_UNAVAILABLE));
         }
+    }
+
+    /**
+     * 兜底：未注册的 /agent/** 一律 404（fail-closed），并留 WARN 便于发现“前端调用了不存在的路由”。
+     *
+     * <p>为什么不直接让 Spring 的 NoHandlerFound 处理：这里需要**记录被拒绝的路径**（不记请求体），
+     * 否则“某个前端页面在打旧接口”只会表现为一条没有上下文的 404，排障时无从查起。
+     *
+     * @param request 当前请求
+     * @return 404 JSON 信封
+     */
+    @RequestMapping("/**")
+    public ResponseEntity<byte[]> rejectUnknown(HttpServletRequest request)
+    {
+        String path = resolvePath(request);
+        if (isCallbackPath(path))
+        {
+            // 回调路径有自己的过滤器鉴权，这里只是防御性兜底（防止未来过滤器注册被误改后经网关暴露）
+            log.warn("拒绝经网关访问回调路径 path={}", path);
+            return jsonResponse(HttpStatus.NOT_FOUND,
+                    AjaxResult.error(HttpStatus.NOT_FOUND.value(), "回调路径不可经网关访问"));
+        }
+        log.warn("拒绝未注册的智能体接口 method={} path={}", request.getMethod(), path);
+        return jsonResponse(HttpStatus.NOT_FOUND,
+                AjaxResult.error(HttpStatus.NOT_FOUND.value(), "智能体接口不存在"));
+    }
+
+    /**
+     * 按「HTTP 方法 + 请求路径」算出所需权限点（null = 不在白名单，直接 404）。
+     *
+     * <p>为什么 GET 与 POST 分开：补货清单/暂停状态是**读**（登录用户看数据），
+     * 确认建单/暂停分析是**写**（会经 Java 回调产生真实工单或改变全局自动分析状态）。
+     * 两者权限点不同，混用会让“只能看清单”的账号获得建单能力——这正是本次要修的越权缺陷。
+     *
+     * @param method HTTP 方法
+     * @param path 去掉 contextPath 的路径
+     * @return 权限点；null 表示该 method/path 组合不在白名单内
+     */
+    private String requiredPermission(String method, String path)
+    {
+        if (HttpMethod.GET.matches(method))
+        {
+            if (PATH_RESTOCK_PLANS.equals(path) || PATH_RESTOCK_PAUSE.equals(path))
+            {
+                return PERMISSION_RESTOCK_READ;
+            }
+            return null;
+        }
+        if (HttpMethod.POST.matches(method))
+        {
+            if (PATH_RESTOCK_PAUSE.equals(path) || PATH_RESTOCK_RESUME.equals(path)
+                    || RESTOCK_PLAN_ACTION.matcher(path).matches())
+            {
+                return PERMISSION_RESTOCK_WRITE;
+            }
+            return null;
+        }
+        // PUT/DELETE/PATCH 等一律不在白名单：即使 Spring 路由注解未来被放宽，也不会被转发
+        return null;
+    }
+
+    /**
+     * 判断当前登录用户是否具备权限点。
+     *
+     * <p>为什么用 {@link SecurityUtils#hasPermi(java.util.Collection, String)} 而不是自己遍历：
+     * 它已包含 RuoYi 的 {@code *:*:*} 通配语义，自己实现会在“权限串通配”上产生第二套口径。
+     * 超管直接放行的原因：RuoYi 的 userId=1 是内置超管，其 permissions 可能因角色配置缺失而不全，
+     * 但 {@code @PreAuthorize("@ss.hasPermi(...)")} 的判权注解对超管同样放行，这里必须与之一致。
+     *
+     * @param permission 所需权限点
+     * @return true 表示放行
+     */
+    private boolean hasPermission(String permission)
+    {
+        LoginUser loginUser;
+        try
+        {
+            loginUser = SecurityUtils.getLoginUser();
+        }
+        catch (RuntimeException e)
+        {
+            // /agent/** 已由 Spring Security 要求 authenticated()，正常请求不会走到这里；
+            // 走到这里说明身份上下文缺失（过滤器顺序被改/内部转发），按无权限拒绝，绝不放行。
+            log.warn("无法解析登录用户，按无权限拒绝智能体接口 permission={}", permission);
+            return false;
+        }
+        if (SecurityUtils.isAdmin(loginUser.getUserId()))
+        {
+            return true;
+        }
+        Set<String> permissions = loginUser.getPermissions();
+        if (permissions == null)
+        {
+            permissions = Collections.emptySet();
+        }
+        return SecurityUtils.hasPermi(permissions, permission);
     }
 
     /**

@@ -21,6 +21,14 @@ def _clear_caches() -> None:
     get_settings.cache_clear()
 
 
+# 测试客户端的来源地址必须显式是**回环**：`/agent/**` 增加了服务间密钥校验
+# （app/security.py 的 require_agent_gateway），非回环来源必须带 DKD_AGENT_SERVICE_SECRET。
+# Starlette TestClient 默认把 client 固定成 ("testclient", 50000)，那不是回环地址；
+# 若在安全层为测试开“非回环放行”的口子，就等于把生产 fail-closed 变成 fail-open
+# （DKD_AGENT_ENV 一个拼写错误即可绕过）。所以这里改测试夹具、不改安全策略。
+_TEST_CLIENT = ("127.0.0.1", 50000)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     """带完整 lifespan 的测试客户端（checkpointer 落在 tmp_path，禁用 MySQL 留痕）。"""
@@ -33,7 +41,7 @@ def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     from app.main import create_app
 
     app = create_app()
-    with TestClient(app) as c:
+    with TestClient(app, client=_TEST_CLIENT) as c:
         yield c
     _clear_caches()
 
@@ -48,7 +56,7 @@ def client_with_secret(tmp_path, monkeypatch) -> Iterator[TestClient]:
     from app.main import create_app
 
     app = create_app()
-    with TestClient(app) as c:
+    with TestClient(app, client=_TEST_CLIENT) as c:
         yield c
     _clear_caches()
 
@@ -69,7 +77,7 @@ def client_with_llm(tmp_path, monkeypatch) -> Iterator[TestClient]:
     from app.main import create_app
 
     app = create_app()
-    with TestClient(app) as c:
+    with TestClient(app, client=_TEST_CLIENT) as c:
         yield c
     _clear_caches()
 
@@ -90,6 +98,10 @@ def _isolate_env() -> Iterator[None]:
     """
     saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("DKD_")}
     os.environ["DKD_AGENT_AUDIT_ENABLED"] = "0"
+    # 2026-10-26（F-02）：运行观测与留痕是两条写入通道，必须一起兜底关闭，
+    # 否则新的 run/step/tool_call 写入器会让"跑个单测"写进本机 agent_run 表。
+    # 要验观测的用例请显式注入假 store（见 tests/test_run_recorder.py）。
+    os.environ["DKD_AGENT_OBS_ENABLED"] = "0"
     os.environ["DKD_AGENT_CHECKPOINT_BACKEND"] = "sqlite"
     yield
     for k in [k for k in os.environ if k.startswith("DKD_") and k not in saved]:

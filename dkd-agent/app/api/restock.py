@@ -18,18 +18,20 @@ from __future__ import annotations
 import logging
 from datetime import date
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
-from app.security import parse_user_context
+from app.security import parse_user_context, require_agent_gateway
 from app.services.restock_service import (
     AdjustmentRequest,
     RestockService,
     RestockServiceError,
 )
 
-router = APIRouter(prefix="/agent/restock", tags=["restock"])
+router = APIRouter(
+    prefix="/agent/restock", tags=["restock"], dependencies=[Depends(require_agent_gateway)]
+)
 logger = logging.getLogger("dkd.agent.api.restock")
 
 

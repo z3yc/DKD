@@ -21,7 +21,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, NamedTuple
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
 from pydantic import BaseModel, Field
@@ -38,10 +38,12 @@ from app.config import Settings, get_settings
 from app.db import get_sessionmaker
 from app.llm import LlmError
 from app.logging_conf import current_request_id
-from app.security import HEADER_REQUEST_ID, parse_user_context
+from app.security import HEADER_REQUEST_ID, parse_user_context, require_agent_gateway
 from app.services import grounding, time_hint
 
-router = APIRouter(prefix="/agent", tags=["chat"])
+router = APIRouter(
+    prefix="/agent", tags=["chat"], dependencies=[Depends(require_agent_gateway)]
+)
 logger = logging.getLogger("dkd.agent.chat")
 
 _CHUNK = 24

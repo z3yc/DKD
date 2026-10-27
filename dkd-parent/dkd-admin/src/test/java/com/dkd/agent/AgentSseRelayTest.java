@@ -4,11 +4,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
 import com.dkd.common.agent.config.AgentProperties;
@@ -16,6 +19,7 @@ import com.dkd.common.agent.controller.AgentGatewayController;
 import com.dkd.common.agent.domain.AgentHeaders;
 import com.dkd.common.agent.domain.AgentUserContext;
 import com.dkd.common.agent.support.AgentUpstreamClient;
+import com.dkd.common.core.domain.model.LoginUser;
 import com.sun.net.httpserver.HttpExchange;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -93,12 +97,14 @@ class AgentSseRelayTest
     @Test
     void 泛化代理遇上游5xx降级为503() throws Exception
     {
-        try (FakeAgentServer server = new FakeAgentServer("/agent/diagnose/1",
+        // 白名单改造后必须走真实注册路径（GET 补货清单），并带上判权身份
+        try (FakeAgentServer server = new FakeAgentServer("/agent/restock/plans",
                 exchange -> FakeAgentServer.respond(exchange, 500, "application/json", "{\"code\":500,\"msg\":\"内部错误\"}")))
         {
             AgentGatewayController controller = controller(server.baseUrl(), true);
+            loginAsAdmin();
 
-            ResponseEntity<byte[]> response = controller.proxy(new MockHttpServletRequest("GET", "/agent/diagnose/1"));
+            ResponseEntity<byte[]> response = controller.proxy(new MockHttpServletRequest("GET", "/agent/restock/plans"));
 
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
             JSONObject body = JSON.parseObject(new String(response.getBody(), StandardCharsets.UTF_8));
@@ -114,8 +120,10 @@ class AgentSseRelayTest
                 exchange -> FakeAgentServer.respond(exchange, 422, "application/json", "{\"code\":422,\"msg\":\"参数校验失败\"}")))
         {
             AgentGatewayController controller = controller(server.baseUrl(), true);
+            loginAsAdmin();
 
-            ResponseEntity<byte[]> response = controller.proxy(new MockHttpServletRequest("POST", "/agent/restock/plans"));
+            ResponseEntity<byte[]> response = controller.proxy(
+                    new MockHttpServletRequest("POST", "/agent/restock/plans/5/skip"));
 
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
             assertThat(new String(response.getBody(), StandardCharsets.UTF_8)).contains("参数校验失败");
@@ -139,6 +147,27 @@ class AgentSseRelayTest
             assertThat(data.getString("upstream")).isEqualTo("up");
             assertThat(healthHit.get()).isEqualTo("/health");
         }
+    }
+
+    /**
+     * 清空 SecurityContext：判权改动后，登录身份不得跨用例泄漏。
+     */
+    @AfterEach
+    void clearSecurityContext()
+    {
+        SecurityContextHolder.clearContext();
+    }
+
+    /**
+     * 以超管身份写入 SecurityContext（聚焦验证转发/降级，不重复覆盖判权本身）。
+     */
+    private void loginAsAdmin()
+    {
+        LoginUser loginUser = new LoginUser();
+        loginUser.setUserId(1L);
+        loginUser.setPermissions(new LinkedHashSet<String>());
+        SecurityContextHolder.getContext()
+                .setAuthentication(new UsernamePasswordAuthenticationToken(loginUser, null));
     }
 
     private AgentGatewayController controller(String baseUrl, boolean enabled)

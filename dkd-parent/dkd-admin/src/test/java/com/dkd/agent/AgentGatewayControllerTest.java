@@ -4,12 +4,15 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
 import com.dkd.common.agent.config.AgentProperties;
@@ -20,6 +23,7 @@ import com.dkd.common.agent.domain.AgentUserContext;
 import com.dkd.common.agent.support.AgentUpstreamClient;
 import com.dkd.common.agent.support.AgentUpstreamException;
 import com.dkd.common.core.domain.AjaxResult;
+import com.dkd.common.core.domain.model.LoginUser;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -136,6 +140,8 @@ class AgentGatewayControllerTest
         when(upstreamClient.forward(anyString(), anyString(), any(), any(), any()))
                 .thenThrow(new AgentUpstreamException(AgentUpstreamException.STATUS_TRANSPORT_FAILURE, "unreachable"));
         AgentGatewayController controller = controller(true);
+        // 白名单改造后转发前先判权：用超管身份验证“有权限时”的降级语义仍与改造前一致
+        loginAsAdmin();
 
         ResponseEntity<byte[]> response = controller.proxy(new MockHttpServletRequest("GET", "/agent/restock/plans"));
 
@@ -151,8 +157,10 @@ class AgentGatewayControllerTest
         when(upstreamClient.forward(anyString(), anyString(), any(), any(), any())).thenReturn(new AgentUpstreamResult(500,
                 "application/json", "{\"stack\":\"Traceback ... internal\"}".getBytes(StandardCharsets.UTF_8), null));
         AgentGatewayController controller = controller(true);
+        loginAsAdmin();
 
-        ResponseEntity<byte[]> response = controller.proxy(new MockHttpServletRequest("GET", "/agent/diagnose/1"));
+        ResponseEntity<byte[]> response = controller.proxy(
+                new MockHttpServletRequest("POST", "/agent/restock/plans/1/confirm"));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         assertThat(new String(response.getBody(), StandardCharsets.UTF_8)).doesNotContain("Traceback");
@@ -198,6 +206,27 @@ class AgentGatewayControllerTest
         assertThat(data.get("enabled")).isEqualTo(Boolean.FALSE);
         assertThat(data.get("upstream")).isEqualTo("down");
         verify(upstreamClient, never()).pingHealth();
+    }
+
+    /**
+     * 清空 SecurityContext：判权改动后，用例之间的登录身份不得互相串（否则拒绝路径会被前一个用例放行）。
+     */
+    @AfterEach
+    void clearSecurityContext()
+    {
+        SecurityContextHolder.clearContext();
+    }
+
+    /**
+     * 以超管身份写入 SecurityContext（userId=1 在 RuoYi 中直接放行全部权限点）。
+     */
+    private void loginAsAdmin()
+    {
+        LoginUser loginUser = new LoginUser();
+        loginUser.setUserId(1L);
+        loginUser.setPermissions(new LinkedHashSet<String>());
+        SecurityContextHolder.getContext()
+                .setAuthentication(new UsernamePasswordAuthenticationToken(loginUser, null));
     }
 
     private AgentGatewayController controller(boolean enabled)
