@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     # --- 对话模式与限额（任务 0-12：成本计量与熔断）---
     use_llm: bool = Field(default=False, validation_alias="DKD_AGENT_USE_LLM")
     audit_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_AUDIT_ENABLED")
+    # --- 运行观测 run/step/tool_call（F-02，2026-10-26）---
+    # 为什么单独一个开关而不复用 audit_enabled：审计（决策留痕）是合规要求，
+    # 观测是排障能力；单测要同时关掉两者，但生产可能只想关观测（省写入）。
+    obs_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_OBS_ENABLED")
+    # 启动扫描判定"僵尸运行"的阈值：running 超过这么多分钟就被改成 interrupted（F-05）
+    run_stale_minutes: int = Field(default=30, validation_alias="DKD_AGENT_RUN_STALE_MINUTES")
     token_daily_limit_per_user: int = Field(
         default=200_000, validation_alias="DKD_AGENT_TOKEN_LIMIT_PER_USER"
     )

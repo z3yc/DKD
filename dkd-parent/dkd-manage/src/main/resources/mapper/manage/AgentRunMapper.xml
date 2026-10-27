@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentRunMapper">
+
+    <!--
+      运行观测三表的只读查询（F-03，DDL 见 docs/ddl/agent_run_step.sql）。
+
+      ## 三条刻意的取舍
+      1. **时间过滤用范围比较，不用 date_format()**
+         `started_at >= beginTime AND started_at < endTime + 1 天`；
+         函数包裹索引列会让 `idx_agent_run_scene_status(scene_code, status, started_at)` 失效
+         （仓库里 OrderMapper.xml:44 的反例，AGENTS §10 明确禁止）。
+      2. **列表不带 evidence_json / 详情才带**
+         证据 JSON 单行可能几 KB，列表页只要看得懂"哪台设备、什么状态"，
+         带上它会让分页随数据增长变慢；需要看证据时点「查看」走详情。
+      3. **工具调用一次取全量，Service 分组**（见 Mapper 接口注释），
+         避免页面逐轮展开时 N+1。
+    -->
+
+    <resultMap type="AgentRun" id="AgentRunResult">
+        <id     property="id"            column="id"             />
+        <result property="runId"         column="run_id"         />
+        <result property="sceneCode"     column="scene_code"     />
+        <result property="subjectType"   column="subject_type"   />
+        <result property="subjectId"     column="subject_id"     />
+        <result property="requestId"     column="request_id"     />
+        <result property="triggerType"   column="trigger_type"   />
+        <result property="status"        column="status"         />
+        <result property="configVersion" column="config_version" />
+        <result property="stopReason"    column="stop_reason"    />
+        <result property="startedAt"     column="started_at"     />
+        <result property="finishedAt"    column="finished_at"    />
+        <result property="createBy"      column="create_by"      />
+        <result property="createTime"    column="create_time"    />
+    </resultMap>
+
+    <resultMap type="AgentStep" id="AgentStepResult">
+        <id     property="id"           column="id"            />
+        <result property="runId"        column="run_id"        />
+        <result property="stepNo"       column="step_no"       />
+        <result property="roleCode"     column="role_code"     />
+        <result property="action"       column="action"        />
+        <result property="summary"      column="summary"       />
+        <result property="evidenceJson" column="evidence_json" />
+        <result property="inputTokens"  column="input_tokens"  />
+        <result property="outputTokens" column="output_tokens" />
+        <result property="durationMs"   column="duration_ms"   />
+        <result property="status"       column="status"        />
+        <result property="errorMsg"     column="error_msg"     />
+        <result property="createTime"   column="create_time"   />
+    </resultMap>
+
+    <resultMap type="AgentToolCall" id="AgentToolCallResult">
+        <id     property="id"           column="id"            />
+        <result property="runId"        column="run_id"        />
+        <result property="stepNo"       column="step_no"       />
+        <result property="callSeq"      column="call_seq"      />
+        <result property="toolCode"     column="tool_code"     />
+        <result property="paramsDigest" column="params_digest" />
+        <result property="rowCount"     column="row_count"     />
+        <result property="durationMs"   column="duration_ms"   />
+        <result property="resultStatus" column="result_status" />
+        <result property="errorMsg"     column="error_msg"     />
+        <result property="createTime"   column="create_time"   />
+    </resultMap>
+
+    <sql id="selectAgentRunVo">
+        select id, run_id, scene_code, subject_type, subject_id, request_id, trigger_type,
+               status, config_version, stop_reason, started_at, finished_at, create_by, create_time
+        from agent_run
+    </sql>
+
+    <sql id="agentRunWhere">
+        <where>
+            <!-- 查询默认只看未删除（AGENTS §7.4） -->
+            del_flag = '0'
+            <if test="sceneCode != null and sceneCode != ''">
+                AND scene_code = #{sceneCode}
+            </if>
+            <if test="status != null and status != ''">
+                AND status = #{status}
+            </if>
+            <if test="subjectType != null and subjectType != ''">
+                AND subject_type = #{subjectType}
+            </if>
+            <if test="subjectId != null and subjectId != ''">
+                AND subject_id like concat('%', #{subjectId}, '%')
+            </if>
+            <if test="requestId != null and requestId != ''">
+                AND request_id = #{requestId}
+            </if>
+            <if test="params.beginTime != null and params.beginTime != ''">
+                <!-- 范围比较（禁止 date_format 包裹索引列，AGENTS §10） -->
+                AND started_at &gt;= #{params.beginTime}
+            </if>
+            <if test="params.endTime != null and params.endTime != ''">
+                <!-- 半开区间上界：函数只作用在参数上，不影响索引 -->
+                AND started_at &lt; DATE_ADD(#{params.endTime}, INTERVAL 1 DAY)
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAgentRunList" parameterType="AgentRun" resultMap="AgentRunResult">
+        <include refid="selectAgentRunVo"/>
+        <include refid="agentRunWhere"/>
+        order by started_at desc, id desc
+    </select>
+
+    <select id="selectAgentRunByRunId" parameterType="String" resultMap="AgentRunResult">
+        <include refid="selectAgentRunVo"/>
+        where run_id = #{runId} and del_flag = '0'
+        limit 1
+    </select>
+
+    <select id="selectAgentStepsByRunId" parameterType="String" resultMap="AgentStepResult">
+        select id, run_id, step_no, role_code, action, summary, evidence_json,
+               input_tokens, output_tokens, duration_ms, status, error_msg, create_time
+        from agent_step
+        where run_id = #{runId}
+        order by step_no asc
+    </select>
+
+    <select id="selectAgentToolCallsByRunId" parameterType="String" resultMap="AgentToolCallResult">
+        select id, run_id, step_no, call_seq, tool_code, params_digest,
+               row_count, duration_ms, result_status, error_msg, create_time
+        from agent_tool_call
+        where run_id = #{runId}
+        order by step_no asc, call_seq asc
+    </select>
+
+</mapper>

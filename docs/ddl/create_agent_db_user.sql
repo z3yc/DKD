@@ -19,6 +19,10 @@
 --   必须确保该账号无法读取这些库（MySQL 新用户默认无权限，此处显式 REVOKE 防历史授权残留）。
 -- ----------------------------------------------------------------------------
 
+-- ⚠️ 必须置顶（2026-10-26）：Windows 客户端默认字符集常是 GBK，中文注释/别名会被转成 '?'。
+-- 本文件可执行语句均为 ASCII，但置顶 SET NAMES 可避免将来加入中文标识符时踩同样的坑。
+SET NAMES utf8mb4;
+
 -- 1) 账号（仅允许本机/内网来源；生产请按实际网段收窄 host）
 CREATE USER IF NOT EXISTS 'dkd_agent'@'127.0.0.1' IDENTIFIED BY '<AGENT_DB_PASSWORD>';
 CREATE USER IF NOT EXISTS 'dkd_agent'@'localhost' IDENTIFIED BY '<AGENT_DB_PASSWORD>';
@@ -53,6 +57,12 @@ GRANT SELECT, INSERT, UPDATE ON dkd.agent_decision_log  TO 'dkd_agent'@'127.0.0.
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_restock_plan  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 -- 2026-09-21 追加（排期 1-7）：自动分析暂停开关（单行表，DDL 见 agent_restock_pause.sql）
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_restock_pause TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+-- 2026-10-26 追加（F-01）：运行观测三表（DDL 见 agent_run_step.sql）
+-- 为什么 Python 可写：run/step/tool_call 是智能体自身的过程数据，不是业务事实（AGENTS §7.3）；
+-- 为什么仍不授 DELETE：观测/审计数据只追加与状态更新，清理由运维按保留策略执行（§7.4）。
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_run        TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_step       TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_tool_call  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 
 FLUSH PRIVILEGES;
 
@@ -78,6 +88,12 @@ FLUSH PRIVILEGES;
 --    DROP TABLE dkd.agent_decision_log;
 -- 9) 已实测（2026-09-21，排期 1-7）：agent_restock_pause 可 UPSERT；`DELETE FROM dkd.agent_restock_pause`
 --    被拒（ERROR 1142），与 7) 同一红线
+-- 10) ✅ 已实测（2026-10-26，F-01）：运行观测三表
+--     允许：事务内 INSERT INTO dkd.agent_run(run_id,scene_code,subject_type,subject_id,...)（回滚后 0 行）
+--     允许：SELECT FROM dkd.agent_run（空表返回 0）
+--     拒绝（1142）：DELETE FROM dkd.agent_run
+--     拒绝（1142）：DROP TABLE dkd.agent_run
+--     同时复测：读 tb_inventory 允许；读 tb_report 拒绝(1142)；写 tb_inventory 拒绝(1142)
 --
 -- 权限自查：
 --   SHOW GRANTS FOR 'dkd_agent'@'127.0.0.1';

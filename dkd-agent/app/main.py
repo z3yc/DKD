@@ -25,6 +25,7 @@ from app.db import dispose_engine
 from app.graphs.chat_graph import build_chat_graph
 from app.llm import build_chat_model
 from app.logging_conf import RequestContextMiddleware, setup_logging
+from app.obs.run_recorder import sweep_stale_runs
 from app.prompts.assistant_chat import SCENE_DIAGNOSE, SCENE_RESTOCK
 from app.services.restock_analyzer import build_default_analyzer
 from app.tools.assistant_tools import all_assistant_tools, tools_for_scene
@@ -46,6 +47,13 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
         raise RuntimeError("DKD_AGENT_USE_LLM=1 但未配置 LLM 密钥，拒绝以错误配置启动")
     if not s.service_secret:
         logger.warning("DKD_AGENT_SERVICE_SECRET 未配置 —— 回调/运维接口将返回 503")
+
+    # 运行观测收尾（F-05，2026-10-26）：把上一个进程遗留的 running 改成 interrupted。
+    # 为什么必须在启动时做：进程被杀不会执行任何清理，页面会永远显示"运行中"，运营以为还在跑；
+    # 为什么失败只 WARN：观测是旁路（同决策留痕纪律），不能因为表没建/库抖动就拒绝启动。
+    swept = await sweep_stale_runs(s, None)
+    if swept:
+        logger.warning("启动扫描：%d 条遗留运行已标记为 interrupted（页面显示可重新发起）", swept)
 
     # 工具能力启动探测（2026-10-01）：配了工具但模型不支持函数调用时，**启动即拒绝**。
     # 为什么不等第一条消息再报：那时用户已经看到了一个 502 错误帧，
