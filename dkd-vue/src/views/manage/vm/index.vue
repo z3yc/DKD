@@ -292,6 +292,7 @@ import { listPartner } from "@/api/manage/partner";
 import { loadAllParams } from "@/api/page";
 import { listNode } from "@/api/manage/node";
 import { parseTime } from "@/utils/ruoyi";
+import DOMPurify from 'dompurify';
 import { listRegion } from "@/api/manage/region";
 import { listPolicy } from "@/api/manage/policy";
 import ChannelDialog from './components/ChannelDialog.vue';
@@ -317,10 +318,30 @@ function handleAiDiagnose(row) {
   });
 }
 
-/** 格式化 AI 文本 (处理换行) */
+/** 转义 HTML 实体：AI 文本一律按纯文本处理，避免把其中的尖括号当成标签 */
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * 格式化 AI 文本（保留换行，供 v-html 渲染）
+ *
+ * 为什么必须净化：设备地址 addr 会拼进后端 prompt，有设备编辑权的人可写入 HTML；
+ * 若直接 `text.replace(/\n/g, '<br/>')` 交给 v-html，管理员点「AI 诊断」就会执行存储型 XSS。
+ * 这里先整体转义（AI 输出本质是纯文本），再只放行 <br> 保留原有换行排版，
+ * 最后由 DOMPurify 兜底（AGENTS §2.2 / §7.7：v-html 仅渲染 sanitize 后的内容）。
+ */
 function formatAiText(text) {
   if (!text) return "";
-  return text.replace(/\n/g, '<br/>');
+  return DOMPurify.sanitize(escapeHtml(text).replace(/\n/g, "<br/>"), {
+    ALLOWED_TAGS: ["br"],
+    ALLOWED_ATTR: []
+  });
 }
 /* ================= AI 模块逻辑 END ================= */
 const { proxy } = getCurrentInstance();

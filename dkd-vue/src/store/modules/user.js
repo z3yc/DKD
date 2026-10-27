@@ -1,5 +1,5 @@
 import { login, logout, getInfo } from '@/api/login'
-import { getToken, setToken, removeToken } from '@/utils/auth'
+import { getToken, setToken, removeToken, removeRememberedLogin } from '@/utils/auth'
 import defAva from '@/assets/images/profile.jpg'
 
 const useUserStore = defineStore(
@@ -55,6 +55,9 @@ const useUserStore = defineStore(
       // 退出系统
       logOut() {
         return new Promise((resolve, reject) => {
+          // 无论服务端注销是否成功（token 可能已失效），本地「记住登录」痕迹都要清掉：
+          // 退出后残留 username/rememberMe（及旧版本可逆的 password Cookie）会让下一人看到上一位的账号
+          removeRememberedLogin()
           logout(this.token).then(() => {
             this.token = ''
             this.roles = []

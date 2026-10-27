@@ -40,7 +40,7 @@
           <img :src="codeUrl" @click="getCode" class="login-code-img"/>
         </div>
       </el-form-item>
-      <el-checkbox v-model="loginForm.rememberMe" style="margin:0px 0px 25px 0px;">记住密码</el-checkbox>
+      <el-checkbox v-model="loginForm.rememberMe" style="margin:0px 0px 25px 0px;">记住账号</el-checkbox>
       <el-form-item style="width:100%;">
         <el-button
           :loading="loading"
@@ -67,7 +67,6 @@
 <script setup>
 import { getCodeImg } from "@/api/login";
 import Cookies from "js-cookie";
-import { encrypt, decrypt } from "@/utils/jsencrypt";
 import useUserStore from '@/store/modules/user'
 
 const userStore = useUserStore()
@@ -77,7 +76,8 @@ const { proxy } = getCurrentInstance();
 
 const loginForm = ref({
   username: "admin",
-  password: "admin123",
+  // 不预填任何密码（原 admin123 预填会把模板默认口令直接摆给访问者）
+  password: "",
   rememberMe: false,
   code: "",
   uuid: ""
@@ -105,17 +105,17 @@ function handleLogin() {
   proxy.$refs.loginRef.validate(valid => {
     if (valid) {
       loading.value = true;
-      // 勾选了需要记住密码设置在 cookie 中设置记住用户名和密码
+      // 「记住账号」只持久化用户名：密码（无论明文还是 RSA 加密）一律不落 Cookie——
+      // 前端 jsencrypt.js 里就有私钥，加密后的密码等于可逆，等同明文保存。
       if (loginForm.value.rememberMe) {
         Cookies.set("username", loginForm.value.username, { expires: 30 });
-        Cookies.set("password", encrypt(loginForm.value.password), { expires: 30 });
         Cookies.set("rememberMe", loginForm.value.rememberMe, { expires: 30 });
       } else {
-        // 否则移除
         Cookies.remove("username");
-        Cookies.remove("password");
         Cookies.remove("rememberMe");
       }
+      // 清理历史版本写入的加密密码 Cookie（30 天有效期内会一直残留）
+      Cookies.remove("password");
       // 调用action的登录方法
       userStore.login(loginForm.value).then(() => {
         const query = route.query;
@@ -148,12 +148,13 @@ function getCode() {
 }
 
 function getCookie() {
+  // 只回填用户名与勾选状态，密码不回填（历史残留的 password Cookie 顺手清掉）
+  Cookies.remove("password");
   const username = Cookies.get("username");
-  const password = Cookies.get("password");
   const rememberMe = Cookies.get("rememberMe");
   loginForm.value = {
     username: username === undefined ? loginForm.value.username : username,
-    password: password === undefined ? loginForm.value.password : decrypt(password),
+    password: "",
     rememberMe: rememberMe === undefined ? false : Boolean(rememberMe)
   };
 }
