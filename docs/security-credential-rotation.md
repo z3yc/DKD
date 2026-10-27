@@ -20,6 +20,8 @@
 | 5 | DeepSeek API Key | `DKD_DEEPSEEK_API_KEY` | `dkd-parent/.../application.yml`、`dkd-agent`（复用同一变量） | 小：仅 LLM 调用；控制台重新签发即可 | ✅ 旧 Key 实测已失效（HTTP 401，2026-09-21 核）；当前 Key 有效（live 用例通过） |
 | 6 | Druid 监控台口令 | `DKD_DRUID_PASSWORD` | `application-druid.yml`（login-username: ruoyi） | 极小：仅 `/druid` 页面 | ⏳ 待人工（本地低优先） |
 | 7 | 智能体只读库账号 `dkd_agent` | `DKD_AGENT_DB_PASSWORD` | `dkd-parent` **不引用**；仅 `dkd-agent`（Python）使用 | 小：只影响智能体服务（业务表只读白名单 + `agent_*` 可写无 DELETE） | ✅ 2026-09-21 已轮换（旧口令 1045 被拒、权限矩阵复测 3 项拒绝全中、Python 侧留痕写入复测通过） |
+| 8 | **dkd-app 运维端 JWT 签名密钥** | `DKD_APP_JWT_SECRET` | `dkd-app/src/main/resources/application-dev.yml`（`dkd.jwt.secret`） | 小：仅移动端，轮换后运维人员需重新登录 | ⏳ 待首次配置（2026-10-21 由硬编码 `"dkd"` 改造而来，见审计报告 F2）；缺失时 dkd-app **启动即失败** |
+| 9 | 智能体服务间密钥（两侧必须一致） | `DKD_AGENT_SERVICE_SECRET` | `dkd-parent/.../application.yml`（`agent.secret`）与 `dkd-agent`（`DKD_AGENT_SERVICE_SECRET`） | 中：不一致时 Python 对非回环调用返回 503（fail-closed），对话/补货确认不可用 | ⚠️ 容器部署必须两侧同时配置（2026-10-21 起 Python 对 `/agent/**` 强制校验） |
 
 > 关键判断：**1/2/3 属"改了会影响别人"的凭据，必须由项目负责人协调窗口**；
 > 4/5/6/7 可在低峰自行完成。本次执行的是 #7（唯一不改服务端配置的一类）。
@@ -52,6 +54,35 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer <旧token>" h
 # 期望：HTTP 200 + 信封 code=401（RuoYi 约定，见方案 §3.3.1 D）
 ```
 > 影响：在线用户全部掉线。**必须**在低峰或值班窗口执行，并提前告知使用方。
+
+### #8 dkd-app 运维端 JWT secret（2026-10-21 新增，替换源码里的硬编码 `"dkd"`）
+
+```powershell
+# 1) 生成并写入本机 .env（不入仓）。注意 Spring Boot 不会自动读 .env：
+#    本机需 setx，或写进 IDE 运行配置；容器部署写进 .env.deploy
+$s = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')   # 64 位十六进制，>=32 字节
+Add-Content .env "DKD_APP_JWT_SECRET=$s"
+Add-Content .env "DKD_SMS_MOCK=true"   # 仅本机/联调；生产必须 false（否则短信验证码不真实下发）
+# 2) 重启 dkd-app。缺这个变量会直接启动失败——这是刻意的 fail-closed
+# 3) 验证：旧令牌必须 401
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer <旧token>" http://127.0.0.1:9070/task-service/task/search
+# 期望 401；重新走"发验证码 → 登录"拿到新 token 后应 200
+```
+
+> 为什么不能给默认值：默认值等于把密钥写回仓库，正是审计报告 F2 的成因。
+
+### #9 智能体服务间密钥（Java 与 Python 两侧必须一致）
+
+```powershell
+# 生成一次，同时注入两侧（本机 .env / 容器 .env.deploy）
+$s = [guid]::NewGuid().ToString('N')
+Add-Content .env "DKD_AGENT_SERVICE_SECRET=$s"
+Add-Content .env.deploy "DKD_AGENT_SERVICE_SECRET=$s"
+```
+
+> 2026-10-21 起 Python 对 `/agent/**` 强制校验 `X-Agent-Secret`（回环来源除外），
+> Java 网关本来就会下发该头，所以**只需两侧值一致**。不一致时的表现是 Python 返回 503、
+> 前端看到"智能体服务暂不可用"，而不是 401（排障时别往"服务没起"上误判）。
 
 ### #4 OSS AK/SK（灰度而非硬切）
 
