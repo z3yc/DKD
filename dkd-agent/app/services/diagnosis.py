@@ -66,6 +66,11 @@ class DiagnosisEvidence(BaseModel):
     summary: str
     source: str
     detail: dict[str, Any] = Field(default_factory=dict)
+    # 2026-10-26（F-07）：证据必须能回溯到本轮某次工具调用的返回行。
+    # 这两个字段由 `app/graphs/fault_graph.py` 的 `trace_evidence()` 填写，
+    # 无法回溯的证据会被丢弃（不写假 ID）；页面据此把证据跳到对应的 tool_call。
+    evidence_id: str | None = Field(default=None, serialization_alias="evidenceId")
+    tool_call_id: str | None = Field(default=None, serialization_alias="toolCallId")
 
 
 class DiagnosisConclusion(BaseModel):
