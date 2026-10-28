@@ -4,6 +4,14 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
 "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.dkd.manage.mapper.OrderMapper">
 
+    <!--
+      时间范围检索纪律（与 AgentRunMapper.xml / AgentDecisionLogMapper.xml / InventoryLogMapper.xml 同一口径）：
+      禁止用 date_format() 等 SQL 函数包裹索引列（create_time），否则索引失效退化为全表扫描
+      （AGENTS §10）。半开区间写法：下界 >= #{params.beginTime}，上界 < endTime + 1 天——
+      前端日期控件传的是 yyyy-MM-dd（order/index.vue 的 addDateRange），直接 < endTime 会
+      漏掉结束日当天的订单。
+    -->
+
     <resultMap type="Order" id="OrderResult">
         <result property="id"    column="id"    />
         <result property="orderNo"    column="order_no"    />
@@ -40,11 +48,11 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         <include refid="selectOrderVo"/>
         <where>
             <if test="orderNo != null  and orderNo != ''"> and order_no = #{orderNo}</if>
-            <if test="params.beginTime != null and params.beginTime != ''"><!-- 开始时间检索 -->
-                AND date_format(create_time,'%y%m%d') &gt;= date_format(#{params.beginTime},'%y%m%d')
+            <if test="params.beginTime != null and params.beginTime != ''"><!-- 开始时间检索（原 date_format 写法已废弃：索引失效） -->
+                AND create_time &gt;= #{params.beginTime}
             </if>
-            <if test="params.endTime != null and params.endTime != ''"><!-- 结束时间检索 -->
-                AND date_format(create_time,'%y%m%d') &lt;= date_format(#{params.endTime},'%y%m%d')
+            <if test="params.endTime != null and params.endTime != ''"><!-- 结束时间检索：半开区间含 endTime 当天全部时刻 -->
+                AND create_time &lt; DATE_ADD(#{params.endTime}, INTERVAL 1 DAY)
             </if>
         </where>
     </select>
