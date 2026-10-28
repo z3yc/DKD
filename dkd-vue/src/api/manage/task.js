@@ -64,18 +64,18 @@ export function getTaskDetails(taskId) {
     method: 'get'
   })
 }
-// 获取补货预警值
+// 获取补货预警值（后端 JobController 的映射路径是 /manage/taskJob，不是 /manage/job）
 export function getJob(id) {
   return request({
-    url: '/manage/job/' + id,
+    url: '/manage/taskJob/' + id,
     method: 'get'
   })
 }
 
-// 设置补货阈值
+// 设置补货阈值（后端 JobController 的映射路径是 /manage/taskJob，不是 /manage/job）
 export function setJob(data) {
   return request({
-    url: '/manage/job',
+    url: '/manage/taskJob',
     method: 'put',
     data:data
   })

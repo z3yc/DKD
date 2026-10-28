@@ -1,5 +1,10 @@
 <template>
-  <div class="app-container restock-page">
+  <!--
+    页面级权限门控：后端 Java 网关 /agent/restock/** 判的是 manage:task:list（不是 9002~9006 的
+    manage:restock:*，那批按钮权限待废弃），前端用同一权限点隐藏整页，
+    避免无权限角色从地址栏直接进来后满屏 403。
+  -->
+  <div class="app-container restock-page" v-hasPermi="['manage:task:list']">
     <div class="page-head">
       <div class="page-head__title">智能补货工作台</div>
       <div class="page-head__sub">
@@ -72,12 +77,20 @@
           <el-button size="small" :icon="Refresh" :loading="loading" @click="getList">刷新</el-button>
           <el-button
             v-if="!pause.paused"
+            v-hasPermi="['manage:task:add']"
             size="small"
             type="warning"
             plain
             @click="openPauseDialog"
           >暂停自动分析</el-button>
-          <el-button size="small" type="primary" :loading="confirmAllLoading" :disabled="!pendingPlans.length" @click="handleConfirmAll">
+          <el-button
+            size="small"
+            type="primary"
+            :loading="confirmAllLoading"
+            :disabled="!pendingPlans.length"
+            @click="handleConfirmAll"
+            v-hasPermi="['manage:task:add']"
+          >
             全部确认建单（{{ pendingPlans.length }}）
           </el-button>
         </div>
@@ -92,7 +105,7 @@
       >
         <template #title>
           <span>已暂停自动补货分析：明日 06:00 不再生成新建议，当前清单仍可继续处理。</span>
-          <el-button size="small" text type="primary" style="margin-left: 12px" @click="openResumeDialog">恢复自动分析</el-button>
+          <el-button size="small" text type="primary" style="margin-left: 12px" @click="openResumeDialog" v-hasPermi="['manage:task:add']">恢复自动分析</el-button>
         </template>
         <template v-if="pause.reason" #default>
           <span class="dim">暂停原因：{{ pause.reason }}（操作人 {{ pause.paused_by || '-' }}）</span>
@@ -219,12 +232,12 @@
         <el-table-column label="操作" width="230" align="right" fixed="right">
           <template #default="{ row }">
             <template v-if="isPending(row.status)">
-              <el-button size="small" type="primary" @click="handleConfirm(row)">确认建单</el-button>
-              <el-button size="small" @click="openAdjustDialog(row)">调整</el-button>
-              <el-button size="small" type="danger" plain @click="openSkipDialog(row)">跳过</el-button>
+              <el-button size="small" type="primary" @click="handleConfirm(row)" v-hasPermi="['manage:task:add']">确认建单</el-button>
+              <el-button size="small" @click="openAdjustDialog(row)" v-hasPermi="['manage:task:add']">调整</el-button>
+              <el-button size="small" type="danger" plain @click="openSkipDialog(row)" v-hasPermi="['manage:task:add']">跳过</el-button>
             </template>
             <template v-else-if="row.status === STATUS.SKIPPED">
-              <el-button size="small" type="primary" plain @click="openRestoreDialog(row)">恢复建议</el-button>
+              <el-button size="small" type="primary" plain @click="openRestoreDialog(row)" v-hasPermi="['manage:task:add']">恢复建议</el-button>
             </template>
             <template v-else-if="row.status === STATUS.ORDERING">
               <span class="dim">建单处理中，请稍候刷新</span>
@@ -274,6 +287,7 @@ import {
 } from '@/api/manage/restock'
 import RestockAdjustDialog from './components/RestockAdjustDialog.vue'
 import RestockReasonDialog from './components/RestockReasonDialog.vue'
+import { checkPermi } from '@/utils/permission'
 
 /**
  * 智能补货工作台（排期 1-10 / 1-11；后端 1-7）。
@@ -362,6 +376,9 @@ const filteredPlans = computed(() =>
 )
 
 onMounted(() => {
+  // 无 manage:task:list 时整页已被 v-hasPermi 移除，这里不再发起必然 403 的请求
+  //（checkPermi 与 v-hasPermi 同一套判定，含 admin 的 *:*:*）
+  if (!checkPermi(['manage:task:list'])) return
   getList()
   loadPauseState()
 })

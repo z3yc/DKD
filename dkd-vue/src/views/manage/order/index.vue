@@ -73,8 +73,8 @@
         <el-form-item label="订单状态" prop="status">
           <span>{{ getOrderStatusLabel(form.status) }}</span>
         </el-form-item>
-        <el-form-item label="设备编号" prop="orderNo">
-          <span>{{ form.orderNo }}</span>
+        <el-form-item label="设备编号" prop="innerCode">
+          <span>{{ form.innerCode ?? '—' }}</span>
         </el-form-item>
         <el-form-item label="设备地址" prop="addr">
           <span>{{ form.addr }}</span>
@@ -94,7 +94,8 @@
       </el-form>
       <template #footer>
         <div class="dialog-footer">
-          <el-button v-if="form.status === 1" type="primary" @click="handleRefund">退款</el-button>
+          <!-- 与后端规则对齐：OrderServiceImpl.canRefund 只允许 status=2（出货成功），canCancel 只允许 status=0（待支付） -->
+          <el-button v-if="form.status === 2" type="primary" @click="handleRefund">退款</el-button>
           <el-button v-if="form.status === 0" type="danger" @click="handleCancel">取消</el-button>
           <el-button @click="cancel">关闭</el-button>
         </div>
@@ -118,7 +119,16 @@
 </template>
 
 <script setup name="Order">
-import { listOrder, getOrder, delOrder, addOrder, updateOrder } from "@/api/manage/order";
+import { ElMessage, ElMessageBox } from "element-plus";
+import {
+  listOrder,
+  getOrder,
+  delOrder,
+  addOrder,
+  updateOrder,
+  cancelOrder,
+  refundOrder
+} from "@/api/manage/order";
 import { loadAllParams } from "@/api/page";
 const { proxy } = getCurrentInstance();
 const { order_status } = proxy.useDict('order_status');
@@ -153,7 +163,7 @@ const data = reactive({
 const { queryParams, form, rules } = toRefs(data);
 
 
-// 订单状态格式化函数
+// 订单状态格式化函数（状态口径与后端 Order 实体注释一致：0待支付/1支付完成/2出货成功/3出货失败/4已取消）
 function getOrderStatusLabel(status) {
   const statusMap = {
     0: '待支付',
@@ -162,18 +172,22 @@ function getOrderStatusLabel(status) {
     3: '出货失败',
     4: '已取消'
   };
-  return statusMap[status] || '未知状态';
+  // 用 ?? 而不是 ||：状态 4 的文案是合法值，将来若出现"空文案"也不该被兜底成未知
+  return statusMap[status] ?? '未知状态';
 }
 
+// el-tag 的 type 白名单（element-plus 2.4.3）只有 success/info/warning/danger/''，
+// 'primary' 不是合法值（会每次渲染触发 Vue prop 校验告警），出货成功用空串走默认主色。
 function getOrderStatusType(status) {
   const typeMap = {
     0: 'warning',    // 待支付 - 黄色
     1: 'success',    // 支付完成 - 绿色
-    2: 'primary',    // 出货成功 - 蓝色
+    2: '',           // 出货成功 - 默认主色（合法值为空串，不能用 'primary'）
     3: 'danger',     // 出货失败 - 红色
     4: 'info'        // 已取消 - 灰色
   };
-  return typeMap[status] || 'info';
+  // 必须用 ??：空串是合法默认主色，用 || 会被兜底成 'info'（灰）
+  return typeMap[status] ?? 'info';
 }
 
 /** 查询订单列表 */
@@ -213,27 +227,50 @@ function handleUpdate(row) {
   });
 }
 
+/**
+ * 申请退款（二次确认 → 调后端 → 刷新列表）。
+ * 后端 OrderServiceImpl.refundOrder 只对 status=2（出货成功）生效，置 payStatus=2 退款中；
+ * 不满足条件时后端返回 error，request 拦截器会统一 toast，因此这里不再额外兜底提示。
+ */
 function handleRefund() {
-  refundOrder(form.value.id).then(() => {
-    open.value = false;
-    getList();
-  }).catch(error => {
-    console.error("退款失败", error);
-  });
+  ElMessageBox.confirm(
+    `确认为订单「${form.value.orderNo}」申请退款？退款金额将原路退回。`,
+    '申请退款',
+    { type: 'warning', confirmButtonText: '确认退款', cancelButtonText: '取消' }
+  )
+    .then(() => refundOrder(form.value.id))
+    .then(() => {
+      open.value = false;
+      getList();
+      ElMessage.success('退款申请已提交');
+    })
+    .catch(() => {});
 }
 
+/** 打开取消原因弹窗（取消必须填原因，便于对账追溯） */
 function handleCancel() {
+  cancelForm.reason = '';
   cancelDialogVisible.value = true;
 }
 
+/**
+ * 提交取消订单：原因必填（后端 @RequestBody String cancelDesc 原样落库）。
+ * 后端 OrderServiceImpl.cancelOrder 只对 status=0（待支付）生效。
+ */
 function confirmCancel() {
-  cancelOrder(form.value.id, cancelForm.reason).then(() => {
-    cancelDialogVisible.value = false;
-    open.value = false;
-    getList();
-  }).catch(error => {
-    console.error("取消订单失败", error);
-  });
+  const reason = (cancelForm.reason || '').trim();
+  if (!reason) {
+    ElMessage.warning('请输入取消原因');
+    return;
+  }
+  cancelOrder(form.value.id, reason)
+    .then(() => {
+      cancelDialogVisible.value = false;
+      open.value = false;
+      getList();
+      ElMessage.success('订单已取消');
+    })
+    .catch(() => {});
 }
 
 

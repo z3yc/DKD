@@ -44,10 +44,11 @@ export function delNode(id) {
 }
 
 // 导出点位导入模板
+// 注意：后端 NodeController.importTemplate 是 @PostMapping，前端必须 POST，否则 405
 export function getImportTemplate() {
   return request({
     url: '/manage/node/importTemplate',
-    method: 'get',
+    method: 'post',
     responseType: 'blob'
   })
 }

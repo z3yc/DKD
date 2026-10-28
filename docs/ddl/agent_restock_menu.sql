@@ -76,7 +76,7 @@ INSERT INTO sys_menu VALUES(
   'manage/restock/index',
   '',
   1, 0, 'C', '0', '0',
-  'manage:restock:list',
+  'manage:task:list',
   'shopping',
   'admin', @now, '', NULL,
   'Agent 每日 06:00 生成补货建议，人工确认后建单（排期 1-10/1-11）'
@@ -85,15 +85,17 @@ INSERT INTO sys_menu VALUES(
 -- ---------------------------------------------------------------------------
 -- 按钮权限（menu_type = 'F'；与前端 v-hasPermi 一一对应）
 --
--- 说明：本轮前端对写操作**未加 v-hasPermi**（工作台目前面向运维/运营同一角色），
--- 但权限标识先建出来，避免后续收权限时还要补一轮 DDL。
--- 若确认本轮不需要按钮级权限，可把下面 5 行整体注释掉——不影响页面可用性。
+-- 说明（2026-10-28 修订）：权限点必须与 Java 网关**同名**——`/agent/restock/**` 网关判
+-- manage:task:list（读）/ manage:task:add（写）。原脚本造的 manage:restock:* 与网关不一致，
+-- 导致"按菜单授权仍 403"（业务规范 §5 待修项）。本文已按新口径生成；**已建库的旧环境**
+-- 用 docs/ddl/normalize_business_v2.sql 第 1.6 步做等价 UPDATE。
+-- 前端工作台已加 v-hasPermi，同样使用 manage:task:*。
 -- ---------------------------------------------------------------------------
-INSERT INTO sys_menu VALUES(@menu_base+2, '补货清单查询', @menu_base+1, '1', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:list',    '#', 'admin', @now, '', NULL, '');
-INSERT INTO sys_menu VALUES(@menu_base+3, '补货建议确认', @menu_base+1, '2', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:confirm', '#', 'admin', @now, '', NULL, '');
-INSERT INTO sys_menu VALUES(@menu_base+4, '补货建议调整', @menu_base+1, '3', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:adjust',  '#', 'admin', @now, '', NULL, '');
-INSERT INTO sys_menu VALUES(@menu_base+5, '补货建议跳过', @menu_base+1, '4', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:skip',    '#', 'admin', @now, '', NULL, '');
-INSERT INTO sys_menu VALUES(@menu_base+6, '自动分析开关', @menu_base+1, '5', '', '', '', 1, 0, 'F', '0', '0', 'manage:restock:pause',   '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+2, '补货清单查询', @menu_base+1, '1', '', '', '', 1, 0, 'F', '0', '0', 'manage:task:list', '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+3, '补货建议确认', @menu_base+1, '2', '', '', '', 1, 0, 'F', '0', '0', 'manage:task:add',  '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+4, '补货建议调整', @menu_base+1, '3', '', '', '', 1, 0, 'F', '0', '0', 'manage:task:add',  '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+5, '补货建议跳过', @menu_base+1, '4', '', '', '', 1, 0, 'F', '0', '0', 'manage:task:add',  '#', 'admin', @now, '', NULL, '');
+INSERT INTO sys_menu VALUES(@menu_base+6, '自动分析开关', @menu_base+1, '5', '', '', '', 1, 0, 'F', '0', '0', 'manage:task:add',  '#', 'admin', @now, '', NULL, '');
 
 -- ---------------------------------------------------------------------------
 -- 角色授权（可选）

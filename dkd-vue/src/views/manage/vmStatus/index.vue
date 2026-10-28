@@ -34,11 +34,8 @@
       </el-table-column>
       <el-table-column label="设备状态" align="center" prop="vmStatus">
         <template #default="scope">
-          <!-- <span v-if="scope.row.runningStatus !== null">
-            {{ JSON.parse(scope.row.runningStatus).status==true?'正常':'异常' }}
-          </span>
-          <span v-else>异常</span> -->
-          {{ scope.row.runningStatus!== null ? JSON.parse(scope.row.runningStatus).status==true?'正常':'异常':'异常' }} 
+          <!-- 复用详情弹窗的容错函数：runningStatus 可能是非法 JSON，裸 JSON.parse 会炸整表 -->
+          {{ runningStatusText(scope.row.runningStatus) }}
         </template>
       </el-table-column>
       <el-table-column label="操作" align="center" class-name="small-padding fixed-width">
@@ -57,9 +54,34 @@
       @pagination="getList"
     />
 
-    <!-- 添加或修改设备管理对话框 -->
-    <el-dialog :title="title" v-model="open" width="500px" append-to-body>
-    
+    <!-- 设备详情对话框：数据来自 GET /manage/vm/{id}。
+         后端只返回 nodeId/partnerId/regionId/vmTypeId 等裸 ID，名称必须用页面初始化时
+         已加载的选项列表（vmTypeOptions/nodeOptions/partnerOptions/regionOptions）翻译；
+         runningStatus 是后端存的 JSON 字符串，需容错解析后再判断，与列表列口径保持一致。 -->
+    <el-dialog :title="title" v-model="open" width="700px" append-to-body>
+      <el-descriptions :column="2" border size="default">
+        <el-descriptions-item label="设备编号">{{ form.innerCode ?? '—' }}</el-descriptions-item>
+        <el-descriptions-item label="设备型号">{{ optionName(vmTypeOptions, form.vmTypeId, 'name') }}</el-descriptions-item>
+        <el-descriptions-item label="所属点位">{{ optionName(nodeOptions, form.nodeId, 'nodeName') }}</el-descriptions-item>
+        <el-descriptions-item label="合作商">{{ optionName(partnerOptions, form.partnerId, 'partnerName') }}</el-descriptions-item>
+        <el-descriptions-item label="所属区域">{{ optionName(regionOptions, form.regionId, 'regionName') }}</el-descriptions-item>
+        <el-descriptions-item label="设备容量">{{ form.channelMaxCapacity ?? '—' }}</el-descriptions-item>
+        <el-descriptions-item label="运营状态">
+          <dict-tag :options="vm_status" :value="form.vmStatus" />
+        </el-descriptions-item>
+        <el-descriptions-item label="设备状态">
+          <el-tag :type="runningStatusTag(form.runningStatus)" size="small">{{ runningStatusText(form.runningStatus) }}</el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="详细地址" :span="2">{{ form.addr ?? '—' }}</el-descriptions-item>
+        <el-descriptions-item label="最近补货时间">{{ parseTime(form.lastSupplyTime) || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="更新时间">{{ form.updateTime ?? '—' }}</el-descriptions-item>
+        <el-descriptions-item label="创建时间" :span="2">{{ form.createTime ?? '—' }}</el-descriptions-item>
+      </el-descriptions>
+      <template #footer>
+        <div class="dialog-footer">
+          <el-button @click="open = false">关 闭</el-button>
+        </div>
+      </template>
     </el-dialog>
   </div>
 </template>
@@ -189,6 +211,44 @@ function getVmInfo(row) {
     open.value = true;
     title.value = "设备详情";
   });
+}
+
+/**
+ * 详情里把裸 ID 翻译成名称
+ * 模板中传入的 optionList 是已自动解包的数组（不是 ref），因此这里直接当数组用。
+ * 查不到（列表未加载完 / 数据被删）时回退为 '—'，不显示裸 ID 免得误导运维。
+ */
+function optionName(optionList, id, field) {
+  if (id === null || id === undefined) {
+    return '—';
+  }
+  const hit = Array.isArray(optionList) ? optionList.find(item => item.id === id) : null;
+  return hit && hit[field] ? hit[field] : '—';
+}
+
+/**
+ * runningStatus 是后端存库的 JSON 字符串（如 {"statusCode":"1001","status":true}），
+ * 硬件上报或历史数据可能不是合法 JSON —— 解析失败按"异常"处理，与列表「设备状态」列口径一致，
+ * 绝不能让 JSON.parse 抛错把整个详情弹窗打挂。
+ */
+function parseRunningStatus(raw) {
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function runningStatusText(raw) {
+  const parsed = parseRunningStatus(raw);
+  return parsed !== null && parsed.status === true ? '正常' : '异常';
+}
+
+function runningStatusTag(raw) {
+  return runningStatusText(raw) === '正常' ? 'success' : 'danger';
 }
 
 /** 提交按钮 */
