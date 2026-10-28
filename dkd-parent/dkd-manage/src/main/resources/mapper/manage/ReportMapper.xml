@@ -104,6 +104,20 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         </foreach>
     </delete>
 
+    <!--
+      同日重复生成必须 **upsert** 而不是 1062（业务规范 §3.5 / §4.5）。
+
+      为什么改（原实现虽叫 insertOrIgnore，SQL 其实是普通 insert）：
+        tb_report 有唯一键 uk_type_date (report_type, report_date)，同一天重跑（手工点“生成”或
+        Quartz 补偿）会抛 DuplicateKeyException；而原 Service 用双层 catch 把它吞掉，
+        接口与 sys_job_log 都显示成功 —— 报表数字却**没有更新**。
+      现在的语义：
+        · 新日期 → 正常插入，回填 id；
+        · 同 (report_type, report_date) → 覆盖全部指标/AI 分析/状态，update_time 刷新；
+        · 仍保留 create_time（首行创建时间），不把历史创建时间改掉。
+      注意：使用 VALUES(col) 引用待插入值（MySQL 5.7/8.0 均支持；8.0.20+ 仅告警不报错），
+      避免为每一列再写一遍 #{param} 造成“插入值与更新值”两处口径漂移。
+    -->
     <insert id="insertOrIgnoreReport" parameterType="Report" useGeneratedKeys="true" keyProperty="id">
         insert into tb_report (
             report_type, report_date, total_revenue, total_orders,
@@ -116,6 +130,20 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
             #{topProducts}, #{topNodes}, #{anomalyAlerts}, #{aiAnalysis},
             #{retryCount}, #{status}, sysdate()
         )
+        on duplicate key update
+            total_revenue     = values(total_revenue),
+            total_orders      = values(total_orders),
+            total_devices     = values(total_devices),
+            online_devices    = values(online_devices),
+            fault_devices     = values(fault_devices),
+            low_stock_devices = values(low_stock_devices),
+            top_products      = values(top_products),
+            top_nodes         = values(top_nodes),
+            anomaly_alerts    = values(anomaly_alerts),
+            ai_analysis       = values(ai_analysis),
+            retry_count       = values(retry_count),
+            status            = values(status),
+            update_time       = sysdate()
     </insert>
 
     <!--
@@ -179,8 +207,19 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         order by sales desc limit 10
     </select>
 
+    <!--
+      库存不足设备数：**按设备去重**，不是库存行数（业务规范 §4.5）。
+
+      原实现 `count(*) from tb_inventory where current_stock = min_stock` 两个口径错误：
+        ① 一台设备有多个货道时会被重复计数（设备数被放大成“库存行数”）；
+        ② 只统计“恰好等于 min_stock”，库存已低于 min_stock（含 0 缺货）反而不算不足。
+      口径与预警一致：current_stock <= min_stock（缺货=0，低库存=<=min，§2.2/§4.4），
+      并按 vm_id 去重。该查询是全表聚合，但 tb_inventory 行数受设备×货道约束（非订单级增长），
+      且由定时任务每日一次触发，不引入时间窗（无时间列语义）。
+    -->
     <select id="countLowStockDevices" resultType="Integer">
-        select count(*) from tb_inventory where current_stock = min_stock
+        select count(distinct vm_id) from tb_inventory
+        where current_stock &lt;= min_stock
     </select>
 
 </mapper>

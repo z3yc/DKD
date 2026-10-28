@@ -26,13 +26,16 @@ CREATE TABLE tb_report (
 
 -- ----------------------------
 -- 定时任务：日报（每天 08:00）
+-- 注意：sys_job.status 口径为 0=正常 / 1=暂停（RuoYi 字典）。
+-- 历史脚本写成 '1' 等于“安装即暂停”，日报永远不会执行且没有任何告警（AGENTS §6.4 / 业务规范 §4.7）。
 -- ----------------------------
-INSERT INTO sys_job VALUES (100, 'AI运营日报', 'DEFAULT', 'reportTask.generateDailyReport()', '0 0 8 * * ?', '3', '1', '1', 'admin', sysdate(), '', null, '每日08:00自动生成AI运营日报');
+INSERT INTO sys_job VALUES (100, 'AI运营日报', 'DEFAULT', 'reportTask.generateDailyReport()', '0 0 8 * * ?', '3', '1', '0', 'admin', sysdate(), '', null, '每日08:00自动生成AI运营日报');
 
 -- ----------------------------
 -- 定时任务：周报（每周一 08:00）
+-- 同上：status 必须是 '0'（正常），否则周报安装即暂停。
 -- ----------------------------
-INSERT INTO sys_job VALUES (101, 'AI运营周报', 'DEFAULT', 'reportTask.generateWeeklyReport()', '0 0 8 ? * MON', '3', '1', '1', 'admin', sysdate(), '', null, '每周一08:00自动生成AI运营周报');
+INSERT INTO sys_job VALUES (101, 'AI运营周报', 'DEFAULT', 'reportTask.generateWeeklyReport()', '0 0 8 ? * MON', '3', '1', '0', 'admin', sysdate(), '', null, '每周一08:00自动生成AI运营周报');
 
 -- ----------------------------
 -- 菜单 SQL

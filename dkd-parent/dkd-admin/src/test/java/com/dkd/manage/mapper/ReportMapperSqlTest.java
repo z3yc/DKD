@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.InputStream;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 
 import javax.xml.parsers.DocumentBuilder;
@@ -74,19 +75,23 @@ class ReportMapperSqlTest
         }
     }
 
-    /** 取出某个 statement 的 SQL 文本（去掉多余空白，便于断言子串）。 */
+    /** 取出某个 statement 的 SQL 文本（去掉多余空白，便于断言子串；select/insert/update 都支持）。 */
     private static String sqlOf(String statementId)
     {
-        NodeList nodes = document.getElementsByTagName("select");
-        for (int i = 0; i < nodes.getLength(); i++)
+        String[] tags = new String[] { "select", "insert", "update", "delete" };
+        for (String tag : tags)
         {
-            Element element = (Element) nodes.item(i);
-            if (statementId.equals(element.getAttribute("id")))
+            NodeList nodes = document.getElementsByTagName(tag);
+            for (int i = 0; i < nodes.getLength(); i++)
             {
-                return element.getTextContent().replaceAll("\\s+", " ").trim();
+                Element element = (Element) nodes.item(i);
+                if (statementId.equals(element.getAttribute("id")))
+                {
+                    return element.getTextContent().replaceAll("\\s+", " ").trim();
+                }
             }
         }
-        throw new AssertionError("ReportMapper.xml 中找不到 select id=" + statementId);
+        throw new AssertionError("ReportMapper.xml 中找不到 statement id=" + statementId);
     }
 
     @Test
@@ -153,5 +158,44 @@ class ReportMapperSqlTest
             assertNotNull(sqlOf(id), id + " 不存在");
         }
         assertEquals(4, AGGREGATE_STATEMENTS.size(), "聚合查询数量变化时请同步本测试");
+    }
+
+    /**
+     * 低库存口径（业务规范 §4.5）：`count(distinct vm_id)` where `current_stock <= min_stock`。
+     *
+     * <p>原 SQL 是 `count(*) ... where current_stock = min_stock`：
+     * ① 统计的是库存**行数**，一台设备多个货道会被重复计数（指标名却叫“库存不足设备数”）；
+     * ② 只算“恰好等于 min_stock”，库存已跌破阈值（含 0 缺货）反而不算不足。
+     */
+    @Test
+    @DisplayName("低库存设备数按 vm 去重，且口径为 current_stock <= min_stock")
+    void lowStockDevicesMustBeDistinctVmAndCoverBelowThreshold()
+    {
+        String sql = sqlOf("countLowStockDevices").toLowerCase(Locale.ROOT);
+        assertTrue(sql.contains("count(distinct vm_id)"),
+                "库存不足设备数必须按设备去重（count(distinct vm_id)），不能数库存行\nSQL=" + sql);
+        assertTrue(sql.contains("current_stock <= min_stock"),
+                "低库存口径必须是 current_stock <= min_stock（含缺货），不能只算恰好等于\nSQL=" + sql);
+        assertFalse(sql.contains("current_stock = min_stock"),
+                "退回了只统计“恰好等于阈值”的旧口径\nSQL=" + sql);
+    }
+
+    /**
+     * 同日重复生成必须 upsert（业务规范 §3.5）：唯一键 `uk_type_date (report_type, report_date)`
+     * 撞车时覆盖指标，而不是抛 1062 被吞（原 Service 双层 catch 会把失败伪装成成功）。
+     */
+    @Test
+    @DisplayName("report 写入必须是 ON DUPLICATE KEY UPDATE upsert")
+    void reportInsertMustBeUpsert()
+    {
+        String sql = sqlOf("insertOrIgnoreReport").toLowerCase(Locale.ROOT);
+        assertTrue(sql.contains("on duplicate key update"),
+                "同名同日重跑必须是 upsert，否则唯一键 1062 会让报表无法更新\nSQL=" + sql);
+        assertTrue(sql.contains("total_revenue = values(total_revenue)"),
+                "upsert 必须覆盖营收指标\nSQL=" + sql);
+        assertTrue(sql.contains("status = values(status)"),
+                "upsert 必须覆盖生成状态（成功/失败）\nSQL=" + sql);
+        assertFalse(sql.contains("insert ignore"),
+                "INSERT IGNORE 会静默丢弃新数据，不是覆盖\nSQL=" + sql);
     }
 }
