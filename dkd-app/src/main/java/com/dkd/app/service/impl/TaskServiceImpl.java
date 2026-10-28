@@ -137,8 +137,8 @@ public class TaskServiceImpl extends ServiceImpl<TaskMapper, Task> implements Ta
         if (ObjectUtil.isEmpty(task)) {
             throw new LogicException("工单不存在");
         }
-        // 2.判断工单状态是否为刚创建（待处理）
-        if (task.getTaskStatus() != VmSystemConstant.TASK_STATUS_CREATE) {
+        // 2.判断工单状态是否为刚创建（待处理）；Integer 比较用 equals，避免包装类型 == 的缓存陷阱
+        if (!VmSystemConstant.TASK_STATUS_CREATE.equals(task.getTaskStatus())) {
             throw new LogicException("此工单状态不是待处理，无法接受");
         }
         // 3.判断登录人是否有权接受工单
@@ -159,9 +159,9 @@ public class TaskServiceImpl extends ServiceImpl<TaskMapper, Task> implements Ta
         if (ObjectUtil.isEmpty(tassk)) {
             throw new LogicException("工单不存在");
         }
-        // 2.判断工单状态是否为刚创建（待处理）
-        if (tassk.getTaskStatus() == VmSystemConstant.TASK_STATUS_FINISH ||
-                tassk.getTaskStatus() == VmSystemConstant.TASK_STATUS_CANCEL) {
+        // 2.判断工单状态是否为刚创建（待处理）；Integer 比较用 equals，避免包装类型 == 的缓存陷阱
+        if (VmSystemConstant.TASK_STATUS_FINISH.equals(tassk.getTaskStatus()) ||
+                VmSystemConstant.TASK_STATUS_CANCEL.equals(tassk.getTaskStatus())) {
             throw new LogicException("此工单状态不是待处理或进行中，无法取消");
         }
         // 3.判断登录人是否有权取消工单
@@ -177,8 +177,22 @@ public class TaskServiceImpl extends ServiceImpl<TaskMapper, Task> implements Ta
         return b;
     }
 
-    // 完成工单
-    @Transactional
+    /**
+     * 完成工单（a~d 四件事在同一事务里，任一步失败整体回滚，工单不完成）。
+     *
+     * <p>清晰版 §2.2 / §4.2：
+     * <ul>
+     *   <li>a. 工单状态 → 4；</li>
+     *   <li>b/c/d. 按类型产生副作用：投放→设备运行中；撤机→设备已撤机；补货→货道缓存 + 库存台账 + 流水；</li>
+     *   <li>Integer 状态/类型比较必须用 equals：这些常量是 java.lang.Integer 包装类型，
+     *       用 == 只在 -128~127 的缓存区间内"碰巧"成立，是典型的静默失效写法。</li>
+     * </ul>
+     *
+     * @param taskId 工单Id
+     * @param userId 登录人Id（必须等于工单执行人）
+     * @return 是否成功
+     */
+    @Transactional(rollbackFor = Exception.class)
     @Override
     public Boolean complete(Long taskId, Integer userId) {
         // 1.判断工单是否存在
@@ -186,13 +200,16 @@ public class TaskServiceImpl extends ServiceImpl<TaskMapper, Task> implements Ta
         if (ObjectUtil.isEmpty(task)) {
             throw new LogicException("工单不存在");
         }
-        // 2.判断工单状态
-        if (task.getTaskStatus() == VmSystemConstant.TASK_STATUS_FINISH ||
-                task.getTaskStatus() == VmSystemConstant.TASK_STATUS_CANCEL ||
-                task.getTaskStatus() == VmSystemConstant.TASK_STATUS_CREATE) {
+        // 2.判断工单状态（必须是进行中；Integer 比较用 equals，避免包装类型 == 的缓存陷阱）
+        if (VmSystemConstant.TASK_STATUS_FINISH.equals(task.getTaskStatus()) ||
+                VmSystemConstant.TASK_STATUS_CANCEL.equals(task.getTaskStatus()) ||
+                VmSystemConstant.TASK_STATUS_CREATE.equals(task.getTaskStatus())) {
             throw new LogicException("此工单状态不是进行中，无法完成");
         }
         // 3.判断登录人是否有权完成工单
+        if (userId == null) {
+            throw new LogicException("未获取到登录人信息，无法完成工单");
+        }
         if (!userId.equals(task.getUserId())) {
             throw new LogicException("此登录人无权完成工单");
         }
@@ -200,25 +217,28 @@ public class TaskServiceImpl extends ServiceImpl<TaskMapper, Task> implements Ta
         task.setTaskStatus(VmSystemConstant.TASK_STATUS_FINISH);
         boolean b = this.updateById(task);
         if (!b) {
-            return b;
+            throw new LogicException("工单状态更新失败，请刷新后重试");
         }
-        // 5. 更新设备状态
+        // 5. 副作用：设备状态 / 补货库存回写（同一事务）
         //判断工单类型  如果是投放工单，则修改为运行中状态
-        if (task.getProductTypeId().equals(TaskTypeConstant.TASK_TYPE_DEPLOY)) {
+        if (TaskTypeConstant.TASK_TYPE_DEPLOY.equals(task.getProductTypeId())) {
             b = vendingMachineService.updateStatus(task.getInnerCode(), VmStatusConstant.VM_STATUS_RUNNING);
         }
         //判断工单类型  如果是撤机工单，则修改为撤机状态
-        if (task.getProductTypeId().equals(TaskTypeConstant.TASK_TYPE_REVOKE)) {
+        else if (TaskTypeConstant.TASK_TYPE_REVOKE.equals(task.getProductTypeId())) {
             b = vendingMachineService.updateStatus(task.getInnerCode(), VmStatusConstant.VM_STATUS_REVOKE);
         }
-        //判断如果是补货工单
-        if (task.getProductTypeId().equals(TaskTypeConstant.TASK_TYPE_SUPPLY)) {
+        //判断如果是补货工单：货道缓存 + 库存台账 + 库存流水（清晰版 §2.2 的 b/c/d）
+        else if (TaskTypeConstant.TASK_TYPE_SUPPLY.equals(task.getProductTypeId())) {
             // 查询工单明细
             List<TaskDetails> details = taskDetailsService.getByTaskId(task.getTaskId());
-            // 更新货道库存
-            b = vendingMachineService.supply(task.getInnerCode(), details);
+            // operator 传工单执行人姓名：流水 tb_inventory_log.operator_name 是审计必写字段
+            b = vendingMachineService.supply(task.getInnerCode(), details, task.getUserName());
         }
-        // 6.返回结果
+        // 6.副作用任何一步没生效都必须抛异常回滚：不允许"返回 false 但工单已提交"
+        if (!b) {
+            throw new LogicException("工单完成失败：设备状态或库存回写未生效，请重试");
+        }
         return b;
     }
 }
