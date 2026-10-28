@@ -47,6 +47,15 @@
     </el-form>
 
     <el-row :gutter="10" class="mb8">
+      <el-col :span="1.5">
+        <el-button
+          type="primary"
+          plain
+          icon="Plus"
+          v-hasPermi="['manage:vm:query']"
+          @click="openStartDialog"
+        >发起故障诊断</el-button>
+      </el-col>
       <right-toolbar v-model:showSearch="showSearch" @queryTable="getList" />
     </el-row>
 
@@ -141,6 +150,29 @@
             <el-descriptions-item label="终止原因" :span="2">{{ drawer.run.stopReason || '—' }}</el-descriptions-item>
           </el-descriptions>
 
+          <!-- 故障场景：派单提案单独摆出来。运营点「确认建单」前必须能看见“派给谁、凭什么”，
+               而不是只看到一个按钮（提案来自 step2 的 evidenceJson，解析失败则整块不显示）。 -->
+          <template v-if="drawer.run.sceneCode === 'fault' && faultProposal">
+            <div class="drawer-section-title">派单提案</div>
+            <el-descriptions :column="2" border size="small">
+              <el-descriptions-item label="接单人">{{ faultProposal.assigneeName || '待指派' }}</el-descriptions-item>
+              <el-descriptions-item label="优先级">{{ priorityLabel(faultProposal.priority) }}</el-descriptions-item>
+              <el-descriptions-item label="可执行">{{ faultProposal.dispatchable ? '是' : '否' }}</el-descriptions-item>
+              <el-descriptions-item label="依据证据">
+                {{ (faultProposal.basedOnEvidence || []).length }} 条
+              </el-descriptions-item>
+              <el-descriptions-item label="选人依据" :span="2">
+                区域 {{ faultProposal.assigneeBasis?.regionId ?? '—' }} ·
+                候选 {{ faultProposal.assigneeBasis?.candidateCount ?? 0 }} 人 ·
+                在途工单 {{ faultProposal.assigneeBasis?.deviceInflightCount ?? 0 }} 张
+              </el-descriptions-item>
+              <el-descriptions-item label="说明" :span="2">{{ faultProposal.desc || '—' }}</el-descriptions-item>
+              <el-descriptions-item v-if="faultProposal.reason" label="未派原因" :span="2">
+                {{ faultProposal.reason }}
+              </el-descriptions-item>
+            </el-descriptions>
+          </template>
+
           <div class="drawer-section-title">轮次（按 stepNo 升序）</div>
           <el-empty
             v-if="sortedSteps.length === 0"
@@ -200,15 +232,73 @@
         <el-empty v-else-if="!drawer.loading" description="未取到运行数据" />
       </div>
       <template #footer>
+        <!-- 人工确认入口（F-09c）：只有「故障 + 待确认 + 提案可执行」才出现。
+             权限点与后端网关一致（manage:task:add）；没有权限的人连按钮都不显示。 -->
+        <template v-if="canConfirmFault">
+          <el-button
+            type="primary"
+            :loading="faultAction.confirming"
+            v-hasPermi="['manage:task:add']"
+            @click="handleFaultConfirm"
+          >确认建单</el-button>
+          <el-button
+            type="danger"
+            plain
+            :loading="faultAction.confirming"
+            v-hasPermi="['manage:task:add']"
+            @click="openRejectDialog"
+          >驳回</el-button>
+        </template>
         <el-button @click="drawer.open = false">关闭</el-button>
       </template>
     </el-drawer>
+
+    <!-- 驳回必须写原因：原因会进 agent_step 与决策留痕，是下一次诊断的输入 -->
+    <el-dialog v-model="rejectDialog.open" title="驳回派单提案" width="520px" append-to-body>
+      <el-form label-width="80px">
+        <el-form-item label="驳回原因" required>
+          <el-input
+            v-model="rejectDialog.remark"
+            type="textarea"
+            :rows="3"
+            maxlength="500"
+            show-word-limit
+            placeholder="必填：写给下一次诊断/派单看（例如证据不足、已在现场处理）"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="rejectDialog.open = false">取消</el-button>
+        <el-button type="danger" :loading="rejectDialog.submitting" @click="submitReject">
+          确认驳回（不建单）
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 发起诊断：M3 的演示入口。设备页的「智能诊断」按钮接入留在后续（F-15 附近统一）。 -->
+    <el-dialog v-model="startDialog.open" title="发起故障诊断" width="560px" append-to-body>
+      <el-form label-width="96px">
+        <el-form-item label="设备编号" required>
+          <el-input v-model="startDialog.innerCode" placeholder="如 A1000001" clearable />
+        </el-form-item>
+        <el-form-item label="时间窗口">
+          <el-input-number v-model="startDialog.windowHours" :min="1" :max="87600" />
+          <span class="dim">小时；默认 24。排查历史积压时调大（本机数据最早 2023 年）</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="startDialog.open = false">取消</el-button>
+        <el-button type="primary" :loading="startDialog.submitting" @click="submitStartRun">
+          开始诊断
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup name="AgentRun">
 import { ElMessage } from 'element-plus'
-import { getAgentRun, listAgentRuns } from '@/api/manage/agentRun'
+import { confirmFaultRun, getAgentRun, listAgentRuns, startFaultRun } from '@/api/manage/agentRun'
 
 /**
  * 智能体运行时间线页（F-04，M1）。
@@ -298,6 +388,16 @@ const queryRef = ref(null)
 /** 抽屉状态：failed 单独标记，用来区分“加载失败”和“真的没有数据”（两者不能都显示空状态） */
 const drawer = reactive({ open: false, loading: false, failed: false, run: null, steps: [] })
 
+/**
+ * 故障场景交互状态（F-09c）。
+ *
+ * 与 drawer 分开：确认/驳回的 loading 只影响按钮，不应让整个抽屉转圈
+ * （否则运营会以为“详情在重载”，而实际是在等 Java 建单）。
+ */
+const faultAction = reactive({ confirming: false })
+const rejectDialog = reactive({ open: false, remark: '', submitting: false })
+const startDialog = reactive({ open: false, innerCode: '', windowHours: 24, submitting: false })
+
 const data = reactive({
   queryParams: {
     pageNum: 1,
@@ -314,6 +414,36 @@ const { queryParams } = toRefs(data)
 /** 按 stepNo 升序：后端 SQL 目前已排好序，页面再排一次，防止将来接口调整把 #1→#N 的时间顺序悄悄打乱（顺序错了会直接误导排障） */
 const sortedSteps = computed(() => {
   return (drawer.steps || []).slice().sort((a, b) => (a.stepNo || 0) - (b.stepNo || 0))
+})
+
+/** 优先级（与后端 DispatchProposal 注释一致：1-低 2-中 3-高 4-紧急） */
+const PRIORITIES = { 1: '低', 2: '中', 3: '高', 4: '紧急' }
+
+/**
+ * 从 step2（dispatch_propose）的 evidenceJson 里取出派单提案。
+ *
+ * 解析失败返回 null（整块不显示）而不是抛错：坏一条证据不该让整页打不开。
+ * `evidenceJson` 可能是字符串（MySQL JSON 列的当前返回）或对象（将来换驱动），两种都兼容。
+ */
+const faultProposal = computed(() => {
+  const step = (drawer.steps || []).filter((item) => item.action === 'dispatch_propose')[0]
+  if (!step || !step.evidenceJson) return null
+  try {
+    const payload =
+      typeof step.evidenceJson === 'string' ? JSON.parse(step.evidenceJson) : step.evidenceJson
+    return (payload && payload.proposal) || null
+  } catch (error) {
+    return null
+  }
+})
+
+/** 只有「故障 + 待确认 + 提案可执行」才允许人工确认（与后端确认接口的前置一致） */
+const canConfirmFault = computed(() => {
+  return (
+    drawer.run?.sceneCode === 'fault' &&
+    drawer.run?.status === 'waiting_confirm' &&
+    faultProposal.value?.dispatchable === true
+  )
 })
 
 /** 空值显示「—」，其余原样转字符串（映射不到时不吞掉原始编码） */
@@ -381,6 +511,10 @@ function toolStatusTag(value) {
 
 function triggerLabel(value) {
   return dictLabel(TRIGGERS, value)
+}
+
+function priorityLabel(value) {
+  return dictLabel(PRIORITIES, value)
 }
 
 function subjectTypeLabel(value) {
@@ -480,11 +614,21 @@ function resetQuery() {
  */
 function handleView(row) {
   drawer.open = true
+  loadDrawer(row.runId)
+}
+
+/**
+ * 加载/刷新抽屉数据（确认、驳回、发起诊断后都走这里）。
+ *
+ * 失败时标记 failed 而不是清成空：让页面能区分“加载失败”和“真的没有轮次”
+ * （后者是业务事实，前者是故障，两者不能都显示空状态）。
+ */
+function loadDrawer(runId) {
   drawer.loading = true
   drawer.failed = false
   drawer.run = null
   drawer.steps = []
-  getAgentRun(row.runId)
+  getAgentRun(runId)
     .then((response) => {
       const detail = response.data || {}
       drawer.run = detail.run || null
@@ -498,6 +642,109 @@ function handleView(row) {
     })
     .finally(() => {
       drawer.loading = false
+    })
+}
+
+/**
+ * 确认建单（F-09c）。
+ *
+ * 结果的三种业务形态都按“正常返回”处理，用不同提示区分，而不是把 duplicate 当失败：
+ * confirmed=新建、duplicate=之前已建（返回原工单）、其它=未建单（含 409 状态冲突，由拦截器提示）。
+ */
+function handleFaultConfirm() {
+  if (!drawer.run) return
+  const runId = drawer.run.runId
+  faultAction.confirming = true
+  confirmFaultRun(runId, { action: 'confirm' })
+    .then((response) => {
+      const result = response.data || {}
+      if (result.status === 'confirmed') {
+        ElMessage.success('已建维修工单 ' + (result.taskCode || result.taskId))
+      } else if (result.status === 'duplicate') {
+        ElMessage.info('该运行已建单，返回原工单 ' + (result.taskCode || result.taskId))
+      } else {
+        ElMessage.warning(result.message || '未建单，请刷新后重试')
+      }
+      loadDrawer(runId)
+      getList()
+    })
+    .catch(() => {
+      // 拦截器已提示后端 message（409 正在建单中 / 403 无权限）；这里刷新一次状态，避免按钮卡死
+      loadDrawer(runId)
+    })
+    .finally(() => {
+      faultAction.confirming = false
+    })
+}
+
+function openRejectDialog() {
+  rejectDialog.remark = ''
+  rejectDialog.open = true
+}
+
+/** 驳回：原因必填（原因会进 step 与决策留痕，是下一次诊断的输入） */
+function submitReject() {
+  const remark = (rejectDialog.remark || '').trim()
+  if (!remark) {
+    ElMessage.warning('驳回必须填写原因')
+    return
+  }
+  if (!drawer.run) return
+  const runId = drawer.run.runId
+  rejectDialog.submitting = true
+  confirmFaultRun(runId, { action: 'reject', remark })
+    .then((response) => {
+      const result = response.data || {}
+      ElMessage.success(result.message || '已驳回，未建单')
+      rejectDialog.open = false
+      loadDrawer(runId)
+      getList()
+    })
+    .catch(() => {
+      // 同样交给拦截器提示；保持弹窗打开，运营可改原因后重试
+    })
+    .finally(() => {
+      rejectDialog.submitting = false
+    })
+}
+
+function openStartDialog() {
+  startDialog.innerCode = ''
+  startDialog.windowHours = 24
+  startDialog.open = true
+}
+
+/**
+ * 发起诊断（M3 演示入口）。
+ *
+ * 为什么同步等待：单台诊断 1~2 秒，运营能接受；变批量巡检（F-15）时再改异步。
+ * 成功后直接打开新运行的抽屉——否则用户点完只看到列表多一行，不知道发生了什么。
+ */
+function submitStartRun() {
+  const innerCode = (startDialog.innerCode || '').trim()
+  if (!innerCode) {
+    ElMessage.warning('请填写设备编号')
+    return
+  }
+  startDialog.submitting = true
+  startFaultRun({ innerCode, windowHours: startDialog.windowHours || 24 })
+    .then((response) => {
+      const result = response.data || {}
+      startDialog.open = false
+      ElMessage.success(
+        result.status === 'waiting_confirm' ? '诊断完成：已生成派单提案，待人工确认' : '诊断完成：未生成派单提案'
+      )
+      getList()
+      if (result.runId) {
+        drawer.open = true
+        loadDrawer(result.runId)
+      }
+    })
+    .catch(() => {
+      // 502/参数错误由拦截器提示；保持弹窗，允许改设备号重试
+    })
+    .finally(() => {
+      startDialog.submitting = false
     })
 }
 

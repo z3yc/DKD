@@ -54,3 +54,36 @@ export function listAgentRunSteps(runId) {
     method: 'get'
   })
 }
+
+/**
+ * 发起一次故障诊断（F-09c）。
+ *
+ * 注意这与上面三个**只读**接口不同：它走 Java 智能体网关 `/agent/fault/runs`
+ * （不是 `/manage/**`），后端要求 `manage:vm:query`；同步执行，返回 runId 与派单提案。
+ *
+ * @param {Object} data { innerCode, windowHours }
+ */
+export function startFaultRun(data) {
+  return request({
+    url: '/agent/fault/runs',
+    method: 'post',
+    data
+  })
+}
+
+/**
+ * 确认 / 驳回一次派单提案（F-09c）。
+ *
+ * 这是**写操作**：确认会经 Java 回调创建真实维修工单（后端要求 `manage:task:add`），
+ * 幂等——重复确认返回同一工单，不会建出第二张。驳回必须带 remark（原因）。
+ *
+ * @param {string} runId 运行ID
+ * @param {Object} data { action: 'confirm'|'reject', assigneeId?, priority?, remark? }
+ */
+export function confirmFaultRun(runId, data) {
+  return request({
+    url: '/agent/fault/runs/' + encodeURIComponent(runId) + '/confirm',
+    method: 'post',
+    data
+  })
+}
