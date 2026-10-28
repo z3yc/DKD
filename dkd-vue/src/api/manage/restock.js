@@ -1,5 +1,5 @@
-import { getToken } from '@/utils/auth'
-import { handleSessionExpired, SESSION_EXPIRED_MSG } from '@/utils/sessionExpired'
+import request from '@/utils/request'
+import { SESSION_EXPIRED_MSG } from '@/utils/sessionExpired'
 
 /**
  * 智能补货工作台 API（后端：排期任务 1-7；前端：1-10 / 1-11）
@@ -8,23 +8,18 @@ import { handleSessionExpired, SESSION_EXPIRED_MSG } from '@/utils/sessionExpire
  * 并注入 `X-Agent-User`。Python 侧写操作**强制要求**该头（无身份头直接 401），
  * 所以本地直连 Python 是写不进去的（AGENTS §7.5 鉴权不裸奔）。
  *
- * ⚠️ 为什么这里刻意不走 `@/utils/request`（axios 拦截器）：
- * 后端把「业务拒绝」表达为**真实 HTTP 状态码**，可行动文案在 `msg` 里：
- *   - 409 = 状态机拒绝 / 并发冲突（如「已建单的计划不能重复确认」）
- *   - 422 = 字段校验（如原因字段缺失）
- *   - 400 = 业务规则拒绝（如「调整必须填写原因」「服务水平必须落在 [0.5, 0.99]」）
- *   - 502 = 回调 Java 建单失败
- *   - 503 = 补货服务未初始化
- * 而 axios 拦截器对非 2xx 会落入 error 分支，**丢掉 msg**、统一改写成
- * 「系统接口409异常」并 `Promise.reject(error)`。运营看到的会是「系统异常」，
- * 而不是「已建单的计划不能重复确认」这类能自救的提示——这正是 1-10/1-11 最该避免的体验。
- * 因此本文件用 fetch 直接读信封，处置方式与 `api/manage/agent.js::probeAgentStatus` 一致。
+ * P1-16 起回归 `@/utils/request`（axios 统一通道），不再自带 fetch：
+ * 原先绕开 axios 的根因是「非 2xx 业务码的 msg 会被拦截器改写成『系统接口409异常』」，
+ * 该根因已在 request.js 修复（错误分支透传响应体 msg + silent 逃生舱）。
+ * 迁移时保住三个既有语义：
+ *   ① 后端把「业务拒绝」表达为**真实 HTTP 状态码**（409/422/400/502/503），
+ *     可行动文案在 msg——由 request.js 错误分支透传，错误对象带 code；
+ *   ② AbortSignal 可取消（页面卸载中止在途请求，取消不弹错）；
+ *   ③ 不设超时（确认建单要等 Java 回调，N 台设备时可达数十秒，fetch 时代同样无超时）。
  *
  * 契约：所有函数**只 resolve、绝不 throw**，统一返回
  * `{ ok, code, msg, data }`；调用方据此决定 toast 文案，不需要 try/catch。
  */
-
-const BASE = import.meta.env.VITE_APP_BASE_API || ''
 
 /**
  * 统一请求。
@@ -32,64 +27,50 @@ const BASE = import.meta.env.VITE_APP_BASE_API || ''
  * @param {string} url    已编码的路径（含查询串），**不含** VITE_APP_BASE_API
  * @param {Object} [opts]
  * @param {string} [opts.method] HTTP 方法，默认 GET
- * @param {Object} [opts.body]   请求体（给了才带 Content-Type: application/json）
+ * @param {Object} [opts.body]   请求体（POST 时作为 JSON 发送）
  * @param {AbortSignal} [opts.signal] 取消信号（页面卸载时中止在途请求）
- * @returns {Promise<{ok:boolean, code:number, msg:string, data?:any, unauthorized?:boolean, network?:boolean}>}
+ * @returns {Promise<{ok:boolean, code:number, msg:string, data?:any, unauthorized?:boolean, network?:boolean, aborted?:boolean}>}
  */
 async function call(url, opts) {
   const options = opts || {}
-  const headers = { Accept: 'application/json' }
-  const token = getToken()
-  if (token) headers.Authorization = 'Bearer ' + token
-
-  const init = { method: options.method || 'GET', headers }
-  if (options.signal) init.signal = options.signal
-  if (typeof options.body !== 'undefined') {
-    headers['Content-Type'] = 'application/json'
-    init.body = JSON.stringify(options.body)
-  }
-
-  let res
   try {
-    res = await fetch(BASE + url, init)
+    // silent：拦截器只做信封解析，提示与交互由工作台视图自管（避免双重弹窗）
+    const payload = await request({
+      url,
+      method: options.method || 'GET',
+      data: options.body,
+      signal: options.signal,
+      timeout: 0,
+      silent: true
+    })
+    // 走到这里信封 code 一定是 200（拦截器已 reject 其余情况）
+    return { ok: true, code: 200, msg: payload.msg || 'ok', data: payload.data }
   } catch (e) {
-    // 区分「主动取消」与「真的连不上」：取消不该弹错误提示（AGENTS §2.2 可取消）
-    if (e && e.name === 'AbortError') {
+    // 主动取消（axios CanceledError / request.js 的 aborted 标记）：不该弹错误提示
+    if (e && (e.aborted === true || e.code === -1 || e.name === 'CanceledError' || e.code === 'ERR_CANCELED')) {
       return { ok: false, code: -1, msg: '请求已取消', aborted: true }
     }
-    return { ok: false, code: 0, msg: '智能体服务连接失败，请稍后重试', network: true }
-  }
-
-  let payload = null
-  try {
-    payload = await res.json()
-  } catch (e) {
-    payload = null
-  }
-
-  // 网关/框架层裸错误（无 RuoYi 信封）也要给一句人话，而不是 undefined
-  if (!payload || typeof payload.code === 'undefined') {
-    return { ok: false, code: res.status, msg: '智能体服务返回异常（HTTP ' + res.status + '）' }
-  }
-  // RuoYi 的认证失败是 HTTP 200 + code=401，必须先看信封 code（0-11 已踩过同款坑）
-  if (payload.code === 401) {
-    // ⚠️ 不能只把这个标记扔在返回值里（2026-10-03 实测报障）：本文件刻意绕开了 axios 拦截器，
-    // 而拦截器正是承载「提示 + 重新登录」的地方。此前没有任何视图消费 `unauthorized`，
-    // 于是运营看到的是 RuoYi 原文「请求访问：/agent/restock/plans/97/adjust，认证失败，
-    // 无法访问系统资源」——既不知道是自己登录过期，也没有重新登录的入口。
-    // 现在统一走 utils/sessionExpired（与 axios 链路同一份实现），并把文案换成可行动的。
-    handleSessionExpired()
+    if (e && e.code === 401) {
+      // 拦截器已完成「提示 + 重新登录」处置（handleSessionExpired），
+      // 这里只回传可行动文案（0-11 / 2026-10-03 实测报障的教训：401 必须给重新登录入口）
+      return {
+        ok: false,
+        code: 401,
+        msg: SESSION_EXPIRED_MSG + '，请重新登录后再操作',
+        unauthorized: true
+      }
+    }
+    if (e && e.network) {
+      return { ok: false, code: 0, msg: '智能体服务连接失败，请稍后重试', network: true }
+    }
+    // 业务拒绝（409/422/400/502/503...）：code 与 msg 已由 request.js 从信封透传
+    const code = (e && e.code) || 0
     return {
       ok: false,
-      code: 401,
-      msg: SESSION_EXPIRED_MSG + '，请重新登录后再操作',
-      unauthorized: true
+      code: code,
+      msg: (e && e.message) || '操作失败（code=' + code + '）'
     }
   }
-  if (payload.code !== 200) {
-    return { ok: false, code: payload.code, msg: payload.msg || '操作失败（code=' + payload.code + '）' }
-  }
-  return { ok: true, code: 200, msg: payload.msg || 'ok', data: payload.data }
 }
 
 /** 拼 `plan_date` 查询参数（后端把日期作为 query 传递，POST 也一样） */
