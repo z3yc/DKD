@@ -2,17 +2,21 @@ package com.dkd.manage.service.impl;
 
 import java.util.ArrayList;
 import java.util.Date;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import com.dkd.common.exception.ServiceException;
 import com.dkd.common.utils.DateUtils;
 import com.dkd.common.utils.SecurityUtils;
+import com.dkd.manage.domain.Channel;
 import com.dkd.manage.domain.InventoryLog;
+import com.dkd.manage.domain.Sku;
+import com.dkd.manage.domain.VendingMachine;
 import com.dkd.manage.domain.dto.InventoryAlertDto;
 import com.dkd.manage.domain.dto.RestockSuggestionDto;
+import com.dkd.manage.mapper.ChannelMapper;
 import com.dkd.manage.mapper.InventoryLogMapper;
+import com.dkd.manage.mapper.SkuMapper;
+import com.dkd.manage.mapper.VendingMachineMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -38,6 +42,16 @@ public class InventoryServiceImpl implements IInventoryService
 
     @Autowired
     private InventoryLogMapper inventoryLogMapper;
+
+    /** P1-15：显示字段反查所需（原先直接注入在 Controller 里，随逻辑一并下沉） */
+    @Autowired
+    private VendingMachineMapper vendingMachineMapper;
+
+    @Autowired
+    private SkuMapper skuMapper;
+
+    @Autowired
+    private ChannelMapper channelMapper;
 
     /**
      * 查询库存
@@ -105,6 +119,79 @@ public class InventoryServiceImpl implements IInventoryService
                 quantity, 0, quantity, InventoryLog.CHANGE_TYPE_ADJUST, InventoryLog.BUSINESS_TYPE_INIT,
                 resolveCurrentOperator(), now);
         return result;
+    }
+
+    /**
+     * 新增库存（支持显示字段反查 ID，P1-15 从 Controller 下沉）。
+     *
+     * <p>为什么下沉：原 InventoryController.add() 里有三段「显示字段→ID 反查」+四段参数校验，
+     * Controller 直接注入三个 Mapper 做业务逻辑，违反「Controller 只做参数校验 + 调 Service」
+     * 的分层规范。反查/校验失败抛 {@link ServiceException}，由全局异常处理器转成
+     * {@code AjaxResult.error(msg)}——错误文案与原 Controller 版逐字一致，前端无感知。
+     *
+     * @param inventory 库存（可用 innerCode/skuName/channelCode+innerCode 代替对应 ID）
+     * @return 结果
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public int insertInventoryByDisplay(Inventory inventory)
+    {
+        if (inventory == null)
+        {
+            throw new ServiceException("库存数量不能为空");
+        }
+
+        // 三段「显示字段 → ID」反查（与原 Controller 逻辑逐字对齐）
+        if (inventory.getVmId() == null && inventory.getInnerCode() != null && !inventory.getInnerCode().isEmpty())
+        {
+            VendingMachine vm = vendingMachineMapper.selectVendingMachineByInnerCode(inventory.getInnerCode());
+            if (vm == null)
+            {
+                throw new ServiceException("售货机编号【" + inventory.getInnerCode() + "】不存在");
+            }
+            inventory.setVmId(vm.getId());
+        }
+
+        if (inventory.getSkuId() == null && inventory.getSkuName() != null && !inventory.getSkuName().isEmpty())
+        {
+            Sku sku = skuMapper.selectSkuBySkuName(inventory.getSkuName());
+            if (sku == null)
+            {
+                throw new ServiceException("商品名称【" + inventory.getSkuName() + "】不存在");
+            }
+            inventory.setSkuId(sku.getSkuId());
+        }
+
+        if (inventory.getChannelId() == null && inventory.getInnerCode() != null && !inventory.getInnerCode().isEmpty()
+            && inventory.getChannelCode() != null && !inventory.getChannelCode().isEmpty())
+        {
+            Channel channel = channelMapper.getChannelInfo(inventory.getInnerCode(), inventory.getChannelCode());
+            if (channel == null)
+            {
+                throw new ServiceException("售货机【" + inventory.getInnerCode() + "】的货道【" + inventory.getChannelCode() + "】不存在");
+            }
+            inventory.setChannelId(channel.getId());
+        }
+
+        // 参数校验（文案与原 Controller 逐字一致）
+        if (inventory.getVmId() == null)
+        {
+            throw new ServiceException("售货机ID不能为空");
+        }
+        if (inventory.getSkuId() == null)
+        {
+            throw new ServiceException("商品ID不能为空");
+        }
+        if (inventory.getChannelId() == null)
+        {
+            throw new ServiceException("货道ID不能为空");
+        }
+        if (inventory.getQuantity() == null)
+        {
+            throw new ServiceException("库存数量不能为空");
+        }
+
+        return insertInventory(inventory);
     }
 
     /**
@@ -589,32 +676,20 @@ public class InventoryServiceImpl implements IInventoryService
     /**
      * 生成库存预警列表
      *
+     * <p>P1-11：候选加载收敛到 {@link #loadAlertCandidates()}（单条合并 SQL），
+     * 本方法只做 DTO 组装；{@code checkInventoryAlert} 按 quantity==0 优先分类，
+     * 与合并 SQL 的口径天然一致。
+     *
      * @return 预警列表
      */
     @Override
+    @Transactional(readOnly = true)
     public List<InventoryAlertDto> generateInventoryAlerts()
     {
         List<InventoryAlertDto> alerts = new ArrayList<>();
-
-        // 获取所有低库存（current_stock <= min_stock）
-        List<Inventory> lowInventoryList = inventoryMapper.selectLowInventoryList();
-        // 获取所有缺货（current_stock = 0）
-        List<Inventory> outOfStockList = inventoryMapper.selectOutOfStockList();
-
-        // 去重：两段口径在 current_stock=0 时重叠（0 <= min_stock 且 =0），
-        // 不去重会对同一货道重复产出"缺货"与"低库存"两条预警（清晰版 §4.4 要求两者口径分离）
-        List<Inventory> mergedList = new ArrayList<>(lowInventoryList.size() + outOfStockList.size());
-        mergedList.addAll(lowInventoryList);
-        mergedList.addAll(outOfStockList);
-
-        Set<Long> seenStockIds = new HashSet<>();
-        for (Inventory inventory : mergedList)
+        for (Inventory inventory : loadAlertCandidates())
         {
             if (inventory == null)
-            {
-                continue;
-            }
-            if (inventory.getId() != null && !seenStockIds.add(inventory.getId()))
             {
                 continue;
             }
@@ -624,7 +699,6 @@ public class InventoryServiceImpl implements IInventoryService
                 alerts.add(alert);
             }
         }
-
         return alerts;
     }
 
@@ -694,31 +768,20 @@ public class InventoryServiceImpl implements IInventoryService
     /**
      * 生成补货建议列表
      *
+     * <p>P1-11：候选加载收敛到 {@link #loadAlertCandidates()}（单条合并 SQL），
+     * 与 {@link #generateInventoryAlerts()} 共用同一段加载逻辑（原先两段几乎逐行重复）；
+     * 本方法只做建议计算，优先级仍由 {@code generateRestockSuggestion} 统一计算。
+     *
      * @return 补货建议列表
      */
     @Override
+    @Transactional(readOnly = true)
     public List<RestockSuggestionDto> generateRestockSuggestions()
     {
         List<RestockSuggestionDto> suggestions = new ArrayList<>();
-
-        // 获取所有低库存和缺货
-        List<Inventory> lowInventoryList = inventoryMapper.selectLowInventoryList();
-        List<Inventory> outOfStockList = inventoryMapper.selectOutOfStockList();
-
-        // 去重后合并：两段口径在 current_stock=0 时重叠，直接 addAll 会让同一货道出两条建议。
-        // 缺货先加入（更严重），排序与优先级仍由 generateRestockSuggestion 统一计算。
-        List<Inventory> mergedList = new ArrayList<>(lowInventoryList.size() + outOfStockList.size());
-        mergedList.addAll(outOfStockList);
-        mergedList.addAll(lowInventoryList);
-
-        Set<Long> seenStockIds = new HashSet<>();
-        for (Inventory inventory : mergedList)
+        for (Inventory inventory : loadAlertCandidates())
         {
             if (inventory == null)
-            {
-                continue;
-            }
-            if (inventory.getId() != null && !seenStockIds.add(inventory.getId()))
             {
                 continue;
             }
@@ -728,8 +791,22 @@ public class InventoryServiceImpl implements IInventoryService
                 suggestions.add(suggestion);
             }
         }
-
         return suggestions;
+    }
+
+    /**
+     * 加载预警候选（P1-11）：低库存 ∪ 缺货，单条合并 SQL 天然去重。
+     *
+     * <p>原先是「selectLowInventoryList + selectOutOfStockList」两次无条件全表查询
+     * 加内存 seenStockIds 去重——两接口同开一次就是 4 次全表扫描；合并后各 1 次，
+     * 且去重根因（两段口径在 current_stock=0 处重叠）被 SQL 层消除。
+     *
+     * @return 预警候选列表（current_stock 升序，缺货在前）
+     */
+    private List<Inventory> loadAlertCandidates()
+    {
+        List<Inventory> candidates = inventoryMapper.selectAlertCandidates();
+        return candidates != null ? candidates : new ArrayList<>();
     }
 
     /**

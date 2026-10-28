@@ -70,7 +70,7 @@ export function initInventory(data) {
     })
 }
 
-// 获取库存预警
+// 获取库存预警（P1-11：返回 TableDataInfo 分页结构 rows/total）
 export function getInventoryAlerts(query) {
     return request({
         url: '/manage/inventory/alerts',
@@ -79,7 +79,7 @@ export function getInventoryAlerts(query) {
     })
 }
 
-// 获取补货建议
+// 获取补货建议（P1-11：返回 TableDataInfo 分页结构 rows/total）
 export function getRestockSuggestions(query) {
     return request({
         url: '/manage/inventory/restock',

@@ -89,6 +89,15 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         order by i.current_stock asc
     </select>
 
+    <!-- P1-11 预警候选：单条 OR 合并「低库存 ∪ 缺货」，替代两次全表查询 + Service 层内存去重。
+         两段口径在 current_stock=0 处重叠，单条 SQL 每行只出一次；min_stock 为 NULL 的缺货行由 OR 第二支捕获。
+         排序与旧合并序等价（缺货更严重在前；0 即最小值）。 -->
+    <select id="selectAlertCandidates" resultMap="InventoryResult">
+        <include refid="selectInventoryVo"/>
+        where i.current_stock &lt;= i.min_stock or i.current_stock = 0
+        order by i.current_stock asc
+    </select>
+
     <insert id="insertInventory" parameterType="Inventory" useGeneratedKeys="true" keyProperty="id">
         insert into tb_inventory
         (vm_id, sku_id, channel_id, current_stock, min_stock, max_stock, last_supply_time, create_time, update_time)

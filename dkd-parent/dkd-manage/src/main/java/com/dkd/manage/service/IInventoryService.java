@@ -38,6 +38,15 @@ public interface IInventoryService
     public int insertInventory(Inventory inventory);
 
     /**
+     * 新增库存（支持显示字段反查 ID：innerCode/skuName/channelCode 可代替对应 ID，
+     * P1-15 自 Controller 下沉；反查或校验失败抛 ServiceException，文案与旧 Controller 版一致）
+     *
+     * @param inventory 库存
+     * @return 结果
+     */
+    public int insertInventoryByDisplay(Inventory inventory);
+
+    /**
      * 修改库存
      *
      * @param inventory 库存

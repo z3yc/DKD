@@ -126,6 +126,22 @@ public interface InventoryMapper
     public List<Inventory> selectOutOfStockList();
 
     /**
+     * 预警候选查询（P1-11）：单条 OR SQL 替代「低库存 + 缺货」两次全表查询 + 内存去重。
+     *
+     * <p>为什么合并：低库存（current_stock &lt;= min_stock）与缺货（current_stock = 0）
+     * 两段口径在 current_stock=0 处重叠，原先靠 Service 层 seenStockIds 集合去重——
+     * 单条 SQL 每行只出一次，天然不重复，且把每接口 2 次全表扫描降为 1 次。
+     * min_stock 为 NULL 的行不满足第一条但只要 current_stock=0 仍会被 OR 捕获，
+     * 与旧「缺货段」口径一致。
+     *
+     * <p>排序 current_stock asc：与旧「缺货在前（更严重）+ 低库存升序」的合并顺序等价
+     * （0 本身就是最小值）。
+     *
+     * @return 预警候选库存列表（低库存 ∪ 缺货，去重）
+     */
+    public List<Inventory> selectAlertCandidates();
+
+    /**
      * 批量插入库存
      *
      * @param inventoryList 库存列表

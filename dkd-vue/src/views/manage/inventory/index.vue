@@ -285,8 +285,10 @@ function handleOutOfStock() {
 
 /** 补货建议 */
 function handleRestockSuggestions() {
-    getRestockSuggestions().then(response=>{
-        restockList.value = response.data || [];
+    // P1-11：/restock 已改 TableDataInfo 分页返回；弹窗场景取首页前 100 条
+    // （旧版全量返回，行数不受控；100 条已覆盖单弹窗可读范围，服务端不再全表物化）
+    getRestockSuggestions({ pageNum: 1, pageSize: 100 }).then(response=>{
+        restockList.value = response.rows || [];
         restockOpen.value = true;
     })
 }

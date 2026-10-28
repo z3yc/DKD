@@ -5,12 +5,6 @@ import javax.servlet.http.HttpServletResponse;
 
 import com.dkd.manage.domain.dto.InventoryAlertDto;
 import com.dkd.manage.domain.dto.RestockSuggestionDto;
-import com.dkd.manage.domain.Channel;
-import com.dkd.manage.domain.Sku;
-import com.dkd.manage.domain.VendingMachine;
-import com.dkd.manage.mapper.ChannelMapper;
-import com.dkd.manage.mapper.SkuMapper;
-import com.dkd.manage.mapper.VendingMachineMapper;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -42,15 +36,6 @@ public class InventoryController extends BaseController
 {
     @Autowired
     private IInventoryService inventoryService;
-
-    @Autowired
-    private VendingMachineMapper vendingMachineMapper;
-
-    @Autowired
-    private SkuMapper skuMapper;
-
-    @Autowired
-    private ChannelMapper channelMapper;
 
     /**
      * 查询库存列表
@@ -89,63 +74,17 @@ public class InventoryController extends BaseController
 
     /**
      * 新增库存
+     *
+     * <p>P1-15：显示字段反查 ID 与参数校验已下沉到
+     * {@code IInventoryService.insertInventoryByDisplay}（反查失败抛 ServiceException，
+     * 文案与本方法旧版逐字一致）。
      */
     @PreAuthorize("@ss.hasPermi('manage:inventory:add')")
     @Log(title = "库存", businessType = BusinessType.INSERT)
     @PostMapping
     public AjaxResult add(@RequestBody Inventory inventory)
     {
-        // 如果前端传递的是显示字段，则根据显示字段查找对应的ID
-        if (inventory.getVmId() == null && inventory.getInnerCode() != null && !inventory.getInnerCode().isEmpty())
-        {
-            VendingMachine vm = vendingMachineMapper.selectVendingMachineByInnerCode(inventory.getInnerCode());
-            if (vm == null)
-            {
-                return AjaxResult.error("售货机编号【" + inventory.getInnerCode() + "】不存在");
-            }
-            inventory.setVmId(vm.getId());
-        }
-
-        if (inventory.getSkuId() == null && inventory.getSkuName() != null && !inventory.getSkuName().isEmpty())
-        {
-            Sku sku = skuMapper.selectSkuBySkuName(inventory.getSkuName());
-            if (sku == null)
-            {
-                return AjaxResult.error("商品名称【" + inventory.getSkuName() + "】不存在");
-            }
-            inventory.setSkuId(sku.getSkuId());
-        }
-
-        if (inventory.getChannelId() == null && inventory.getInnerCode() != null && !inventory.getInnerCode().isEmpty()
-            && inventory.getChannelCode() != null && !inventory.getChannelCode().isEmpty())
-        {
-            Channel channel = channelMapper.getChannelInfo(inventory.getInnerCode(), inventory.getChannelCode());
-            if (channel == null)
-            {
-                return AjaxResult.error("售货机【" + inventory.getInnerCode() + "】的货道【" + inventory.getChannelCode() + "】不存在");
-            }
-            inventory.setChannelId(channel.getId());
-        }
-
-        // 参数校验
-        if (inventory.getVmId() == null)
-        {
-            return AjaxResult.error("售货机ID不能为空");
-        }
-        if (inventory.getSkuId() == null)
-        {
-            return AjaxResult.error("商品ID不能为空");
-        }
-        if (inventory.getChannelId() == null)
-        {
-            return AjaxResult.error("货道ID不能为空");
-        }
-        if (inventory.getQuantity() == null)
-        {
-            return AjaxResult.error("库存数量不能为空");
-        }
-
-        return toAjax(inventoryService.insertInventory(inventory));
+        return toAjax(inventoryService.insertInventoryByDisplay(inventory));
     }
 
     /**
@@ -214,23 +153,32 @@ public class InventoryController extends BaseController
 
     /**
      * 获取库存预警列表
+     *
+     * <p>P1-11（破坏性变更）：返回结构由 AjaxResult 改为 TableDataInfo 并接入分页。
+     * 前端唯一消费方为 dkd-vue（getInventoryAlerts 当前无页面引用）；
+     * dkd-agent 只读 tb_* 表不走此 REST 接口。
      */
     @PreAuthorize("@ss.hasPermi('manage:inventory:list')")
     @GetMapping("/alerts")
-    public AjaxResult getAlerts()
+    public TableDataInfo getAlerts()
     {
+        startPage();
         List<InventoryAlertDto> alerts = inventoryService.generateInventoryAlerts();
-        return success(alerts);
+        return getDataTable(alerts);
     }
 
     /**
      * 获取补货建议列表
+     *
+     * <p>P1-11（破坏性变更）：返回结构由 AjaxResult 改为 TableDataInfo 并接入分页。
+     * 前端消费方 inventory/index.vue 的补货建议弹窗已同步改为读 rows。
      */
     @PreAuthorize("@ss.hasPermi('manage:inventory:list')")
     @GetMapping("/restock")
-    public AjaxResult getRestockSuggestions()
+    public TableDataInfo getRestockSuggestions()
     {
+        startPage();
         List<RestockSuggestionDto> suggestions = inventoryService.generateRestockSuggestions();
-        return success(suggestions);
+        return getDataTable(suggestions);
     }
 }
