@@ -10,20 +10,36 @@
 
 ### Added
 
-- **故障诊断 M3 派单提案（F-08）**：诊断完成后生成派单提案——接单人按设备区域匹配、优先级由证据强度决定
+- 故障诊断 M4（审核官）：计划中，见 `docs/agent-fault-scenario-plan-2026-10-26.md`。
+
+## [0.3.0] - 2026-10-28
+
+故障诊断派单闭环（M3）。
+
+### Added
+
+- **派单提案（F-08）**：诊断完成后生成派单提案——接单人按设备区域匹配、优先级由证据强度决定
   （高严重度证据→高）、`desc` 带设备号/证据条数/在途工单数；提案必须引用 `basedOnEvidence` 与
   `assigneeBasis`（区域/候选数/在途数），引用越界或缺依据直接拒绝生成。提案**只落库、不建单**，
-  run 停在 `waiting_confirm` 等人工确认（F-09 才调用 Java 回调建维修单）。
-- **故障诊断 M3 派单确认（F-09 核心）**：运营确认派单提案后经 Java 回调创建**维修工单**（`productTypeId=3`），
-  全过程 human-in-the-loop：提案只落库，确认才建单；重复确认返回同一工单（幂等，不重复回调）；
-  业务拒绝（设备有在途工单/区域不一致）与传输失败都回退到待确认并留 step 错误；
-  人工驳回需填原因且不建单。每次确认/驳回写 `agent_step` 与 `agent_decision_log`。
-  实现采用「DB 状态机两阶段」而非 LangGraph interrupt（决策 D11，理由见计划 §5.1）。
-- **故障诊断接口与网关接入（F-09b）**：新增 `POST /agent/fault/runs`（发起诊断，需 `manage:vm:query`）与
-  `POST /agent/fault/runs/{runId}/confirm`（确认/驳回，需 `manage:task:add`）；确认与驳回携带网关注入的
-  人工身份并写入 `agent_decision_log.user_id`；Java 网关按白名单转发，非法方法/runId 形状一律 404。
-- 故障诊断前端「确认/驳回」按钮：进行中。
-- 故障诊断 M4（审核官）：计划中，见 `docs/agent-fault-scenario-plan-2026-10-26.md`。
+  run 停在 `waiting_confirm` 等人工确认。
+- **派单确认（F-09）**：运营确认后经 Java 回调创建**维修工单**（`productTypeId=3`）；human-in-the-loop：
+  重复确认返回同一工单（幂等，不重复回调）；业务拒绝（设备有在途工单/区域不一致）与传输失败回退到待确认并留 step 错误；
+  人工驳回需填原因且不建单；确认/驳回都写 `agent_step` 与 `agent_decision_log`（含操作人 user_id）。
+- **接口与网关（F-09b）**：`POST /agent/fault/runs`（需 `manage:vm:query`）、
+  `POST /agent/fault/runs/{runId}/confirm`（需 `manage:task:add`）；Java 网关按方法+路径形状判权，
+  非法方法/runId 一律 404。
+- **前端确认入口（F-09c）**：运行时间线页新增「发起故障诊断」、故障运行抽屉里的「派单提案」卡片、
+  「确认建单 / 驳回」（驳回原因必填）；无 `manage:task:add` 权限不显示按钮；确认结果区分
+  confirmed / duplicate / 未建单三种提示。
+
+### Changed
+
+- 确认流程实现采用「DB 状态机两阶段」而非 LangGraph `interrupt()`（决策 D11：确认是跨进程 HTTP 动作，
+  DB 状态机即协调器，幂等兜底是 Java 在途工单防重 + claim 回查）。
+
+### Security
+
+- 起跑与确认使用**两个不同权限点**（能看设备 ≠ 能建单）；确认/驳回强制 `X-Agent-User`，身份进决策留痕。
 
 ## [0.2.0] - 2026-10-27
 
