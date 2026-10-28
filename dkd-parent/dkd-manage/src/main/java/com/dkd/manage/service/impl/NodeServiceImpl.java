@@ -167,7 +167,15 @@ public class NodeServiceImpl implements INodeService
         int failureNum = 0;
         StringBuilder successMsg = new StringBuilder();
         StringBuilder failureMsg = new StringBuilder();
-        
+
+        // P1-10 判重 N+1 整改：原实现每行触发一次按名称查询，导入 N 行 = N 次 SQL。
+        // 改为循环前一次预载建 Map（点位量级远小于导入批次时是净收益），循环内 O(1) 判重；
+        // putIfAbsent 保持与原 findFirst 相同的「列表首个同名记录」语义。
+        Map<String, Node> existingByName = new HashMap<>();
+        for (Node existing : nodeMapper.selectNodeList(new Node())) {
+            existingByName.putIfAbsent(existing.getNodeName(), existing);
+        }
+
         for (Node node : nodeList) {
             try {
                 // 验证数据的必要字段
@@ -181,14 +189,10 @@ public class NodeServiceImpl implements INodeService
                     failureMsg.append("<br/>" + failureNum + "、详细地址不能为空");
                     continue;
                 }
-                
-                // 查询是否已存在相同的点位名称
-                Node existNode = nodeMapper.selectNodeList(
-                    new Node() {{
-                        setNodeName(node.getNodeName());
-                    }}
-                ).stream().findFirst().orElse(null);
-                
+
+                // 判重走预载索引（原为逐行查库）
+                Node existNode = existingByName.get(node.getNodeName());
+
                 if (existNode != null && !isUpdateSupport) {
                     failureNum++;
                     failureMsg.append("<br/>" + failureNum + "、点位名称：" + node.getNodeName() + " 已存在");
@@ -205,6 +209,9 @@ public class NodeServiceImpl implements INodeService
                         successNum++;
                         successMsg.append("<br/>" + successNum + "、点位名称：" + node.getNodeName() + " 导入成功");
                     }
+                    // 维护预载索引，保持原「逐行查库」在批内重复名称上的可见性：
+                    // 同一批次里第二条同名点位仍会被判为「已存在」，不需要额外查库
+                    existingByName.put(node.getNodeName(), node);
                 }
             } catch (Exception e) {
                 failureNum++;

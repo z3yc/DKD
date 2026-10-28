@@ -1,7 +1,10 @@
 package com.dkd.manage.service.impl;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import com.dkd.common.utils.DateUtils;
@@ -141,6 +144,22 @@ public class ChannelServiceImpl implements IChannelService
             return 0;
         }
 
+        // P1-10 SELECT 侧 N+1 整改：原实现每条 dto 调一次 getChannelInfo（N 货道 = N 次 SQL）。
+        // 改为按设备分组、每台设备一次查询建内存索引，循环内 O(1) 命中——一次货道配置提交
+        // 通常只涉及 1~2 台设备，查询次数从「货道数（几十）」降为「设备数」。
+        // innerCode 的取值口径与单条查询保持一致：dto.innerCode 优先，回退外层 ChannelConfigDto.innerCode。
+        Map<String, Channel> channelByKey = new HashMap<>();
+        Set<String> innerCodes = channelConfigDto.getChannelList().stream()
+                .filter(Objects::nonNull)
+                .map(dto -> dto.getInnerCode() != null ? dto.getInnerCode() : channelConfigDto.getInnerCode())
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        for (String innerCode : innerCodes) {
+            for (Channel ch : channelMapper.selectChannelListByInnerCode(innerCode)) {
+                channelByKey.put(innerCode + "|" + ch.getChannelCode(), ch);
+            }
+        }
+
         // 将dto转为po对象
         List<Channel> channelList = channelConfigDto.getChannelList().stream().map(dto -> {
             if (dto == null) {
@@ -148,8 +167,9 @@ public class ChannelServiceImpl implements IChannelService
             }
             // dto.innerCode 优先，否则回退到外层 ChannelConfigDto.innerCode
             String innerCode = dto.getInnerCode() != null ? dto.getInnerCode() : channelConfigDto.getInnerCode();
-            //根据售货机编号和货道编号查询货道信息
-            Channel channel = channelMapper.getChannelInfo(innerCode, dto.getChannelCode());
+            // 从预载索引命中货道（替代逐条查库）；null channelCode / null innerCode 与旧 SQL
+            // 「= null 永不匹配」语义一致：索引未命中即按「货道不存在」过滤
+            Channel channel = channelByKey.get(innerCode + "|" + dto.getChannelCode());
             if (channel != null) {
                 //关联最新商品
                 channel.setSkuId(dto.getSkuId());
@@ -165,15 +185,13 @@ public class ChannelServiceImpl implements IChannelService
         if (channelList.isEmpty()) {
             return 0;
         }
-        // 避免 JDBC 多语句执行限制，逐条更新，计数汇总
+        // UPDATE 侧刻意逐条：规避 JDBC 多语句执行限制（allowMultiQueries），
+        // 逐条按主键 UPDATE 是索引写、N = 货道数（几十），收益不足以抵消拼 CASE WHEN 批量语句的风险
         int affected = 0;
         for (Channel ch : channelList) {
             affected += channelMapper.updateChannel(ch);
         }
         // 若本次是幂等更新（例如原值相同或已为空），受影响行数可能为0，但仍应视为成功
         return affected == 0 ? 1 : affected;
-
-
-
     }
 }

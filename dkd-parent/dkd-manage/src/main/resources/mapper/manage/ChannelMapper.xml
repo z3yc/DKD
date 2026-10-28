@@ -72,6 +72,12 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
 
     </select>
 
+    <!-- P1-10：setChannel 批量配置按设备一次取全量货道，替代逐条 getChannelInfo 的 N+1 -->
+    <select id="selectChannelListByInnerCode" parameterType="String" resultMap="ChannelResult">
+        <include refid="selectChannelVo"/>
+        where inner_code = #{innerCode}
+    </select>
+
     <insert id="insertChannel" parameterType="Channel" useGeneratedKeys="true" keyProperty="id">
         insert into tb_channel
         <trim prefix="(" suffix=")" suffixOverrides=",">

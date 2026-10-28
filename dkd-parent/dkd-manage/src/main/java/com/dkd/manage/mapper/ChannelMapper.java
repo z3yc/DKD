@@ -92,6 +92,17 @@ public interface ChannelMapper
     @Select("select * from tb_channel where inner_code=#{innerCode} and channel_code=#{channelCode}")
     Channel getChannelInfo(@Param("innerCode") String innerCode, @Param("channelCode") String channelCode);
 
+    /**
+     * 按设备编号查询其全部货道（P1-10：setChannel 批量配置的 SELECT 侧 N+1 整改）。
+     *
+     * <p>原实现每条 dto 调一次 {@link #getChannelInfo}，N 个货道 = N 次 SQL；
+     * 改为每台设备一次查询后在内存建 {@code innerCode|channelCode → Channel} 索引。
+     *
+     * @param innerCode 售货机编号
+     * @return 该设备全部货道
+     */
+    List<Channel> selectChannelListByInnerCode(String innerCode);
+
 
     /**
      * 批量更新
