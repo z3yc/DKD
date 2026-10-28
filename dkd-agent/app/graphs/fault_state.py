@@ -24,7 +24,9 @@ class FaultState(TypedDict, total=False):
     字段生命周期：
     - `run_id / inner_code / window_hours`：入口写入，后续只读；
     - `step_no / tool_calls`：诊断节点写入（一条 step + 若干工具调用）；
+    - `region_id`：诊断节点从设备档案带出，供派单官选人（不再重复查档案）；
     - `diagnosis / evidence_count / dropped_count / dispatch_allowed`：诊断结论；
+    - `dispatch_proposal`：派单提案（F-08；仅有提案不等于已建单，F-09 才建）；
     - `stop_reason / error`：终止原因（页面直接展示）。
     """
 
@@ -32,10 +34,12 @@ class FaultState(TypedDict, total=False):
     inner_code: str
     window_hours: int
     step_no: int
+    region_id: int | None
     tool_calls: list[dict[str, Any]]
     diagnosis: dict[str, Any] | None
     evidence_count: int
     dropped_count: int
     dispatch_allowed: bool
+    dispatch_proposal: dict[str, Any] | None
     stop_reason: str | None
     error: str | None

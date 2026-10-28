@@ -271,7 +271,19 @@ async def test_graph_run_persists_evidence(monkeypatch: pytest.MonkeyPatch) -> N
     ) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
         return facts, calls, None
 
+    async def fake_dispatch_facts(
+        deps: fg.FaultDeps,
+        *,
+        run_id: str,
+        inner_code: str,
+        region_id: int | None,
+        step_no: int = 2,
+    ) -> tuple[list[Any], list[Any], list[dict[str, Any]]]:
+        # M3 起诊断后会进入派单官；本用例只验诊断证据落库，故桩成"无可用接单人"
+        return [], [], []
+
     monkeypatch.setattr(fg, "collect_facts", fake_collect)
+    monkeypatch.setattr(fg, "_fetch_dispatch_facts", fake_dispatch_facts)
     store = FakeStore()
     deps = fg.FaultDeps(
         settings=make_settings(), store=store, now=lambda: datetime(2026, 10, 27, 9, 0, 0)
@@ -282,7 +294,9 @@ async def test_graph_run_persists_evidence(monkeypatch: pytest.MonkeyPatch) -> N
     assert state["diagnosis"] is not None
     assert state["evidence_count"] == 1
     assert state["dispatch_allowed"] is True
-    assert state["stop_reason"] is None
+    # 无可派接单人：提案不可执行，运行按 done 收尾并写明原因（不假装已派单）
+    assert state["dispatch_proposal"]["dispatchable"] is False
+    assert "no_assignee" in state["stop_reason"]
     # 收尾：run 建了、step 写了、run 以 done 结束
     assert store.ops()[0] == "insert_run"
     assert "insert_step" in store.ops()

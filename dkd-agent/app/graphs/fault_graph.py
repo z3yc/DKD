@@ -51,6 +51,15 @@ logger = logging.getLogger("dkd.agent.graphs.fault")
 ROLE_DIAGNOSTICIAN = "diagnostician"
 ACTION_DIAGNOSE = "diagnose"
 
+# M3/F-08：派单官。只产出**提案**，不建单——建单在 F-09 由人工确认后触发（AGENTS §7.9）
+ROLE_DISPATCHER = "dispatcher"
+ACTION_DISPATCH_PROPOSE = "dispatch_propose"
+
+# 提案优先级（1-低 / 2-中 / 3-高 / 4-紧急），口径与补货工作台 priorityLabel 一致
+PRIORITY_LOW = 1
+PRIORITY_MEDIUM = 2
+PRIORITY_HIGH = 3
+
 DEFAULT_WINDOW_HOURS = 24
 
 # 证据 kind 前缀 → 产出它的工具。回溯不到工具调用 = 证据不可复核 = 必须丢弃（F-07）
@@ -86,6 +95,40 @@ class EvidenceTrace:
     dropped: list[dict[str, Any]] = field(default_factory=list)
     cannot_conclude: bool = True
     dispatch_allowed: bool = False
+
+
+@dataclass
+class DispatchProposal:
+    """派单提案（F-08 的唯一产物；F-09 经人工确认后才建单）。
+
+    为什么把"能不能派"与"派的依据"放在同一个对象里：只给一个 assigneeId 的话，
+    页面无法解释"为什么派给这个人、为什么现在派"，运营只能盲信；提案必须自带
+    `based_on_evidence`（诊断证据）与 `assignee_basis`（区域/候选数/在途数）。
+    """
+
+    inner_code: str
+    assignee_id: int | None
+    assignee_name: str | None
+    priority: int
+    desc: str
+    based_on_evidence: list[str] = field(default_factory=list)
+    assignee_basis: dict[str, Any] = field(default_factory=dict)
+    dispatchable: bool = False
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """出口统一 camelCase（与 diagnosis 的 serialization_alias 约定一致）。"""
+        return {
+            "innerCode": self.inner_code,
+            "assigneeId": self.assignee_id,
+            "assigneeName": self.assignee_name,
+            "priority": self.priority,
+            "desc": self.desc,
+            "basedOnEvidence": list(self.based_on_evidence),
+            "assigneeBasis": dict(self.assignee_basis),
+            "dispatchable": self.dispatchable,
+            "reason": self.reason,
+        }
 
 
 def _row_count(rows: Any) -> int:
@@ -320,6 +363,229 @@ def trace_evidence(
     )
 
 
+def _proposal_priority(diagnosis: dict[str, Any]) -> int:
+    """优先级由证据强度决定（不让模型或调用方随手给）。"""
+    evidence = diagnosis.get("evidence") or []
+    if any(str(item.get("severity")) == "high" for item in evidence):
+        return PRIORITY_HIGH
+    if str(diagnosis.get("confidence")) == "high":
+        return PRIORITY_MEDIUM
+    return PRIORITY_LOW
+
+
+def build_dispatch_proposal(
+    diagnosis: dict[str, Any],
+    *,
+    assignees: list[Any],
+    inflight: list[Any],
+) -> DispatchProposal:
+    """由诊断结论 + 候选接单人生成派单提案（纯函数，可单测）。
+
+    拒绝路径（F-08 验收）：
+    - `cannotConclude=true` → `cannot_conclude`，不产提案；
+    - 没有任何 `evidenceId` → `diagnosis_without_evidence`（"没依据的派单"比不派更糟）；
+    - 没有可用接单人 → `no_assignee`（与补货的「待指派」同语义，不静默选错人）。
+    """
+    inner_code = str(diagnosis.get("innerCode") or "")
+    evidence_ids = [
+        str(item.get("evidenceId"))
+        for item in (diagnosis.get("evidence") or [])
+        if item.get("evidenceId")
+    ]
+    empty = DispatchProposal(inner_code, None, None, PRIORITY_LOW, "", evidence_ids, {}, False)
+    if diagnosis.get("cannotConclude") is True:
+        empty.reason = "cannot_conclude"
+        return empty
+    if not evidence_ids:
+        empty.reason = "diagnosis_without_evidence"
+        return empty
+
+    assignee = assignees[0] if assignees else None
+    basis: dict[str, Any] = {
+        "regionId": getattr(assignee, "region_id", None) if assignee is not None else None,
+        "candidateCount": len(assignees),
+        "deviceInflightCount": len(inflight),
+    }
+    if assignee is None:
+        empty.assignee_basis = basis
+        empty.reason = "no_assignee"
+        return empty
+
+    kinds = sorted({str(item.get("kind")) for item in (diagnosis.get("evidence") or [])})
+    desc = f"智能诊断建议：{inner_code} 检出 {len(evidence_ids)} 条异常证据（{'、'.join(kinds)}）"
+    if inflight:
+        desc += f"；设备已有 {len(inflight)} 张在途工单，处置前请先核对"
+    return DispatchProposal(
+        inner_code=inner_code,
+        assignee_id=getattr(assignee, "emp_id", None),
+        assignee_name=getattr(assignee, "user_name", None),
+        priority=_proposal_priority(diagnosis),
+        desc=desc,
+        based_on_evidence=evidence_ids,
+        assignee_basis=basis,
+        dispatchable=True,
+    )
+
+
+def validate_proposal_refs(proposal: DispatchProposal, diagnosis: dict[str, Any]) -> str | None:
+    """校验提案引用（F-08 的"引用越界拒绝"）。
+
+    @return None 表示合法；否则返回拒绝原因（调用方写进 step.error_msg）
+    """
+    allowed = {
+        str(item.get("evidenceId"))
+        for item in (diagnosis.get("evidence") or [])
+        if item.get("evidenceId")
+    }
+    if not proposal.based_on_evidence:
+        return "evidence_ref_missing"
+    if any(ref not in allowed for ref in proposal.based_on_evidence):
+        return "evidence_ref_out_of_range"
+    if proposal.assignee_id is not None and proposal.assignee_basis.get("regionId") is None:
+        return "assignee_basis_missing"
+    return None
+
+
+def _dispatch_summary(proposal: DispatchProposal) -> str:
+    """派单提案给运营看的一句话（是否可执行、依据几条，不粉饰）。"""
+    if proposal.dispatchable:
+        return (
+            f"派给={proposal.assignee_name}（优先级 {proposal.priority}）；"
+            f"依据证据 {len(proposal.based_on_evidence)} 条；待人工确认"
+        )
+    return f"未生成可执行派单：{proposal.reason}"
+
+
+async def _fetch_dispatch_facts(
+    deps: FaultDeps,
+    *,
+    run_id: str,
+    inner_code: str,
+    region_id: int | None,
+    step_no: int = 2,
+) -> tuple[list[Any], list[Any], list[dict[str, Any]]]:
+    """取派单所需事实：同区域可接单人 + 本设备在途工单（都写 tool_call）。"""
+    calls: list[dict[str, Any]] = []
+    seq = 0
+
+    async def run_tool(
+        tool_code: str,
+        factory: Callable[[], Any],
+        params: dict[str, Any],
+        row_count_fn: Callable[[Any], int] | None = None,
+    ) -> Any:
+        nonlocal seq
+        seq += 1
+        began = time.perf_counter()
+        rows = await factory()
+        duration_ms = int((time.perf_counter() - began) * 1000)
+        row_count = row_count_fn(rows) if row_count_fn is not None else _row_count(rows)
+        await record_tool_call(
+            deps.settings,
+            deps.store,
+            run_id=run_id,
+            step_no=step_no,
+            call_seq=seq,
+            tool_code=tool_code,
+            params=params,
+            row_count=row_count,
+            duration_ms=duration_ms,
+        )
+        calls.append(
+            {
+                "tool_code": tool_code,
+                "step_no": step_no,
+                "call_seq": seq,
+                "row_count": row_count,
+                "duration_ms": duration_ms,
+            }
+        )
+        return rows
+
+    grouped: dict[int, list[Any]] = {}
+    async with get_sessionmaker()() as session:
+        if region_id is not None:
+            grouped = await run_tool(
+                "list_region_assignees",
+                lambda: read_tools.list_region_assignees(session, region_ids=[region_id]),
+                {"regionId": region_id},
+                row_count_fn=lambda data: len((data or {}).get(region_id, [])),
+            )
+        # 即使没有接单人也要查在途：它是"这批已经有人在处理"的证据，页面要展示
+        inflight = await run_tool(
+            "list_inflight_tasks",
+            lambda: read_tools.list_inflight_tasks(session, inner_codes=[inner_code]),
+            {"innerCodes": [inner_code]},
+        )
+    assignees = list((grouped or {}).get(region_id, [])) if region_id is not None else []
+    return assignees, list(inflight or []), calls
+
+
+def _make_dispatch_node(deps: FaultDeps) -> Callable[[FaultState], Any]:
+    """构造派单官节点（M3/F-08）：只生成提案并落 step，不建单。"""
+
+    async def dispatch(state: FaultState) -> FaultState:
+        run_id = state["run_id"]
+        inner_code = state["inner_code"]
+        diagnosis = state.get("diagnosis") or {}
+        region_id = state.get("region_id")
+        try:
+            assignees, inflight, calls = await _fetch_dispatch_facts(
+                deps, run_id=run_id, inner_code=inner_code, region_id=region_id
+            )
+        except Exception as exc:  # noqa: BLE001 —— 取数失败落 step 并终止，不抛穿图
+            logger.warning(
+                "派单选人取数失败 run_id=%s err=%s", run_id, type(exc).__name__, exc_info=True
+            )
+            await record_step(
+                deps.settings,
+                deps.store,
+                run_id=run_id,
+                step_no=2,
+                role_code=ROLE_DISPATCHER,
+                action=ACTION_DISPATCH_PROPOSE,
+                summary="选人取数失败",
+                status="error",
+                error_msg=f"选人取数失败（{type(exc).__name__}）",
+            )
+            return {"error": "dispatch_collect_failed", "stop_reason": "派单选人取数失败"}
+
+        proposal = build_dispatch_proposal(diagnosis, assignees=assignees, inflight=inflight)
+        ref_error = validate_proposal_refs(proposal, diagnosis) if proposal.dispatchable else None
+        if ref_error is not None:
+            await record_step(
+                deps.settings,
+                deps.store,
+                run_id=run_id,
+                step_no=2,
+                role_code=ROLE_DISPATCHER,
+                action=ACTION_DISPATCH_PROPOSE,
+                summary="提案引用校验失败",
+                status="error",
+                error_msg=f"提案引用校验失败：{ref_error}",
+            )
+            return {"error": "proposal_invalid", "stop_reason": f"派单提案引用非法：{ref_error}"}
+
+        await record_step(
+            deps.settings,
+            deps.store,
+            run_id=run_id,
+            step_no=2,
+            role_code=ROLE_DISPATCHER,
+            action=ACTION_DISPATCH_PROPOSE,
+            summary=_dispatch_summary(proposal),
+            evidence={"proposal": proposal.to_dict(), "toolCalls": calls},
+            status="ok" if proposal.dispatchable else "skipped",
+        )
+        stop_reason = None if proposal.dispatchable else f"未生成可执行派单：{proposal.reason}"
+        return {
+            "dispatch_proposal": proposal.to_dict(),
+            "stop_reason": stop_reason,
+        }
+
+    return dispatch
+
+
 def _diagnose_summary(conclusion: DiagnosisConclusion, trace: EvidenceTrace) -> str:
     """一轮诊断给运营看的一句话（不编造，数字全来自 trace）。"""
     return (
@@ -409,6 +675,8 @@ def _make_diagnose_node(deps: FaultDeps) -> Callable[[FaultState], Any]:
         )
         return {
             "tool_calls": calls,
+            # 区域 id 是派单官的选人键；放 state 而不是让它再查一次设备档案
+            "region_id": facts["profile"].region_id,
             "diagnosis": conclusion.model_dump(by_alias=True),
             "evidence_count": len(trace.kept),
             "dropped_count": len(trace.dropped),
@@ -422,11 +690,13 @@ def _make_diagnose_node(deps: FaultDeps) -> Callable[[FaultState], Any]:
 
 
 def supervisor(state: FaultState) -> str:
-    """主管路由（纯函数）：出错 → 结束；没有诊断 → 派诊断官；有诊断 → 结束（M2）。"""
+    """主管路由（纯函数）：出错→结束；无诊断→诊断官；可派单且无提案→派单官；否则结束。"""
     if state.get("error"):
         return END
     if state.get("diagnosis") is None:
         return ROLE_DIAGNOSTICIAN
+    if state.get("dispatch_allowed") and state.get("dispatch_proposal") is None:
+        return ROLE_DISPATCHER
     return END
 
 
@@ -436,17 +706,23 @@ def _pass_through(state: FaultState) -> FaultState:  # noqa: ARG001 —— 节�
 
 
 def build_fault_graph(deps: FaultDeps) -> Any:
-    """编译故障诊断图（M2 只有 supervisor + diagnose；M3 加 dispatch，M4 加 review）。"""
+    """编译故障诊断图（M3：supervisor + 诊断官 + 派单官；M4 再加审核官）。"""
     builder = StateGraph(FaultState)
     builder.add_node("supervisor", _pass_through)
     builder.add_node(ROLE_DIAGNOSTICIAN, _make_diagnose_node(deps))
+    builder.add_node(ROLE_DISPATCHER, _make_dispatch_node(deps))
     builder.add_edge(START, "supervisor")
     builder.add_conditional_edges(
         "supervisor",
         supervisor,
-        {ROLE_DIAGNOSTICIAN: ROLE_DIAGNOSTICIAN, END: END},
+        {
+            ROLE_DIAGNOSTICIAN: ROLE_DIAGNOSTICIAN,
+            ROLE_DISPATCHER: ROLE_DISPATCHER,
+            END: END,
+        },
     )
     builder.add_edge(ROLE_DIAGNOSTICIAN, "supervisor")
+    builder.add_edge(ROLE_DISPATCHER, "supervisor")
     return builder.compile()
 
 
@@ -457,10 +733,10 @@ async def run_fault_diagnosis(
     window_hours: int = DEFAULT_WINDOW_HOURS,
     trigger_type: int = 3,
 ) -> FaultState:
-    """跑一次故障诊断：建 run → 跑图 → 收尾（失败也收尾，页面不会永远转圈）。
+    """跑一次故障诊断（含派单提案）：建 run → 跑图 → 收尾（失败也收尾，页面不会永远转圈）。
 
     @param trigger_type 1-用户 2-定时任务 3-人工干预（首期由页面按钮触发，固定 3）
-    @return 最终 state（含 diagnosis / evidence_count / dispatch_allowed）
+    @return 最终 state（含 diagnosis / dispatch_proposal / dispatch_allowed）
     """
     run_id = f"fault-{uuid.uuid4().hex[:12]}"
     await start_run(
@@ -481,6 +757,7 @@ async def run_fault_diagnosis(
         "step_no": 1,
         "diagnosis": None,
         "dispatch_allowed": False,
+        "dispatch_proposal": None,
     }
     try:
         result = await graph.ainvoke(initial)
@@ -493,7 +770,14 @@ async def run_fault_diagnosis(
             stop_reason="诊断执行异常",
         )
         raise
-    status = "failed" if result.get("error") else "done"
+    proposal = result.get("dispatch_proposal") or {}
+    if result.get("error"):
+        status = "failed"
+    elif proposal.get("dispatchable") and result.get("stop_reason") is None:
+        # 提案已生成、等人确认：非终态，finished_at 不写（recorder 语义）
+        status = "waiting_confirm"
+    else:
+        status = "done"
     await finish_run(
         deps.settings,
         deps.store,
@@ -506,11 +790,14 @@ async def run_fault_diagnosis(
 
 __all__ = [
     "DEFAULT_WINDOW_HOURS",
+    "DispatchProposal",
     "EvidenceTrace",
     "FaultDeps",
+    "build_dispatch_proposal",
     "build_fault_graph",
     "collect_facts",
     "run_fault_diagnosis",
     "supervisor",
     "trace_evidence",
+    "validate_proposal_refs",
 ]
