@@ -14,7 +14,13 @@
   （高严重度证据→高）、`desc` 带设备号/证据条数/在途工单数；提案必须引用 `basedOnEvidence` 与
   `assigneeBasis`（区域/候选数/在途数），引用越界或缺依据直接拒绝生成。提案**只落库、不建单**，
   run 停在 `waiting_confirm` 等人工确认（F-09 才调用 Java 回调建维修单）。
-- 故障诊断场景 M3 人工确认（F-09）与 M4（审核官）：计划中，见 `docs/agent-fault-scenario-plan-2026-10-26.md`。
+- **故障诊断 M3 派单确认（F-09 核心）**：运营确认派单提案后经 Java 回调创建**维修工单**（`productTypeId=3`），
+  全过程 human-in-the-loop：提案只落库，确认才建单；重复确认返回同一工单（幂等，不重复回调）；
+  业务拒绝（设备有在途工单/区域不一致）与传输失败都回退到待确认并留 step 错误；
+  人工驳回需填原因且不建单。每次确认/驳回写 `agent_step` 与 `agent_decision_log`。
+  实现采用「DB 状态机两阶段」而非 LangGraph interrupt（决策 D11，理由见计划 §5.1）。
+- 故障诊断 F-09 的 HTTP 接口（`POST /agent/fault/runs/{id}/confirm`）、Java 网关白名单与前端按钮：进行中。
+- 故障诊断 M4（审核官）：计划中，见 `docs/agent-fault-scenario-plan-2026-10-26.md`。
 
 ## [0.2.0] - 2026-10-27
 

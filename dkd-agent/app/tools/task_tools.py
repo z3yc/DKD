@@ -123,16 +123,24 @@ def _safe_msg(response: httpx.Response) -> str:
     return str(_safe_json(response).get("msg") or "")
 
 
-async def create_restock_task(
-    plan: RestockPlan, *, client: httpx.AsyncClient | None = None, request_id: str | None = None
-) -> CreatedTask:
-    """把补货计划提交给 Java 建单（唯一写通道）。
+# 维修工单类型（与 Java `DkdContants.TASK_TYPE_REPAIR` 一致；Java 侧是权威枚举）
+TASK_TYPE_REPAIR = 3
 
-    @param plan 已通过状态机卡口、且已有接单人的补货计划（内部用 `to_task_dto()` 做字段映射）
-    @param client 可选注入的 httpx 客户端（单测用 MockTransport，生产传 None）
-    @param request_id 全链路追踪 ID（与网关/日志一致，便于跨进程对账）
-    @return 建单结果（taskId/taskCode）
-    @raises CallbackAuthError / CallbackUnavailableError / CallbackBusinessError 见模块 docstring
+
+async def _post_task_payload(
+    payload: dict[str, Any],
+    *,
+    inner_code: str,
+    label: str,
+    detail_count: int = 0,
+    client: httpx.AsyncClient | None = None,
+    request_id: str | None = None,
+) -> CreatedTask:
+    """把工单载荷提交给 Java（补货/维修共用同一条写通道与同一套失败分类）。
+
+    @param payload 已组装好的 TaskDto（字段映射由调用方负责）
+    @param label 日志里的动作名（"建单" / "报修建单"），只用于排障，不影响行为
+    @param detail_count 明细条数（仅日志用）
     """
     settings = get_settings()
     secret = settings.service_secret
@@ -140,7 +148,6 @@ async def create_restock_task(
         # 本地快速失败：Java 侧同样会回 503，但在这里拦掉能给出更明确的“配置缺失”信息
         raise CallbackAuthError("DKD_AGENT_SERVICE_SECRET 未配置，无法调用建单回调")
 
-    payload = plan.to_task_dto()
     url = _callback_url()
     headers = {
         HEADER_SECRET: secret,
@@ -155,9 +162,10 @@ async def create_restock_task(
         response = await http.post(url, json=payload, headers=headers)
     except httpx.TimeoutException as exc:
         logger.warning(
-            "建单回调超时（%ss）inner_code=%s request_id=%s",
+            "%s回调超时（%ss）inner_code=%s request_id=%s",
+            label,
             settings.callback_timeout_s,
-            plan.inner_code,
+            inner_code,
             request_id,
         )
         # 为什么这条文案比“请勿盲目重试”长（FIX-16 演练产出，2026-10-01 实测）：
@@ -171,15 +179,16 @@ async def create_restock_task(
         # 但可以让这句文案**自己带上下一步动作与可能原因**，把死胡同变成可行动。
         # 措辞上用“可能”而不是断言 Redis：Agent 看不到 Java 内部，不能替运维下结论。
         raise CallbackUnavailableError(
-            f"建单回调超时（>{settings.callback_timeout_s}s），未确认结果："
-            "请先刷新该计划状态再决定是否重试（若已变为「已建单」则勿重试）；"
+            f"{label}回调超时（>{settings.callback_timeout_s}s），未确认结果："
+            "请先刷新状态再决定是否重试（若已变为「已建单」则勿重试）；"
             "回调经过 Redis 限流计数与数据库，可能原因包括 Java 或 Redis 不可用，建议一并检查"
         ) from exc
     except httpx.HTTPError as exc:
         # 只记异常类型：异常文本可能含 URL，而 URL 不含密钥（密钥只在头里），但仍避免贴原始报文
         logger.warning(
-            "建单回调网络失败 inner_code=%s request_id=%s err=%s",
-            plan.inner_code,
+            "%s回调网络失败 inner_code=%s request_id=%s err=%s",
+            label,
+            inner_code,
             request_id,
             type(exc).__name__,
         )
@@ -191,11 +200,67 @@ async def create_restock_task(
     created = _raise_for_envelope(response)
     # 只记结果与标识，不记密钥、不记完整请求体（AGENTS §6.1 日志规范）
     logger.info(
-        "建单回调成功 inner_code=%s task_id=%s task_code=%s channels=%s request_id=%s",
-        plan.inner_code,
+        "%s回调成功 inner_code=%s task_id=%s task_code=%s details=%s request_id=%s",
+        label,
+        inner_code,
         created.task_id,
         created.task_code,
-        len(payload.get("details", [])),
+        detail_count,
         request_id,
     )
     return created
+
+
+async def create_restock_task(
+    plan: RestockPlan, *, client: httpx.AsyncClient | None = None, request_id: str | None = None
+) -> CreatedTask:
+    """把补货计划提交给 Java 建单（唯一写通道）。
+
+    @param plan 已通过状态机卡口、且已有接单人的补货计划（内部用 `to_task_dto()` 做字段映射）
+    @param client 可选注入的 httpx 客户端（单测用 MockTransport，生产传 None）
+    @param request_id 全链路追踪 ID（与网关/日志一致，便于跨进程对账）
+    @return 建单结果（taskId/taskCode）
+    @raises CallbackAuthError / CallbackUnavailableError / CallbackBusinessError 见模块 docstring
+    """
+    payload = plan.to_task_dto()
+    return await _post_task_payload(
+        payload,
+        inner_code=plan.inner_code,
+        label="建单",
+        detail_count=len(payload.get("details", [])),
+        client=client,
+        request_id=request_id,
+    )
+
+
+async def create_repair_task(
+    *,
+    inner_code: str,
+    assignee_id: int,
+    desc: str,
+    client: httpx.AsyncClient | None = None,
+    request_id: str | None = None,
+) -> CreatedTask:
+    """报修工单建单（故障场景 F-09 的唯一写通道，`productTypeId=3`）。
+
+    <p>为什么维修单没有 details：Java `TaskDetailsMapper` 的明细是补货货道语义；
+    维修单只带设备号/接单人/描述，`AgentCallbackController.validate()` 也只对补货强制校验明细。
+
+    @param inner_code 设备编号
+    @param assignee_id 接单人（`tb_emp.id`；Java 会校验与设备区域一致）
+    @param desc 工单描述（来自派单提案，含证据依据）
+    @raises CallbackAuthError / CallbackUnavailableError / CallbackBusinessError
+    """
+    payload = {
+        "innerCode": inner_code,
+        "userId": assignee_id,
+        "productTypeId": TASK_TYPE_REPAIR,
+        "desc": desc,
+    }
+    return await _post_task_payload(
+        payload,
+        inner_code=inner_code,
+        label="报修建单",
+        client=client,
+        request_id=request_id,
+    )
