@@ -58,7 +58,7 @@
 
 | 任务 | 内容 | 工时 | 依赖 | 验收 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| **F-10** | `get_task_detail`（读 `tb_task`/`tb_task_details`）+ `check_repair_effective`（修复后窗口订单恢复）+ 四分类结论（`fix_verified/not_fixed/wrong_dispatch/evidence_insufficient`） | 2.5d | F-09 | 四类各有单测；`not_fixed` 必须点名证据 | ⬜ |
+| **F-10** | `get_task_detail`（读 `tb_task`/`tb_task_details`）+ `check_repair_effective`（修复后窗口订单恢复）+ 四分类结论（`fix_verified/not_fixed/wrong_dispatch/evidence_insufficient`） | 2.5d | F-09 | 四类各有单测；`not_fixed` 必须点名证据 | 🔄 **F-10a 已完成（2026-10-28，代码+单测）**：`app/tools/review_tools.py`（只读工具 + 纯函数效果判定）+ `app/services/fault_review.py`（四分类 + 证据点名）+ `tests/test_fault_review.py` **16 用例**；`ruff` 全过、`pytest` 全量 **485 passed**；新模块覆盖率 **95%**（review_tools 100% / fault_review 90%）。**未接**：HTTP/网关/前端、run/step 记录、真库样本 → 见 §6.5 与下一步 |
 
 ### F5 配置台 / 工具中心（上一版 P0/P1）
 
@@ -120,6 +120,7 @@
 | **D9** | Q4 工具开关是否对补货场景生效 | **一致生效**（同一套 `agent_tool` 注册表） | 两套开关必然漂移；补货场景也要能关工具 | F-12 完成时补一条补货侧回归：关工具后补货图也看不到 |
 | **D10** | Q5 何时并入排期计划 | **待排期窗口确认后**再并入 `DKD智能体接入项目排期计划.md` 并重算可用工日 | AGENTS §4.3 要求双文档互引 + 重算；现在并表会污染 64 人日基线 | 复查触发：本计划 F-17 执行前必须完成并表 |
 | **D11** | F-09 的 `interrupt()` 实现方式 | **改用「提案落库 + 独立确认调用」两阶段 DB 状态机**（`waiting_confirm → running → done`），不引入 checkpointer interrupt | ① 确认来自独立 HTTP 请求，天然跨进程；DB 状态机本身即可协调，无需持久化图实例/thread_id；② 幂等真正兜底是"Java 同设备同类型在途工单防重 + claim 回查"，不是 checkpointer；③ 少一条需长期维护的恢复路径（AGENTS：不新增两套并存路径）。若将来出现多轮人工介入再评估 | 复查触发：审核官（F-10）若也要人工确认，或出现"确认后需回退再改提案"的需求时 |
+| **D12** | F-10 审核官如何接入 | **独立复核入口（按 taskId 触发），不改动 M3 已验收的 `fault_graph`**：本轮先落只读工具 + 四分类纯逻辑（F-10a），下一切片再接 HTTP/网关/前端（F-10b）。分类优先级固定为「证据不足 > 派错人 > 未修复 > 已验证」，`fix_verified` 必须有选人依据（缺依据降级为证据不足） | ① D8 已定"页面点复核"，与诊断图不是同一次调用；② 不改已上线图，避免给 M3 回归面；③ 先把可审计的判定做成纯函数，单测可覆盖全部拒绝路径，再接传输层 | 复查触发：F-10b 接入时若需与诊断 run 合并展示，再评估复用 `fault_graph` 的 `run_id` 关联（只读关联，不改图） |
 
 ### 5.2 防遗忘清单（每条都有触发点，不靠记忆）
 
@@ -155,6 +156,8 @@
 | 2026-10-28 | **M3/F-09c 前端完成**：时间线页新增「发起故障诊断」（`manage:vm:query`）、抽屉内派单提案卡片、「确认建单 / 驳回」（`manage:task:add`）、驳回原因必填；`npm run build:prod` exit 0；浏览器交互待人工冒烟 |
 | 2026-10-28 | **M3 收口 + 发版**：F-08/F-09 全部完成，版本升 `0.3.0` 并打标注 tag；下一里程碑 F-10 审核官 |
 | 2026-10-28 | **自查（基线 `921eb41` → 当前工作树）**：涉及 `dkd-vue`；新增 288 行/删除 6 行；发现 2 处（`handleView` 需抽 `loadDrawer` 供确认后复用、`faultProposal` 需兼容字符串/对象两种 evidenceJson）；修复 2 处；门禁 `npm run build:prod` exit 0 |
+| 2026-10-28 | **F-10a 审核官基础完成**：`app/tools/review_tools.py`（`get_task_detail` + 纯函数 `check_repair_effective`）+ `app/services/fault_review.py`（四分类 + 证据点名 + 所需数据）+ `tests/test_fault_review.py` **16 用例**；新模块覆盖率 **95%**（工具 100% / 服务 90%）；未接 HTTP/网关/前端与真库样本（F-10 保持"进行中"） |
+| 2026-10-28 | **自查（基线 `9d881c8` → 待提交）**：涉及 `dkd-agent`；新增 843 行/删除 2 行；发现 3 处（ruff E501×5、`wrong_dispatch` 证据文案缺 `assigneeBasis` 字样、缺"无选人依据不得判已验证"用例）；修复 3 处；门禁 `ruff check` 全过 / `pytest` **485 passed** |
 
 ### 6.1 本次交付明细（M1 第一批，2026-10-26）
 
@@ -168,7 +171,22 @@
 | `dkd-agent/tests/conftest.py` | autouse 兜底关闭 `DKD_AGENT_OBS_ENABLED`（防单测写本机库） | 全量测试不再碰 DB |
 | `dkd-agent/tests/test_run_recorder.py` | 正常/关闭/失败/非法参数/摘要/扫描 10 用例 | 10 passed |
 
-**下一步**：M3 已收口（v0.3.0），进入 **F-10 审核官**（`get_task_detail` + `check_repair_effective` + 四分类结论；按 D8 先做"页面点复核"）。
+**下一步**：M3 已收口（v0.3.0），F-10 进行中——**F-10a（本轮）**已落审核官只读工具 + 四分类纯逻辑；
+**F-10b** 接复核入口（`POST /agent/fault/reviews` + Java 网关白名单/权限 + 时间线页「复核」按钮 + run/step 记录 + 决策留痕）；
+**F-10c** 真库四分类样本与 e2e（四类各至少一条真实样本，`not_fixed` 必须能点回订单）。
+
+### 6.5 F-10a 审核官基础（2026-10-28，代码完成+单测通过，未接入口）
+
+| 文件 | 内容 | 验证 |
+| --- | --- | --- |
+| `dkd-agent/app/tools/review_tools.py` | `get_task_detail`（`tb_task` + `tb_task_details`，复用 `read_tools._fetch_all` 的白名单/超时/行数护栏，两条等值查询各带 `limit`，不 join 避免 collation 坑）；`check_repair_effective`（**纯函数**，复用诊断已取的 `OrderAnomaly`，不新查库） | 覆盖率 **100%**；SQL 形状断言（表名/limit/无 `date_format`/无 join） |
+| `dkd-agent/app/services/fault_review.py` | 四分类 + 判定优先级「证据不足 > 派错人 > 未修复 > 已验证」；`not_fixed` 点名订单证据；`wrong_dispatch` 点名期望/实际 + `assigneeBasis`；`evidence_insufficient` 列出需补数据（禁止"再观察"）；无选人依据时**禁止**给 `fix_verified` | 覆盖率 **90%**；四类各有单测 |
+| `dkd-agent/tests/test_fault_review.py` | 16 用例：工具解析/缺失/非法入参、效果判定三态、四分类各一、四类互斥集合、拒绝路径（未完成/非维修/缺提案/无依据/无窗口数据） | `pytest` **485 passed / 14 deselected** |
+
+**边界与未验证（如实登记）**：
+- **未接 HTTP/网关/前端**：本轮只到纯逻辑层；F-10b 才对外可用，因此 F-10 **不得标完成**；
+- **未连真库**：`tb_task`/`tb_task_details` 的列以 Mapper/DDL 勘查为准，真库四分类样本属 F-10c；
+- **未写 run/step/决策留痕**：审核动作的观测与审计在 F-10b 接入时补（审核是只读判定，但"谁点的复核"仍须留痕）。
 
 ### 6.4 F-09c 前端手测清单（**未验到，需人工冒烟**）
 
