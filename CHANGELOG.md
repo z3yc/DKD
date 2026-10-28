@@ -19,7 +19,10 @@
   业务拒绝（设备有在途工单/区域不一致）与传输失败都回退到待确认并留 step 错误；
   人工驳回需填原因且不建单。每次确认/驳回写 `agent_step` 与 `agent_decision_log`。
   实现采用「DB 状态机两阶段」而非 LangGraph interrupt（决策 D11，理由见计划 §5.1）。
-- 故障诊断 F-09 的 HTTP 接口（`POST /agent/fault/runs/{id}/confirm`）、Java 网关白名单与前端按钮：进行中。
+- **故障诊断接口与网关接入（F-09b）**：新增 `POST /agent/fault/runs`（发起诊断，需 `manage:vm:query`）与
+  `POST /agent/fault/runs/{runId}/confirm`（确认/驳回，需 `manage:task:add`）；确认与驳回携带网关注入的
+  人工身份并写入 `agent_decision_log.user_id`；Java 网关按白名单转发，非法方法/runId 形状一律 404。
+- 故障诊断前端「确认/驳回」按钮：进行中。
 - 故障诊断 M4（审核官）：计划中，见 `docs/agent-fault-scenario-plan-2026-10-26.md`。
 
 ## [0.2.0] - 2026-10-27

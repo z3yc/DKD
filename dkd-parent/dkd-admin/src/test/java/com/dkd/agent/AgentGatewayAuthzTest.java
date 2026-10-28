@@ -210,6 +210,65 @@ class AgentGatewayAuthzTest
         verifyNoInteractions(upstreamClient);
     }
 
+    @Test
+    void 故障诊断起跑需要vm查询权限_无权限403且不转发()
+    {
+        AgentGatewayController controller = controller(true);
+        login(2L, "manage:task:add");
+
+        ResponseEntity<byte[]> response = controller.proxy(request("POST", "/agent/fault/runs"));
+
+        assertThat(response.getStatusCode()).as("起跑诊断需要 manage:vm:query，不能用建单权限替代")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(body(response).getIntValue("code")).isEqualTo(403);
+        verifyNoInteractions(upstreamClient);
+    }
+
+    @Test
+    void 故障派单确认需要建单权限_只有查询权限403()
+    {
+        AgentGatewayController controller = controller(true);
+        login(2L, "manage:vm:query");
+
+        ResponseEntity<byte[]> response = controller
+                .proxy(request("POST", "/agent/fault/runs/fault-8ecd8058c359/confirm"));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(body(response).getIntValue("code")).isEqualTo(403);
+        verifyNoInteractions(upstreamClient);
+    }
+
+    @Test
+    void 故障派单确认有add权限时转发()
+    {
+        when(upstreamClient.forward(anyString(), anyString(), any(), any(), any())).thenReturn(okResult());
+        AgentGatewayController controller = controller(true);
+        login(2L, "manage:task:add");
+
+        ResponseEntity<byte[]> response = controller
+                .proxy(request("POST", "/agent/fault/runs/fault-8ecd8058c359/confirm"));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        verify(upstreamClient).forward(eq("POST"), eq("/agent/fault/runs/fault-8ecd8058c359/confirm"),
+                any(), any(), any());
+    }
+
+    @Test
+    void 故障接口只接受白名单方法且runId形状非法一律404()
+    {
+        AgentGatewayController controller = controller(true);
+        login(1L);
+
+        ResponseEntity<byte[]> getRuns = controller.proxy(request("GET", "/agent/fault/runs"));
+        ResponseEntity<byte[]> badRunId = controller
+                .proxy(request("POST", "/agent/fault/runs/bad!id/confirm"));
+
+        assertThat(getRuns.getStatusCode()).as("GET /fault/runs 不在白名单（起跑只允许 POST）")
+                .isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(badRunId.getStatusCode()).as("runId 形状非法不得放行").isEqualTo(HttpStatus.NOT_FOUND);
+        verifyNoInteractions(upstreamClient);
+    }
+
     /**
      * 写入 SecurityContext 的登录用户。
      *

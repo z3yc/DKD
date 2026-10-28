@@ -52,7 +52,7 @@
 | 任务 | 内容 | 工时 | 依赖 | 验收 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | **F-08** | 提案生成：接单人（区域匹配 + 在途数）、优先级、工单描述；必须引用 `basedOnEvidence` 与 `assigneeBasis` | 2d | F-07 | 单测：缺依据拒绝生成；引用越界拒绝 | ✅ 2026-10-28：`build_dispatch_proposal` / `validate_proposal_refs` + 派单节点（step 2）；9 个新单测；真库 `fault-8ecd8058c359` 提案落库（派给=孙权、优先级 2、依据 12 条、run=`waiting_confirm`） |
-| **F-09** | `interrupt()` 生成提案 → `POST /runs/{id}/confirm` → 回调 `/agent/callback/task`（`productTypeId=3`）→ 幂等 | 2.5d | F-08 | 重复确认不重复建单；未确认不建单；拒单回写状态 | 🔄 2026-10-28：**确认核心完成并真库验收**（两阶段 DB 状态机，见 D11）：`confirm_fault_dispatch` + `create_repair_task`；10 个单测；真库 run `fault-8ecd8058c359` → 建单 `taskId=579/202610280001`、二次确认返回同一单、设备状态未被改（D7）、决策留痕 1 条。**待做**：HTTP `POST /agent/fault/runs/{id}/confirm`、Java 网关白名单、前端确认按钮 |
+| **F-09** | `interrupt()` 生成提案 → `POST /runs/{id}/confirm` → 回调 `/agent/callback/task`（`productTypeId=3`）→ 幂等 | 2.5d | F-08 | 重复确认不重复建单；未确认不建单；拒单回写状态 | 🔄 2026-10-28：确认核心 + **HTTP 接口 + 网关白名单/权限点完成**：`POST /agent/fault/runs`（`manage:vm:query`）、`POST /agent/fault/runs/{id}/confirm`（`manage:task:add`）、人工身份进留痕；10+10 单测、Java 31 项、真库闭环（建单 579/二次幂等/HTTP 驳回未建单）。**仅剩**：前端「确认/驳回」按钮 |
 
 ### F4 审核官
 
@@ -87,7 +87,7 @@
 | --- | --- | --- | --- |
 | **M1 基座** | F-01 ~ F-05 | 7d | ✅ 2026-10-26：三张运行表 + recorder + 时间线接口与页面 + 重启收尾（真库已执行） |
 | **M2 诊断官** | F-06 ~ F-07 | 3d | ✅ 2026-10-27：一台设备出诊断结论 + 证据回溯 + 时间线（真库两次运行） |
-| **M3 派单官** | F-08 ~ F-09 | 4.5d | F-08 ✅／F-09 🔄 确认核心已真库验收（建单+幂等），接口层待做 |
+| **M3 派单官** | F-08 ~ F-09 | 4.5d | F-08 ✅／F-09 🔄 后端全通（提案+确认+接口+网关+真库建单/幂等），仅缺前端按钮 |
 | **M4 审核官** | F-10 | 2.5d | 工单完成后复核与四分类结论 |
 | **M5 配置台/工具中心** | F-11 ~ F-15 | 11d | 运营可调参数、工具开关、模型/Prompt 管理 |
 | **收尾** | F-16 ~ F-17 | 3d | e2e + 文档 |
@@ -151,7 +151,8 @@
 | 2026-10-27 | **M2 收口**：真库两次运行（24h 无证据 → 不可下结论、不派单；宽窗口 11 条证据 → 高置信可派单）；`pytest` 全量 440 项通过、`ruff` 全过 |
 | 2026-10-28 | **M3/F-08 完成**：派单提案（`build_dispatch_proposal` / `validate_proposal_refs` / 派单节点 step 2）；9 个新单测；真库 `fault-8ecd8058c359` run=`waiting_confirm`、派给=孙权、优先级 2、依据 12 条 |
 | 2026-10-28 | **M3/F-09 确认核心完成**：两阶段 DB 状态机（D11）+ `task_tools.create_repair_task`；10 个单测；真库建单 `taskId=579`、二次确认幂等返回同一单、设备状态未被改（D7）、决策留痕 1 条 |
-| 2026-10-28 | **自查（基线 `95b8a10` → 当前工作树）**：涉及 `dkd-agent`；新增 902 行/删除 23 行；发现 3 处（`_audit` 少传 runId、2 处超 100 列、`task_tools` 提交逻辑重复→抽 `_post_task_payload`）；修复 3 处；门禁 `ruff` 全过 / `pytest` 全量通过 |
+| 2026-10-28 | **M3/F-09b 接口层完成**：`app/api/fault.py`（起跑 + 确认/驳回）、Java 网关白名单与权限点（起跑=`manage:vm:query`，确认=`manage:task:add`）、人工身份进 `agent_decision_log`；Java 31 项、Python 全量通过；HTTP 真库冒烟：起跑 200（12 证据/待确认）→ 驳回 200（step3 skipped、留痕 result=3、未新增工单） |
+| 2026-10-28 | **自查（基线 `5ef1aec` → 当前工作树）**：涉及 `dkd-agent` + `dkd-common`/`dkd-admin` 测试；新增 434 行/删除 8 行；发现 3 处（`require_user_id` 跨模块复用需确认、4 个 fake 签名把 deps 写成仅关键字导致 502、`_audit` 需补 user_id）；修复 3 处；门禁 `ruff`/`pytest`/`mvn test` 全过 |
 
 ### 6.1 本次交付明细（M1 第一批，2026-10-26）
 
@@ -165,7 +166,7 @@
 | `dkd-agent/tests/conftest.py` | autouse 兜底关闭 `DKD_AGENT_OBS_ENABLED`（防单测写本机库） | 全量测试不再碰 DB |
 | `dkd-agent/tests/test_run_recorder.py` | 正常/关闭/失败/非法参数/摘要/扫描 10 用例 | 10 passed |
 
-**下一步**：F-09 还剩**接口层**（`POST /agent/fault/runs/{id}/confirm`、Java 网关白名单与权限点、前端确认/驳回按钮）；完成后 M3 收口，再进 F-10 审核官。
+**下一步**：F-09 只剩**前端「确认/驳回」按钮**（时间线抽屉里对 `waiting_confirm` + 故障场景显示；驳回必填原因；成功后刷新）。完成即 M3 收口，再进 F-10 审核官。
 
 ### 6.3 M2 收口（2026-10-27）
 

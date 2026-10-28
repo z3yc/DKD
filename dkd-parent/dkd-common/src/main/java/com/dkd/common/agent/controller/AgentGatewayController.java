@@ -123,6 +123,31 @@ public class AgentGatewayController
     private static final String PERMISSION_RESTOCK_WRITE = "manage:task:add";
 
     /**
+     * 故障诊断起跑（POST /agent/fault/runs）：只读业务数据，给“能看设备”的账号即可。
+     */
+    private static final String PATH_FAULT_RUNS = "/agent/fault/runs";
+
+    /**
+     * 故障派单确认路径正则：`/agent/fault/runs/{runId}/confirm`（runId 形如 `fault-8ecd8058c359`）。
+     *
+     * <p>为什么用正则而不是 startsWith：runId 是路径变量，若只判前缀，未来出现
+     * `/agent/fault/runs/x/confirm/evil` 之类路径也会被放行；显式约束字符集（字母数字下划线短横，
+     * 1~64 位）+ 固定后缀，路径形状本身才是白名单的一部分（fail-closed）。
+     */
+    private static final Pattern FAULT_CONFIRM_ACTION = Pattern.compile(
+            "^/agent/fault/runs/[A-Za-z0-9_-]{1,64}/confirm$");
+
+    /**
+     * 故障诊断权限点（登录 + 能看设备）
+     */
+    private static final String PERMISSION_FAULT_DIAGNOSE = "manage:vm:query";
+
+    /**
+     * 故障派单确认权限点（会经 Java 回调建维修工单，与补货确认同级）
+     */
+    private static final String PERMISSION_FAULT_CONFIRM = "manage:task:add";
+
+    /**
      * 回调路径前缀：回调是 Python → Java 的单向通道，绝不经网关暴露给前端（防御性兜底）
      */
     private static final String CALLBACK_PATH_PREFIX = AgentCallbackAuthFilter.CALLBACK_PATH_PREFIX;
@@ -220,7 +245,9 @@ public class AgentGatewayController
             "/restock/plans/{planId:\\d+}/skip",
             "/restock/plans/{planId:\\d+}/restore",
             "/restock/pause",
-            "/restock/resume" },
+            "/restock/resume",
+            "/fault/runs",
+            "/fault/runs/{runId}/confirm" },
             method = { RequestMethod.GET, RequestMethod.POST })
     public ResponseEntity<byte[]> proxy(HttpServletRequest request)
     {
@@ -325,6 +352,15 @@ public class AgentGatewayController
         }
         if (HttpMethod.POST.matches(method))
         {
+            // 故障场景（M3）：起跑=读业务数据；确认=建维修工单（会经 Java 回调产生真实业务事实）
+            if (PATH_FAULT_RUNS.equals(path))
+            {
+                return PERMISSION_FAULT_DIAGNOSE;
+            }
+            if (FAULT_CONFIRM_ACTION.matcher(path).matches())
+            {
+                return PERMISSION_FAULT_CONFIRM;
+            }
             if (PATH_RESTOCK_PAUSE.equals(path) || PATH_RESTOCK_RESUME.equals(path)
                     || RESTOCK_PLAN_ACTION.matcher(path).matches())
             {

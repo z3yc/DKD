@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api import chat, ops, restock
+from app.api import chat, fault, ops, restock
 from app.checkpoint import (
     ensure_windows_event_loop_policy,
     get_checkpoint_store,
@@ -116,6 +116,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(ops.router)
     app.include_router(restock.router)
+    app.include_router(fault.router)
 
     @app.get("/health", tags=["ops"], summary="健康检查（含依赖就绪状态）")
     async def health() -> dict[str, object]:

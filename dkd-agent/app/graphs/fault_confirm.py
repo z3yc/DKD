@@ -220,6 +220,7 @@ async def _audit(
     assignee_id: int | None,
     priority: int | None,
     remark: str | None,
+    user_id: int | None = None,
     error_msg: str | None = None,
 ) -> None:
     """写决策留痕（失败只 WARN，由 `write_decision` 内部兜底）。"""
@@ -230,7 +231,7 @@ async def _audit(
         action=action,
         target_type="vm",
         target_id=inner_code,
-        user_id=None,  # 运营身份由 Java 侧 oper_log 记录；此处不伪造用户
+        user_id=user_id,  # 网关注入的人工身份；定时任务/脚本为 None（不伪造）
         trigger_type=3,
         result=result,
         input_context={
@@ -252,6 +253,7 @@ async def confirm_fault_dispatch(
     priority: int | None = None,
     remark: str | None = None,
     operator: str = "operator",
+    user_id: int | None = None,
     store: ConfirmStore | None = None,
     callback: RepairTaskCallback | None = None,
     audit_writer: Any = None,
@@ -324,6 +326,7 @@ async def confirm_fault_dispatch(
         await _audit(
             deps,
             run_id=run_id,
+            user_id=user_id,
             writer=audit_writer,
             action="fault.dispatch_reject",
             inner_code=str(run.get("subject_id") or ""),
@@ -385,6 +388,7 @@ async def confirm_fault_dispatch(
         await _audit(
             deps,
             run_id=run_id,
+            user_id=user_id,
             writer=audit_writer,
             action="fault.dispatch_confirm",
             inner_code=inner_code,
@@ -414,6 +418,7 @@ async def confirm_fault_dispatch(
         await _audit(
             deps,
             run_id=run_id,
+            user_id=user_id,
             writer=audit_writer,
             action="fault.dispatch_confirm",
             inner_code=inner_code,
