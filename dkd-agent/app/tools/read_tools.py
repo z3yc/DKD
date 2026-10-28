@@ -43,12 +43,12 @@ logger = logging.getLogger("dkd.agent.tools.read")
 VM_STATUS_RUNNING = 1
 # 补货工单类型（DkdContants.TASK_TYPE_SUPPLY = 2）
 TASK_TYPE_SUPPLY = 2
-# 接单人必须是「运营人员」角色（DkdContants.ROLE_CODE_BUSINESS = "1002"）。
-# 依据：前端补货工单页 `dkd-vue/src/views/manage/task/business.vue` 调的正是
-# `businessList` → `EmpController.businessList`
-# （region_id + ROLE_CODE_BUSINESS + EMP_STATUS_NORMAL），与 Java 侧建单校验同源；
-# 取 1003（运维/维修）会被 dkd-app 的作业队列发错人。
+# 接单人角色（与 Java 侧建单校验、前端选人来源同源）：
+#   补货工单 → 运营人员 1002（businessList）；维修/投放/撤机 → 维修人员 1003（operationList）。
+# 为什么必须分开：Java 侧 2026-10-28 起按工单类型校验角色，派错角色会在回调建单时被拒
+# （「该员工角色不能执行此类工单」），且 dkd-app 的作业队列也是按角色分的。
 ASSIGNEE_ROLE_CODE = "1002"
+ASSIGNEE_ROLE_CODE_REPAIR = "1003"
 # 员工启用状态（DkdContants.EMP_STATUS_NORMAL = 1）
 EMP_STATUS_NORMAL = 1
 # 工单状态：1-待接单（创建） 2-进行中（DkdContants.TASK_STATUS_CREATE/PROGRESS）
@@ -319,16 +319,16 @@ async def list_machine_profiles(
 
 
 async def list_region_assignees(
-    session: Any, *, region_ids: Sequence[int]
+    session: Any, *, region_ids: Sequence[int], role_code: str = ASSIGNEE_ROLE_CODE
 ) -> dict[int, list[Assignee]]:
-    """按区域批量取**可选接单人**（`region_id` → 启用中的运营人员列表）。
+    """按区域批量取**可选接单人**（`region_id` → 启用中的指定角色人员列表）。
 
     为什么一次取多个区域而不是“一个设备一次查询”：06:00 分析要跨区域处理上百台设备，
     逐台查人就是典型的 N+1（AGENTS §10 列表接口循环内查库是重点检查项）。
 
-    过滤条件三件套（缺一不可，与 `EmpController.businessList` 逐条对齐）：
+    过滤条件三件套（缺一不可，与 `EmpController.businessList/operationList` 逐条对齐）：
       - `region_id`：`TaskServiceImpl` 强校验 `emp.regionId == vm.regionId`；
-      - `role_code = 1002`：只有运营人员该接补货工单；
+      - `role_code`：补货=1002(运营)、维修/投放/撤机=1003(维修)——默认 1002 保持补货旧行为；
       - `status = 1`：停用账号不能派单。
 
     `order by region_id, id` 是**确定性保证**：负载相同时候选顺序稳定，分配结果可复现（可测试）。
@@ -357,7 +357,7 @@ async def list_region_assignees(
             """,
             {
                 "region_ids": tuple(batch),
-                "role_code": ASSIGNEE_ROLE_CODE,
+                "role_code": role_code,
                 "status": EMP_STATUS_NORMAL,
                 "limit": settings.read_row_limit,
             },

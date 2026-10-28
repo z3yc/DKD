@@ -507,8 +507,12 @@ async def _fetch_dispatch_facts(
         if region_id is not None:
             grouped = await run_tool(
                 "list_region_assignees",
-                lambda: read_tools.list_region_assignees(session, region_ids=[region_id]),
-                {"regionId": region_id},
+                lambda: read_tools.list_region_assignees(
+                    session,
+                    region_ids=[region_id],
+                    role_code=read_tools.ASSIGNEE_ROLE_CODE_REPAIR,
+                ),
+                {"regionId": region_id, "roleCode": read_tools.ASSIGNEE_ROLE_CODE_REPAIR},
                 row_count_fn=lambda data: len((data or {}).get(region_id, [])),
             )
         # 即使没有接单人也要查在途：它是"这批已经有人在处理"的证据，页面要展示
