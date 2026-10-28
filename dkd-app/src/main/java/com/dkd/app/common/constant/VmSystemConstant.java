@@ -3,6 +3,13 @@ package com.dkd.app.common.constant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 
+/**
+ * ⚠️ P1-14 契约纪律：本类是「状态码/角色码」在 dkd-app（运维移动端）侧的定义处。
+ * 唯一事实源是 {@code docs/CONTRACTS/status-codes.md}——改任何取值前先读它。
+ * 本工程与 dkd-parent 是独立 POM，无法直接依赖 {@code DkdContants}，取值只能靠
+ * 契约对齐：**改这里必须同步改 dkd-parent 的 DkdContants.java**（类型 Integer vs Long
+ * 是历史差异，取值与语义必须一致）。Python 侧见 {@code dkd-agent/app/constants.py}。
+ */
 public class VmSystemConstant {
     /**
      * 售货机状态：未投放
@@ -12,6 +19,13 @@ public class VmSystemConstant {
      * 售货机状态：运营
      */
     public static final Integer VM_STATUS_RUNNING = 1;
+    /**
+     * 售货机状态：停机（现场停用但未撤机）。
+     *
+     * <p>P1-14 补齐：与 dkd-parent 的 DkdContants.VM_STATUS_STOPPED 对齐（此前本类缺失，
+     * 报表/后台侧的「故障」唯一口径就是 vm_status=2，见 docs/CONTRACTS/status-codes.md）。
+     */
+    public static final Integer VM_STATUS_STOPPED = 2;
     /**
      * 售货机状态：撤机
      */

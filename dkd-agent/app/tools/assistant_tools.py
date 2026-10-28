@@ -34,6 +34,7 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+from app.constants import CASE_WINDOW_DAYS_ASSISTANT
 from app.db import get_sessionmaker
 from app.graphs.restock_decisions import summarize_plan
 from app.graphs.restock_plan_store import SqlPauseStore, SqlPlanStore, plan_from_row
@@ -387,7 +388,8 @@ DEFAULT_ANOMALY_WINDOW_DAYS = 90
 # 历史检索默认窗口 2000 天（≈5.5 年）：比 read_tools 的程序化默认（1095）大，
 # 因为自然语言的“历史/以前”比程序调用含糊，窗口给小了会得到“没有历史”的假结论
 # （本机维修单全在 2023-03）。真实成本护栏仍是 per-device 过滤 + 超时熔断。
-DEFAULT_CASE_WINDOW_DAYS = 2000
+# P1-14：常量收敛到 app/constants.py（两值刻意不同，理由见 docs/CONTRACTS/status-codes.md 末节）。
+DEFAULT_CASE_WINDOW_DAYS = CASE_WINDOW_DAYS_ASSISTANT
 # 各工具自己的窗口上限（下面是唯一的定义处，别再散落魔法数字）：
 #   异常 3650（10 年）——异常数据天生稀疏，窗口太短会得出“设备没问题”的假阴性；
 #   历史 2000（≈5.5 年）——与上面的默认值一致。
@@ -557,7 +559,7 @@ async def _list_device_anomalies(inner_code: str, days: int = DEFAULT_ANOMALY_WI
 
 class _HistoryArgs(BaseModel):
     inner_code: str = Field(description="售货机编码；未确认时先用 find_devices 定位")
-    days: int = Field(default=DEFAULT_CASE_WINDOW_DAYS, description="回看天数（1-2000），默认 1095")
+    days: int = Field(default=DEFAULT_CASE_WINDOW_DAYS, description="回看天数（1-2000），默认 2000")
 
 
 async def _search_device_history(inner_code: str, days: int = DEFAULT_CASE_WINDOW_DAYS) -> str:

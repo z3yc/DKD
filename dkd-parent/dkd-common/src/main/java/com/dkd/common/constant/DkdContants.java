@@ -2,6 +2,16 @@ package com.dkd.common.constant;
 
 /**
  * 帝可得业务常量
+ *
+ * <p>⚠️ P1-14 契约纪律：本类是「状态码/角色码」在 dkd-parent 侧的定义处。
+ * 唯一事实源是 {@code docs/CONTRACTS/status-codes.md}——改任何取值前先读它。
+ * 同一取值还在两处独立定义，**必须同步改**：
+ * <ul>
+ *   <li>{@code dkd-app/src/main/java/com/dkd/app/common/constant/VmSystemConstant.java}
+ *       （运维移动端，独立 POM 无法依赖本模块，取值靠契约对齐）；</li>
+ *   <li>{@code dkd-agent/app/constants.py}（Python 智能体，角色码与检索窗口）。</li>
+ * </ul>
+ * Mapper XML 中的 SQL 字面量（如 vm_status=2）允许保留，但需在契约表登记。
  */
 public class DkdContants {
 

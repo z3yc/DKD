@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import bindparam, text
 
 from app.config import get_settings
+from app.constants import CASE_WINDOW_DAYS_PROGRAMMATIC, ROLE_CODE_BUSINESS, ROLE_CODE_REPAIR
 from app.db import assert_table_allowed
 
 logger = logging.getLogger("dkd.agent.tools.read")
@@ -43,12 +44,13 @@ logger = logging.getLogger("dkd.agent.tools.read")
 VM_STATUS_RUNNING = 1
 # 补货工单类型（DkdContants.TASK_TYPE_SUPPLY = 2）
 TASK_TYPE_SUPPLY = 2
-# 接单人角色（与 Java 侧建单校验、前端选人来源同源）：
+# 接单人角色（与 Java 侧建单校验、前端选人来源同源，P1-14 起常量收敛到 app/constants.py，
+# 契约表见 docs/CONTRACTS/status-codes.md）：
 #   补货工单 → 运营人员 1002（businessList）；维修/投放/撤机 → 维修人员 1003（operationList）。
 # 为什么必须分开：Java 侧 2026-10-28 起按工单类型校验角色，派错角色会在回调建单时被拒
 # （「该员工角色不能执行此类工单」），且 dkd-app 的作业队列也是按角色分的。
-ASSIGNEE_ROLE_CODE = "1002"
-ASSIGNEE_ROLE_CODE_REPAIR = "1003"
+ASSIGNEE_ROLE_CODE = ROLE_CODE_BUSINESS
+ASSIGNEE_ROLE_CODE_REPAIR = ROLE_CODE_REPAIR
 # 员工启用状态（DkdContants.EMP_STATUS_NORMAL = 1）
 EMP_STATUS_NORMAL = 1
 # 工单状态：1-待接单（创建） 2-进行中（DkdContants.TASK_STATUS_CREATE/PROGRESS）
@@ -673,7 +675,9 @@ _CASE_MATCH_RANK = {
 # 历史案例的默认检索窗口（1095 天 = 3 年）。
 # 为什么给个较大的默认值：维修工单很稀疏（本机 5 条全部落在 2023-03），窗口太短会得出“没有历史”
 # 的假结论；但也不能无界——单主库（无从库）上任何分析查询都要有时间窗口 + 上限（AGENTS §10）。
-DEFAULT_CASE_WINDOW_DAYS = 1095
+# P1-14：常量收敛到 app/constants.py（与 assistant_tools 的 2000 刻意不同，理由见契约表），
+# 本处别名保留既有引用点不动。
+DEFAULT_CASE_WINDOW_DAYS = CASE_WINDOW_DAYS_PROGRAMMATIC
 
 
 class OrderAnomaly(BaseModel):
