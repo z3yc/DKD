@@ -36,6 +36,7 @@ resume 只给「决策」，计划明细与状态全部从 checkpoint 的 state 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from datetime import date, datetime
@@ -512,6 +513,16 @@ def build_restock_graph(
 
         幂等（1-8 验收项 ② 的基础版）：已建单的计划在 `apply_decisions` 就返回
         `already_ordered`，**不会走到这里**，因此重复确认不会重复建单。
+
+        P1-13：回调阶段改为 ``Semaphore`` 有界并发（默认 4，可配
+        ``DKD_AGENT_CREATE_TASK_CONCURRENCY``）。原先逐台串行 await，每次回调
+        超时上限 10s，N 台设备最坏 N×10s 才结束本轮图执行（Java 网关 read-timeout
+        120s，N>12 时逼近上限）。两个语义原样保留：
+        - **失败不抛穿图**：单台失败进 failures，不回退状态（模块 docstring §4）；
+        - **结果按输入序归并**：created/failures/updated 的顺序与 plans 原序一致
+          （gather 完成序无关），保证结果可复现、测试断言稳定。
+        ``deps.save_decision`` 仍按序串行执行——审计写入的顺序性比速度重要，
+        且它写 agent 自有库、无 10s 回调超时问题，不是瓶颈。
         """
         decisions = {
             int(vm_id): PlanDecision(**raw) for vm_id, raw in (state.get("decisions") or {}).items()
@@ -522,6 +533,8 @@ def build_restock_graph(
         failures: list[dict[str, Any]] = []
         updated: list[dict[str, Any]] = []
 
+        # 先按原序收集待建单计划（未放行的直接原样透传）
+        pending: list[tuple[Any, PlanDecision]] = []
         for plan in plans:
             if plan.vm_id not in orderable:
                 updated.append(plan.model_dump(mode="json"))
@@ -529,14 +542,30 @@ def build_restock_graph(
             decision = decisions.get(plan.vm_id) or PlanDecision(
                 vm_id=plan.vm_id, action=ACTION_CONFIRM
             )
-            try:
-                result = await deps.create_task(plan, request_id=state.get("request_id", ""))
-            except (CallbackError, OrderClaimConflictError) as exc:
+            pending.append((plan, decision))
+
+        semaphore = asyncio.Semaphore(max(settings.create_task_concurrency, 1))
+
+        async def _invoke(plan: Any) -> tuple[Any, Any, Exception | None]:
+            """单台设备的回调；预期内的失败转成 (plan, None, exc) 不抛出。"""
+            async with semaphore:
+                try:
+                    result = await deps.create_task(plan, request_id=state.get("request_id", ""))
+                except (CallbackError, OrderClaimConflictError) as exc:
+                    return plan, None, exc
+            return plan, result, None
+
+        # 并发跑回调；gather 保持输入序，未预期的异常（编程错误）仍向上抛——与串行版一致
+        outcomes = await asyncio.gather(*(_invoke(plan) for plan, _ in pending))
+
+        # 串行归并：save_decision 与三列表追加都按 plans 原序执行
+        for (plan, decision), (_, result, error) in zip(pending, outcomes, strict=True):
+            if error is not None:
                 # 失败不改状态（模块 docstring §4）：原因交给 1-7 的“重试建单”。
                 # 并发认领失败（1-8）也走这里：**不抛穿图**（AGENTS §6.3），而是作为
                 # 该设备的失败原因如实上报（运营看到“正在建单中”而不是整个图崩掉）。
-                logger.warning("建单未完成 vm_id=%s err=%s", plan.vm_id, exc)
-                failures.append({"vm_id": plan.vm_id, "stage": "create_task", "reason": str(exc)})
+                logger.warning("建单未完成 vm_id=%s err=%s", plan.vm_id, error)
+                failures.append({"vm_id": plan.vm_id, "stage": "create_task", "reason": str(error)})
                 updated.append(plan.model_dump(mode="json"))
                 continue
 

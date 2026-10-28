@@ -134,6 +134,14 @@ class Settings(BaseSettings):
     # （见 app/tools/task_tools.py）
     callback_timeout_s: float = Field(default=10.0, validation_alias="DKD_AGENT_CALLBACK_TIMEOUT_S")
 
+    # 建单回调并发度（P1-13）：create_tasks 节点原先逐台串行 await，
+    # N 台设备最坏 N×10s 才结束本轮图执行；改为 Semaphore 有界并发。
+    # 为什么默认 4：Java 侧回调接口有 @RateLimiter(60s/60次/IP) 且容器内固定出口 IP，
+    # 4 并发远低于限流阈值；调大前先确认 Java 侧限流与建单校验链的承载。
+    create_task_concurrency: int = Field(
+        default=4, validation_alias="DKD_AGENT_CREATE_TASK_CONCURRENCY"
+    )
+
     # --- 补货基线引擎参数（Phase 1 / 任务 1-4）---
     # 为什么全部做成配置而不是常量：这些是**业务参数**（服务水平/补货周期随运营策略变），
     # 排期 3-6/5-2 要按复盘结果迭代它们；硬编码会让“调参”变成“改代码+发版”。

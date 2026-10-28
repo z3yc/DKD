@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import date
 from typing import Any
 
@@ -273,6 +275,140 @@ async def test_create_task_failure_keeps_status_and_records_reason(tmp_path):
     failures = [f for f in result["failures"] if f.get("stage") == "create_task"]
     assert failures and "不可达" in failures[0]["reason"]
     assert result["created_tasks"] == []
+
+
+# --------------------------------------------------------------------------------------
+# P1-13：建单回调有界并发
+# --------------------------------------------------------------------------------------
+
+
+def _multi_vm_stock(count: int) -> list[ChannelStockItem]:
+    """N 台设备各一条缺货货道（复用 _stock() 的单货道参数，只换设备维度）。"""
+    return [
+        ChannelStockItem(
+            vm_id=80 + i,
+            inner_code=f"A100000{i + 1}",
+            channel_id=4732 + i,
+            channel_code="1-1",
+            inventory_sku_id=1,
+            channel_sku_id=1,
+            current_stock=0,
+            min_stock=None,
+            channel_max_capacity=10,
+            inventory_max_stock=10,
+        )
+        for i in range(count)
+    ]
+
+
+def _multi_vm_daily(count: int) -> list[ChannelDailySales]:
+    rows: list[ChannelDailySales] = []
+    for i in range(count):
+        rows.extend(
+            ChannelDailySales(
+                inner_code=f"A100000{i + 1}",
+                channel_code="1-1",
+                sale_date=TODAY.replace(day=21 - offset),
+                qty=3,
+            )
+            for offset in range(1, 8)
+        )
+    return rows
+
+
+class SlowTrackingDeps(FakeDeps):
+    """P1-13 回归用：慢回调（可测并发度）+ 记录并发峰值，可指定部分设备失败。"""
+
+    def __init__(
+        self,
+        *,
+        delay_s: float,
+        fail_vm_ids: set[int] | None = None,
+        **kw: Any,
+    ) -> None:
+        super().__init__(**kw)
+        self.delay_s = delay_s
+        self.fail_vm_ids = fail_vm_ids or set()
+        self._inflight = 0
+        self.max_inflight = 0
+
+    async def create_task(self, plan: Any, *, request_id: str) -> CreatedTask:
+        self._inflight += 1
+        self.max_inflight = max(self.max_inflight, self._inflight)
+        try:
+            await asyncio.sleep(self.delay_s)
+            if plan.vm_id in self.fail_vm_ids:
+                raise CallbackUnavailableError(f"Java 服务不可达（vm {plan.vm_id}）")
+            created = CreatedTask(task_id=900 + plan.vm_id, task_code=f"T-{plan.vm_id}")
+            self.created.append(plan)
+            return created
+        finally:
+            self._inflight -= 1
+
+
+async def test_create_tasks_bounded_concurrent_and_input_ordered(tmp_path):
+    """P1-13：N 台设备回调走 Semaphore 有界并发，结果按 plans 原序归并。"""
+    count = 8
+    deps = SlowTrackingDeps(
+        delay_s=0.2,
+        stock=_multi_vm_stock(count),
+        daily=_multi_vm_daily(count),
+        assignee=(10, "孙权"),
+    )
+    graph, store = await _open_graph(tmp_path / "cp.db", deps)
+    config = {"configurable": {"thread_id": THREAD}}
+    try:
+        await graph.ainvoke(new_restock_state(plan_date=PLAN_DATE, request_id="rid-c1"), config)
+        started = time.monotonic()
+        result = await graph.ainvoke(
+            Command(resume=[{"vmId": vm, "action": "confirm"} for vm in range(80, 80 + count)]),
+            config,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        await store.close()
+
+    # 并发上界：默认 4，8 台 → 至少两批；峰值不得超过 4（回归串行则峰值恒为 1）
+    assert deps.max_inflight <= 4
+    assert deps.max_inflight >= 2, "回调应当并发执行（串行版 8 台最坏 8×10s）"
+    # 耗时按批缩减：串行 8×0.2s=1.6s，4 并发约 0.4s；阈值取 1.2s 留防抖余量
+    assert elapsed < 1.2, f"8 台×0.2s 回调用时 {elapsed:.2f}s，疑似退回串行"
+    # 结果按输入序归并（gather 完成序无关，保证可复现）
+    assert [c["vm_id"] for c in result["created_tasks"]] == list(range(80, 80 + count))
+    assert all(p["status"] == PLAN_STATUS_ORDERED for p in result["plans"])
+
+
+async def test_create_tasks_partial_failure_does_not_break_others(tmp_path):
+    """P1-13：并发下部分设备回调失败，其余照常建单、失败进 failures 不抛穿图。"""
+    count = 6
+    fail_vm_ids = {81, 84}
+    deps = SlowTrackingDeps(
+        delay_s=0.05,
+        fail_vm_ids=fail_vm_ids,
+        stock=_multi_vm_stock(count),
+        daily=_multi_vm_daily(count),
+        assignee=(10, "孙权"),
+    )
+    graph, store = await _open_graph(tmp_path / "cp.db", deps)
+    config = {"configurable": {"thread_id": THREAD}}
+    try:
+        await graph.ainvoke(new_restock_state(plan_date=PLAN_DATE, request_id="rid-c2"), config)
+        result = await graph.ainvoke(
+            Command(resume=[{"vmId": vm, "action": "confirm"} for vm in range(80, 80 + count)]),
+            config,
+        )
+    finally:
+        await store.close()
+
+    # 未失败的设备全部建单成功（含输入序）
+    assert [c["vm_id"] for c in result["created_tasks"]] == [80, 82, 83, 85]
+    # 失败如实上报且不改状态（模块 docstring §4）
+    failure_vms = {f["vm_id"] for f in result["failures"] if f.get("stage") == "create_task"}
+    assert failure_vms == fail_vm_ids
+    status_by_vm = {p["vm_id"]: p["status"] for p in result["plans"]}
+    assert status_by_vm[80] == PLAN_STATUS_ORDERED
+    assert status_by_vm[81] == PLAN_STATUS_SUGGESTED
+    assert status_by_vm[84] == PLAN_STATUS_SUGGESTED
 
 
 async def test_illegal_resume_payload_is_reported_not_raised(tmp_path):
