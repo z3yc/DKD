@@ -192,6 +192,80 @@ async def test_quota_disabled_when_limits_zero(session: AsyncSession):
     await enforce_daily_quota(session, user_id=1, per_user_limit=0, global_limit=0)
 
 
+# --- P1-12：全局用量 TTL 缓存与 scene 死参数清理 ---
+
+
+async def test_global_usage_cached_within_ttl(session: AsyncSession, monkeypatch):
+    """TTL 内 global 查询不重复执行；缓存可被强制失效。"""
+    import app.audit as audit_mod
+
+    await _seed(session, user_id=1, tokens=30)
+
+    calls = {"n": 0}
+    real = audit_mod.summarize_usage
+
+    async def counting(session_: AsyncSession, **kw: object) -> object:
+        calls["n"] += 1
+        return await real(session_, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(audit_mod, "summarize_usage", counting)
+
+    # per_user 关闭、global 打开：global 走缓存
+    await enforce_daily_quota(session, user_id=1, per_user_limit=0, global_limit=1000)
+    await enforce_daily_quota(session, user_id=1, per_user_limit=0, global_limit=1000)
+    await enforce_daily_quota(session, user_id=1, per_user_limit=0, global_limit=1000)
+    assert calls["n"] == 1, "TTL 内 global 用量必须命中缓存，不能每请求都全表聚合"
+
+    # 强制失效后重新查询
+    audit_mod._reset_usage_cache()
+    await enforce_daily_quota(session, user_id=1, per_user_limit=0, global_limit=1000)
+    assert calls["n"] == 2
+
+
+async def test_global_quota_blocks_with_cached_value(session: AsyncSession):
+    """缓存值超限仍要熔断：TTL 缓存不能把 429 语义缓存没。"""
+    await _seed(session, user_id=1, tokens=80)
+
+    # 第一次调用把超限的 global 用量写入缓存（80 >= 50）
+    with pytest.raises(QuotaExceededError, match="全局"):
+        await enforce_daily_quota(session, user_id=2, per_user_limit=0, global_limit=50)
+
+    # TTL 内第二次：读缓存，同样必须熔断
+    with pytest.raises(QuotaExceededError, match="全局"):
+        await enforce_daily_quota(session, user_id=2, per_user_limit=0, global_limit=50)
+
+
+async def test_per_user_quota_not_cached(session: AsyncSession, monkeypatch):
+    """per-user 查询不做缓存：每个用户自己的限额必须每请求精确判断。"""
+    import app.audit as audit_mod
+
+    await _seed(session, user_id=5, tokens=40)
+
+    calls = {"n": 0}
+    real = audit_mod.summarize_usage
+
+    async def counting(session_: AsyncSession, **kw: object) -> object:
+        calls["n"] += 1
+        return await real(session_, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(audit_mod, "summarize_usage", counting)
+
+    await enforce_daily_quota(session, user_id=5, per_user_limit=100, global_limit=0)
+    await enforce_daily_quota(session, user_id=5, per_user_limit=100, global_limit=0)
+    assert calls["n"] == 2, "per-user 限额查询必须每请求执行（有 (user_id, create_time) 索引）"
+
+
+def test_summarize_usage_has_no_scene_param():
+    """P1-12 语义 bug 防回归：scene 参数过滤的是 msg_role（口径错误）且无调用方，已删除。"""
+    import inspect
+
+    params = inspect.signature(summarize_usage).parameters
+    assert "scene" not in params, (
+        "scene 过滤的是 Message.msg_role（按场景统计的口径是错的）；"
+        "如需按场景统计，应加 scene 列与正确过滤，而不是复活此参数"
+    )
+
+
 def test_result_codes_match_ddl_comment():
     """结果码必须与 agent_tables.sql 的列注释一致，避免 MySQL/Java/Python 三端语义漂移。"""
     assert (RESULT_PENDING, RESULT_OK, RESULT_FAIL, RESULT_REJECTED) == (0, 1, 2, 3)

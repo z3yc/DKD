@@ -21,6 +21,18 @@ def _clear_caches() -> None:
     get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_usage_cache() -> None:
+    """每个用例前清空进程内全局用量缓存（P1-12）。
+
+    app/audit.py 的 global 限额查询带 30s TTL 的模块级缓存；限额用例各自用独立
+    SQLite 建表，不清缓存会把上一用例的全局用量带进下一用例的熔断判断。
+    """
+    from app.audit import _reset_usage_cache
+
+    _reset_usage_cache()
+
+
 # 测试客户端的来源地址必须显式是**回环**：`/agent/**` 增加了服务间密钥校验
 # （app/security.py 的 require_agent_gateway），非回环来源必须带 DKD_AGENT_SERVICE_SECRET。
 # Starlette TestClient 默认把 client 固定成 ("testclient", 50000)，那不是回环地址；

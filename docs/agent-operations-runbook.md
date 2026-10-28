@@ -239,6 +239,10 @@ DKD_AGENT_ENABLED=false   # 网关层：/agent/status 报 enabled=false；对话
 | `DKD_AGENT_TOKEN_LIMIT_GLOBAL` | 2000000 | **20000000** |
 
 - 超限时 `/agent/chat` **直接熔断**（error 帧 `code=429` + “当日 token 已达上限”），不再调 LLM——这是**功能**，不是故障。
+- **全局熔断有 30s 滞后（P1-12 起）**：global 用量带 30s 进程内 TTL 缓存
+  （`app/audit.py::_global_usage`），超限判定最多滞后 30s（期间可能放过少量超额请求，
+  随后仍会熔断）。per-user 判定**每请求精确执行**不受影响。监控告警若依赖
+  “熔断即刻生效”的精确即时值，请按 30s 粒度评估。索引 DDL：`docs/ddl/agent_message_index.sql`。
 - ⚠️ 开关**名字容易写错**：早期文档里出现过 `DKD_AGENT_TOKEN_DAILY_LIMIT_PER_USER`（多了 `DAILY_`）。
   写错不会报错，只会“设了没生效”，然后你会以为配额没上调——**改完请用**
   `uv run python -c "import sys;sys.path.insert(0,'.');from app.config import get_settings;print(get_settings().token_daily_limit_per_user)"`

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -244,18 +245,21 @@ async def summarize_usage(
     session: AsyncSession,
     *,
     days: int = 1,
-    scene: int | None = None,
     user_id: int | None = None,
 ) -> UsageSummary:
-    """按日/场景/用户聚合 token 消耗（限额判断与报表共用同一口径）。"""
+    """按日/用户聚合 token 消耗（限额判断与报表共用同一口径）。
+
+    P1-12 修正：原先还有一个 ``scene`` 参数，过滤的却是 ``Message.msg_role``
+    （参数叫「场景」实际按「消息角色」过滤，口径是错的）——且全仓无任何调用方
+    传值，属于死代码 + 语义 bug，直接删除。按场景统计等真需要时再加
+    ``scene`` 列与正确过滤，而不是复用 msg_role。
+    """
     since = datetime.now() - timedelta(days=max(days, 1))
     stmt = select(
         func.count(Message.id),
         func.coalesce(func.sum(Message.tokens_in), 0),
         func.coalesce(func.sum(Message.tokens_out), 0),
     ).where(Message.create_time >= since, Message.del_flag == "0")
-    if scene is not None:
-        stmt = stmt.where(Message.msg_role == scene)  # scene 由调用方按需扩展
     if user_id is not None:
         stmt = stmt.where(Message.user_id == user_id)
     count, tin, tout = (await session.execute(stmt)).one()
@@ -265,6 +269,40 @@ async def summarize_usage(
         tokens_out=int(tout or 0),
         tokens_total=int(tin or 0) + int(tout or 0),
     )
+
+
+# 全局用量短 TTL 缓存（P1-12）。
+#
+# 为什么只缓存 global、不缓存 per-user：enforce_daily_quota 每请求触发 1 次
+# per-user 查询 + 1 次 global 查询，两者都是 ``create_time >= now()-1d`` 的窗口
+# 聚合——agent_message.create_time 历史上无索引时即近全表扫描，高频对话时熔断
+# 检查自己变成热点。per-user 查询有 (user_id, create_time) 复合索引
+# （docs/ddl/agent_message_index.sql），保持每请求精确查询；global 查询对熔断
+# 本来就是**近似前置检查**（本函数 docstring：请求前判断，事后告警已晚），
+# 30s 粒度的近似不影响安全语义——最多滞后 30s 放过少量超额请求，随后仍会熔断。
+#
+# 语义偏移声明：引入缓存后全局熔断最多滞后 TTL（30s）；运维侧告警阈值若依赖
+# 精确即时值，见 docs/agent-operations-runbook.md 的说明。
+_GLOBAL_USAGE_CACHE_TTL_S = 30.0
+_global_usage_cache: tuple[float, UsageSummary] | None = None
+
+
+def _reset_usage_cache() -> None:
+    """清空进程内全局用量缓存（测试夹具用；生产代码无需调用）。"""
+    global _global_usage_cache  # noqa: A001
+    _global_usage_cache = None
+
+
+async def _global_usage(session: AsyncSession) -> UsageSummary:
+    """全局用量（带 TTL 缓存）。"""
+    global _global_usage_cache
+    now = time.monotonic()
+    cached = _global_usage_cache
+    if cached is not None and now < cached[0]:
+        return cached[1]
+    summary = await summarize_usage(session, days=1)
+    _global_usage_cache = (now + _GLOBAL_USAGE_CACHE_TTL_S, summary)
+    return summary
 
 
 async def enforce_daily_quota(
@@ -277,6 +315,9 @@ async def enforce_daily_quota(
     """限额熔断：超限抛 QuotaExceededError。
 
     为什么在请求前判断：LLM 调用一旦发出就会产生费用，事后告警已经晚了。
+
+    查询成本（P1-12 后）：per-user 每请求 1 次索引查询；global 每 TTL（30s）
+    至多 1 次查询（进程内缓存，见 _global_usage）。
     """
     today = date.today()
     if per_user_limit > 0 and user_id is not None:
@@ -286,7 +327,7 @@ async def enforce_daily_quota(
                 f"用户 {today} 当日 token 已达上限（{used.tokens_total}/{per_user_limit}）"
             )
     if global_limit > 0:
-        used_all = await summarize_usage(session, days=1)
+        used_all = await _global_usage(session)
         if used_all.tokens_total >= global_limit:
             raise QuotaExceededError(
                 f"全局 {today} 当日 token 已达上限（{used_all.tokens_total}/{global_limit}）"
