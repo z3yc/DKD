@@ -10,7 +10,35 @@
 
 ### Added
 
-- 故障诊断 M4（审核官）：计划中，见 `docs/agent-fault-scenario-plan-2026-10-26.md`。
+- **业务规范（清晰版）**：`docs/DKD业务规范-清晰版.md`——唯一事实源、标准流程、状态机、校验/口径规则、
+  清理清单、迁移与验收步骤；作为业务口径的单一来源（as-is 体检仍见 `docs/DKD业务全景梳理.md`）。
+- **Phase B 迁移脚本**：`docs/ddl/normalize_business_v2.sql`（预检/修数/DDL/回滚；**未执行，需 root**）：
+  库存按货道唯一 `uk_vm_channel`、活跃工单唯一索引、报表任务启用、补货菜单权限点对齐。
+- 库存唯一入口与流水：`InventoryServiceImpl.applyInventoryChange`、app 端 `InventoryStockService`
+  （补货完成同事务写货道缓存 + 库存台账 + `tb_inventory_log`，容量夹取、`is_alert` 重算）。
+- 建单校验新增拒绝路径单测（非法类型/停用员工/角色不匹配/货道不归属/超容量/无明细/sku 不一致）与
+  报表口径用例（`TaskServiceValidationTest`、`ReportServiceReportMetricsTest`、`ReportTaskFailureTest`）。
+
+### Changed
+
+- **建单规则**：类型白名单 1~4；员工启用 + 角色匹配（补货=1002，维修/投放/撤机=1003，1001 兜底）；
+  补货明细校验货道归属/数量/容量/sku；`create_type` 审计口径（后台=1、Agent 回调=0）；禁止通用编辑改
+  `task_status`（状态只经状态机）。
+- **库存口径**：台账 `tb_inventory.current_stock` 为数量事实，`tb_channel.current_capacity` 为设备侧缓存；
+  补货完成同时回写两者并写流水；`tb_inventory_log` 改用真实列名（`change_amount/before_stock/after_stock/
+  business_type/operator_name` 等），预警/缺货 SQL 与 Service 口径对齐并去重。
+- **报表口径**：故障设备仅 `vm_status=2`；库存不足按设备去重；同名同日生成改 upsert；生成失败不再被吞。
+- **权限**：`/manage/ai/**` 三个接口纳入 `manage:vm:query`；补货工作台前端按钮使用与网关一致的
+  `manage:task:list/add`。
+- **智能体派单**：故障派单接单人过滤改为维修角色 1003（补货仍为 1002），与 Java 建单校验和运维端作业队列一致。
+
+### Fixed
+
+- 前端：订单退款/取消按钮调用未定义函数（点击必崩）、点位导入模板 GET/POST 不一致（405）、
+  工单配置路径 `/manage/job`→`/manage/taskJob`、设备状态列表裸 `JSON.parse` 炸整表、
+  订单详情"设备编号"错绑订单号、el-tag 非法 `primary`。
+- 后端：补货完成"失败但工单已提交"（改为整体回滚）、Integer 状态比较用 `==`、
+  补货只写货道不写台账、库存流水列名与真实表不一致、报表任务失败被吞（现已抛异常进 `sys_job_log`）。
 
 ## [0.3.0] - 2026-10-28
 
