@@ -80,6 +80,9 @@ public class TaskController extends BaseController
     @PostMapping
     public AjaxResult add(@RequestBody TaskDto taskDto)
     {
+        // 后台建单一律记为“手动(1)”，忽略请求体里的 createType：
+        // 创建类型是审计口径（0-自动/1-手动），不能让调用方自报（自动建单只允许走 Agent 回调）。
+        taskDto.setCreateType(1L);
         taskDto.setAssignorId(getUserId());
         return toAjax(taskService.insertTaskDto(taskDto));
     }

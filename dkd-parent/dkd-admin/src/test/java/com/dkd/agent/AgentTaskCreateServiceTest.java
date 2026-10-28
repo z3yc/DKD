@@ -18,11 +18,13 @@ import org.springframework.data.redis.core.ValueOperations;
 
 import com.dkd.common.constant.DkdContants;
 import com.dkd.common.exception.ServiceException;
+import com.dkd.manage.domain.Channel;
 import com.dkd.manage.domain.Emp;
 import com.dkd.manage.domain.Task;
 import com.dkd.manage.domain.VendingMachine;
 import com.dkd.manage.domain.dto.TaskDetailsDto;
 import com.dkd.manage.domain.dto.TaskDto;
+import com.dkd.manage.mapper.ChannelMapper;
 import com.dkd.manage.mapper.TaskMapper;
 import com.dkd.manage.service.IEmpService;
 import com.dkd.manage.service.ITaskDetailsService;
@@ -71,6 +73,9 @@ class AgentTaskCreateServiceTest
     private ITaskDetailsService taskDetailsService;
 
     @Mock
+    private ChannelMapper channelMapper;
+
+    @Mock
     private RedisTemplate<Object, Object> redisTemplate;
 
     @Mock
@@ -96,7 +101,26 @@ class AgentTaskCreateServiceTest
         emp.setId(2L);
         emp.setUserName("张三");
         emp.setRegionId(regionId);
+        // 建单校验链已补「员工启用 + 角色匹配」：补货工单必须由运营(1002)或管理(1001)执行
+        emp.setStatus(DkdContants.EMP_STATUS_NORMAL);
+        emp.setRoleCode(DkdContants.ROLE_CODE_BUSINESS);
         return emp;
+    }
+
+    /**
+     * 补货明细校验已按 innerCode 一次取货道并校验归属/容量/商品。
+     * 这里给 A1000001 配一个与明细（1-1 / 8 件 / skuId=1）匹配的货道。
+     */
+    private void stubChannelsOfSupplyingMachine()
+    {
+        Channel channel = new Channel();
+        channel.setId(11L);
+        channel.setInnerCode("A1000001");
+        channel.setChannelCode("1-1");
+        channel.setSkuId(1L);
+        channel.setMaxCapacity(16L);
+        when(channelMapper.selectChannelList(any(Channel.class)))
+                .thenReturn(new ArrayList<Channel>(Collections.singletonList(channel)));
     }
 
     private TaskDto supplyTaskDto()
@@ -122,6 +146,7 @@ class AgentTaskCreateServiceTest
         when(taskMapper.selectInflightTaskList(anyString(), any(Long.class), any(List.class)))
                 .thenReturn(new ArrayList<Task>());
         when(empService.selectEmpById(2L)).thenReturn(empOfRegion(3L));
+        stubChannelsOfSupplyingMachine();
         when(redisTemplate.hasKey(anyString())).thenReturn(false);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         // 模拟 MyBatis useGeneratedKeys 回填主键
@@ -150,6 +175,7 @@ class AgentTaskCreateServiceTest
         when(taskMapper.selectInflightTaskList(anyString(), any(Long.class), any(List.class)))
                 .thenReturn(new ArrayList<Task>());
         when(empService.selectEmpById(2L)).thenReturn(empOfRegion(3L));
+        stubChannelsOfSupplyingMachine();
         when(redisTemplate.hasKey(anyString())).thenReturn(true);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         when(valueOperations.increment(anyString())).thenReturn(2L);

@@ -106,6 +106,9 @@ class TaskServiceRepairStatusTest
         emp.setId(2L);
         emp.setUserName("张三");
         emp.setRegionId(3L);
+        // 建单校验链已补「员工启用 + 角色匹配」：维修工单必须由维修(1003)或管理(1001)执行
+        emp.setStatus(DkdContants.EMP_STATUS_NORMAL);
+        emp.setRoleCode(DkdContants.ROLE_CODE_OPERATOR);
         when(empService.selectEmpById(2L)).thenReturn(emp);
         when(redisTemplate.hasKey(anyString())).thenReturn(true);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);

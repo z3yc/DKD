@@ -18,11 +18,13 @@ import org.springframework.data.redis.core.ValueOperations;
 
 import com.dkd.common.constant.DkdContants;
 import com.dkd.common.exception.ServiceException;
+import com.dkd.manage.domain.Channel;
 import com.dkd.manage.domain.Emp;
 import com.dkd.manage.domain.Task;
 import com.dkd.manage.domain.VendingMachine;
 import com.dkd.manage.domain.dto.TaskDetailsDto;
 import com.dkd.manage.domain.dto.TaskDto;
+import com.dkd.manage.mapper.ChannelMapper;
 import com.dkd.manage.mapper.TaskMapper;
 import com.dkd.manage.service.impl.TaskServiceImpl;
 
@@ -78,6 +80,9 @@ class TaskServiceCreateConflictTest
     private ITaskDetailsService taskDetailsService;
 
     @Mock
+    private ChannelMapper channelMapper;
+
+    @Mock
     private RedisTemplate<Object, Object> redisTemplate;
 
     @Mock
@@ -98,11 +103,23 @@ class TaskServiceCreateConflictTest
         emp.setId(2L);
         emp.setUserName("张三");
         emp.setRegionId(3L);
+        // 建单校验链已补「员工启用 + 角色匹配」：补货工单必须由运营(1002)或管理(1001)执行
+        emp.setStatus(DkdContants.EMP_STATUS_NORMAL);
+        emp.setRoleCode(DkdContants.ROLE_CODE_BUSINESS);
+        // 补货明细校验按 innerCode 一次取货道：明细里的 "1-1" 必须真实存在且容量足够
+        Channel channel = new Channel();
+        channel.setId(11L);
+        channel.setChannelCode("1-1");
+        channel.setInnerCode("A1000001");
+        channel.setSkuId(1L);
+        channel.setMaxCapacity(16L);
 
         when(vendinngService.selectVendingMachineByInnerCode("A1000001")).thenReturn(vm);
         when(taskMapper.selectInflightTaskList(anyString(), anyLong(), anyList()))
                 .thenReturn(new ArrayList<Task>());
         when(empService.selectEmpById(2L)).thenReturn(emp);
+        when(channelMapper.selectChannelList(any(Channel.class)))
+                .thenReturn(new ArrayList<Channel>(Collections.singletonList(channel)));
         // 走“key 已存在”的分支，避免 hasKey/set 的额外打桩
         when(redisTemplate.hasKey(anyString())).thenReturn(true);
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);

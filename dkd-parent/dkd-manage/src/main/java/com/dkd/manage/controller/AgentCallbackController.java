@@ -64,6 +64,10 @@ public class AgentCallbackController extends BaseController
     public AjaxResult createTask(@RequestBody TaskDto taskDto)
     {
         validate(taskDto);
+        // 创建类型是审计口径（tb_task.create_type：0-自动 / 1-手动，见 docs/DKD业务规范-清晰版 §4.1）：
+        // 智能体回调建单一律记为 0（自动），即使 Python 侧传了别值也在这里覆盖，
+        // 避免“自动建的单”在审计里被伪装成人工建单。后台建单由 TaskController 置 1。
+        taskDto.setCreateType(0L);
         // 注意：回调没有登录用户上下文，因此不设置 assignorId（不伪造创建人）。
         // 工单的创建人语义是“谁下的这单”，Python 侧已有 agent_restock_plan 记录确认人，两边可对账。
         Task created = taskService.insertTaskDtoReturningTask(taskDto);

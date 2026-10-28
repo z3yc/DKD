@@ -83,4 +83,9 @@ public class DkdContants {
      */
     public static final String ROLE_CODE_OPERATOR = "1003";
 
+    /**
+     * 角色编码：管理人员（可执行任意类型工单，用于兜底/值班场景）
+     */
+    public static final String ROLE_CODE_ADMIN = "1001";
+
 }
