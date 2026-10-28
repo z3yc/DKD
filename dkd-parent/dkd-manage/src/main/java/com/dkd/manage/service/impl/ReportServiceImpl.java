@@ -5,7 +5,6 @@ import java.util.*;
 import com.dkd.common.constant.DkdContants;
 import com.dkd.common.utils.DateUtils;
 import com.dkd.manage.domain.Report;
-import com.dkd.manage.domain.VendingMachine;
 import com.dkd.manage.mapper.ReportMapper;
 import com.dkd.manage.mapper.VendingMachineMapper;
 import com.dkd.manage.service.IReportService;
@@ -147,14 +146,28 @@ public class ReportServiceImpl implements IReportService
         List<Map<String, Object>> topNodes = reportMapper.topNodesByRevenue(ORDER_STATUS_SUCCESS, beginTime, endTimeStr);
         List<Map<String, Object>> topProducts = reportMapper.topProductsBySales(ORDER_STATUS_SUCCESS, beginTime, endTimeStr);
 
-        // 设备统计
-        List<VendingMachine> allVm = vendingMachineMapper.selectVendingMachineList(new VendingMachine());
-        if (allVm == null) {
-            allVm = Collections.emptyList();
+        // 设备统计（P1-8 下推 SQL：原实现拉全量设备实体进内存只为 size()/逐台数状态，
+        // 设备量上千后每次日报/周报多一次全表物化 + N 次 JSON 解析）
+        int totalDevices = 0;
+        int faultDevices = 0;
+        List<Map<String, Object>> statusCounts = vendingMachineMapper.countGroupByVmStatus();
+        if (statusCounts != null) {
+            for (Map<String, Object> row : statusCounts) {
+                Number cnt = (Number) row.get("cnt");
+                Number vmStatus = (Number) row.get("vm_status");
+                if (cnt == null) {
+                    continue;
+                }
+                totalDevices += cnt.intValue();
+                // 故障口径：仅 vm_status=2（停机）。不能用 vm_status != 1——未投放(0)/已撤机(3)
+                // 是正常生命周期，算成故障会让故障率虚高、AI 分析失真（业务规范 §4.5）。
+                if (vmStatus != null && vmStatus.longValue() == DkdContants.VM_STATUS_STOPPED.longValue()) {
+                    faultDevices += cnt.intValue();
+                }
+            }
         }
-        int totalDevices = allVm.size();
-        int onlineDevices = countOnlineDevices(allVm);
-        int faultDevices = countFaultDevices(allVm);
+        Integer onlineCount = vendingMachineMapper.countOnlineByRunningStatus();
+        int onlineDevices = onlineCount != null ? onlineCount : 0;
 
         // 库存不足设备数：Mapper 以 vm_id 去重统计（同一台设备多个货道只算一台，业务规范 §4.5）
         Integer lowStockDevices = reportMapper.countLowStockDevices();
@@ -195,53 +208,6 @@ public class ReportServiceImpl implements IReportService
         report.setStatus(aiFailed ? REPORT_STATUS_FAILED : 1);
         report.setRetryCount(0);
         return report;
-    }
-
-    /**
-     * 在线设备数：runningStatus 心跳 JSON 中 {@code status === true}（沿用设备列表页口径）。
-     *
-     * <p>脏 JSON 只影响该设备一台：记 debug 后按“离线”统计，不能因为一条坏心跳让整张日报失败。
-     *
-     * @param allVm 全部设备
-     * @return 在线设备数
-     */
-    private int countOnlineDevices(List<VendingMachine> allVm)
-    {
-        int onlineDevices = 0;
-        for (VendingMachine vm : allVm) {
-            if (vm == null || vm.getRunningStatus() == null) {
-                continue;
-            }
-            try {
-                cn.hutool.json.JSONObject json = JSONUtil.parseObj(vm.getRunningStatus());
-                if (json.getBool("status", false)) {
-                    onlineDevices++;
-                }
-            } catch (Exception e) {
-                log.debug("设备心跳状态 JSON 解析失败，按离线统计：innerCode={}", vm.getInnerCode(), e);
-            }
-        }
-        return onlineDevices;
-    }
-
-    /**
-     * 故障设备数：**仅 vm_status=2（停机）**。
-     *
-     * <p>为什么不能用“vm_status != 1”：未投放(0) 与已撤机(3) 是正常生命周期状态，
-     * 把它们算成故障会让故障率虚高、AI 分析失真（业务规范 §4.5）。
-     *
-     * @param allVm 全部设备
-     * @return 故障设备数
-     */
-    private int countFaultDevices(List<VendingMachine> allVm)
-    {
-        int faultDevices = 0;
-        for (VendingMachine vm : allVm) {
-            if (vm != null && DkdContants.VM_STATUS_STOPPED.equals(vm.getVmStatus())) {
-                faultDevices++;
-            }
-        }
-        return faultDevices;
     }
 
     @Override

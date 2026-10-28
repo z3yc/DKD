@@ -120,9 +120,26 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
     </delete>
 
     <delete id="deleteVendingMachineByIds" parameterType="String">
-        delete from tb_vending_machine where id in 
+        delete from tb_vending_machine where id in
         <foreach item="id" collection="array" open="(" separator="," close=")">
             #{id}
         </foreach>
     </delete>
+
+    <!-- P1-8 报表设备统计下推：口径约束见 VendingMachineMapper#countGroupByVmStatus 的 Javadoc
+         （faultDevices 仅 vm_status=2，不能用 vm_status != 1——未投放/撤机是正常生命周期） -->
+    <select id="countGroupByVmStatus" resultType="java.util.HashMap">
+        select vm_status, count(*) as cnt
+        from tb_vending_machine
+        group by vm_status
+    </select>
+
+    <!-- P1-8 在线设备数下推：$.status === true；JSON_VALID 不通过（坏心跳/缺心跳）按离线，
+         与 Java 版「解析失败记 debug 按离线」口径一致 -->
+    <select id="countOnlineByRunningStatus" resultType="java.lang.Integer">
+        select count(*)
+        from tb_vending_machine
+        where json_valid(running_status)
+          and json_extract(running_status, '$.status') = true
+    </select>
 </mapper>
