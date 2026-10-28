@@ -54,6 +54,27 @@ export default defineConfig(({ mode, command }) => {
           }
         ]
       }
+    },
+    // P1-17 构建产物瘦身：原先无 build 节点，全部 vendor 打进 entry，
+    // 最大 chunk 1.6M（gzip 前）——首屏要下载的代码与路由级懒加载的页面代码
+    // 混在一起，改一处业务代码也会让整个大 chunk 缓存失效。
+    // 拆分原则：稳定不变的三方库各自成 chunk（浏览器长缓存），业务代码进 entry/页面 chunk。
+    // 配合 vite-plugin-compression 产出 .gz，首屏只需 entry + vue-vendor + element-plus。
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            // element-plus 全量注册（main.js），与图标包强耦合，一起拆
+            'element-plus': ['element-plus', '@element-plus/icons-vue'],
+            // echarts 仅报表页懒加载使用，独立拆出后不进首屏
+            'echarts': ['echarts'],
+            // 框架核心：变更频率远低于业务代码，独立 chunk 享长缓存
+            'vue-vendor': ['vue', 'vue-router', 'pinia'],
+            // AI 助手侧边栏的 markdown 渲染链（marked + dompurify），仅聊天时需要
+            'markdown': ['marked', 'dompurify']
+          }
+        }
+      }
     }
   }
 })

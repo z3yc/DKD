@@ -169,7 +169,7 @@ getCookie();
   justify-content: center;
   align-items: center;
   height: 100%;
-  background-image: url("../assets/images/login-background1.png");
+  background-image: url("../assets/images/login-background1.webp");
   background-size: cover;
 }
 .title {
