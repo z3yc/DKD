@@ -1,0 +1,28 @@
+[project]
+name = "devkit"
+version = "1.0.0"
+description = "个人开发体系核心模块（Python）：配置 / 日志 / 错误码 / ID / HTTP"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.2", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "ASYNC", "T20", "ANN", "PTH"]
+ignore = ["ANN101", "ANN102", "ANN401"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

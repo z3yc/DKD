@@ -1,0 +1,9 @@
+# dev-kit 自身：本目录建议独立成仓（见 README §六 第 8 项）
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.DS_Store
+Thumbs.db

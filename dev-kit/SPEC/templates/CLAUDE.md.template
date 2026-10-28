@@ -1,0 +1,26 @@
+# Project: __PROJECT_NAME__
+
+__ONE_LINE_DESC__
+
+## Tech Stack
+- __STACK_LINE_1__
+- __STACK_LINE_2__
+
+## Modules
+- `__MODULE_1__`: __DESC__
+- `__MODULE_2__`: __DESC__
+
+## Must-read before editing
+- **完整规范见 `AGENTS.md`**（硬约束、环境实测边界、命名、测试要求都在那里）
+- **评审关注点见各子系统的 `REVIEW.md`**
+- 硬约束速记（只列最关键的 3~5 条，多了记不住）：
+  1. __HARD_RULE_1__
+  2. __HARD_RULE_2__
+  3. __HARD_RULE_3__
+
+## Skill routing
+When the user's request matches an available skill, ALWAYS invoke it using the Skill
+tool as your FIRST action. Do NOT answer directly.
+
+## Verify before claiming done
+- 跑 `__VERIFY_CMD__`，**展示输出**，不要说"已完成"。
