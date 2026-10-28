@@ -153,6 +153,9 @@ mysql -h127.0.0.1 -uroot -p    < ../docs/ddl/create_agent_db_user.sql   # dkd_ag
 | 文档 | 内容 |
 | --- | --- |
 | `AGENTS.md` | **开发规范**（安全红线 / 命名 / 测试门槛 / CR 准入 / AI 协作流程）——动手前必读 |
+| `docs/DKD业务全景梳理.md` | **业务全景**（四端边界 / 实体模型 / 端到端流程 / 核心规则 / 权限 / 智能体 / 断点与待决事项）——接手与评审先读 |
+| `docs/DKD业务规范-清晰版.md` | **业务规范（to-be 唯一口径）**：唯一事实源 / 标准流程 / 状态机 / 校验与报表口径 / 清理清单 / 迁移验收——改业务前先读 |
+| `docs/ddl/normalize_business_v2.sql` | Phase B 数据修正与约束收口（库存按货道唯一、活跃工单唯一、报表任务启用、菜单权限对齐；**未执行，需 root**） |
 | `docs/DKD智能体接入方案-LangChain-LangGraph.md` | 智能体接入方案 V1.1（架构决策 / 读写分离 / 技术选型 / 风险 / 证据索引） |
 | `docs/DKD智能体接入项目排期计划.md` | 排期计划 V2（14 周里程碑 + 任务清单 + **§七 执行进度**） |
 | `docs/dkd-agent-restock-state-schema.md` | 补货子图 state schema 冻结稿（字段契约 / 中断恢复 / 版本兼容 / 评审清单） |
