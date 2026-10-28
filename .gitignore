@@ -12,6 +12,8 @@ dist/
 *.class
 *.jar
 *.war
+# IDE 运行配置生成的源码副本（.run/appbuild、.run/startbuild 等），非源码事实，勿提交
+.run/
 
 # ---- 依赖目录 ----
 node_modules/
