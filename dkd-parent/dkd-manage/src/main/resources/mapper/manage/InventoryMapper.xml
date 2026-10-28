@@ -54,17 +54,38 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
     <select id="selectByVmIdAndSkuIdAndChannelId" resultMap="InventoryResult">
         <include refid="selectInventoryVo"/>
         where i.vm_id = #{vmId} and i.sku_id = #{skuId} and i.channel_id = #{channelId}
+        limit 1
     </select>
 
+    <!-- 库存粒度以货道为准：清晰版 §1 规定 tb_channel 是"卖什么/容量多少"的权威，台账一个货道一行。
+         历史数据只保证 (vm_id, sku_id) 唯一，故 limit 1 防止脏数据导致 TooManyResultsException。 -->
+    <select id="selectByVmIdAndChannelId" resultMap="InventoryResult">
+        <include refid="selectInventoryVo"/>
+        where i.vm_id = #{vmId} and i.channel_id = #{channelId}
+        order by i.id asc
+        limit 1
+    </select>
+
+    <!-- 兼容旧唯一键 uk_vm_sku (vm_id, sku_id) 的回退查询 -->
+    <select id="selectByVmIdAndSkuId" resultMap="InventoryResult">
+        <include refid="selectInventoryVo"/>
+        where i.vm_id = #{vmId} and i.sku_id = #{skuId}
+        order by i.id asc
+        limit 1
+    </select>
+
+    <!-- 低库存 = current_stock <= min_stock（与 InventoryServiceImpl.checkInventoryAlert 判断一致） -->
     <select id="selectLowInventoryList" resultMap="InventoryResult">
         <include refid="selectInventoryVo"/>
-        where i.current_stock = i.min_stock
+        where i.current_stock &lt;= i.min_stock
         order by i.current_stock asc
     </select>
 
+    <!-- 缺货 = current_stock = 0（清晰版 §4.4；原实现写成 current_stock < min_stock，
+         会把"低于预警值但还有货"的货道误判为缺货，与 Service 层 quantity==0 才判缺货的口径冲突） -->
     <select id="selectOutOfStockList" resultMap="InventoryResult">
         <include refid="selectInventoryVo"/>
-        where i.current_stock &lt; i.min_stock
+        where i.current_stock = 0
         order by i.current_stock asc
     </select>
 
@@ -87,6 +108,16 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
             <if test="createTime != null">create_time = #{createTime},</if>
             <if test="updateTime != null">update_time = #{updateTime},</if>
         </trim>
+        where id = #{id}
+    </update>
+
+    <!-- 库存变更服务专用：只动数量事实列，不碰 sku_id/channel_id/max_stock 等档案列（清晰版 §4.3） -->
+    <update id="updateInventoryStockState">
+        update tb_inventory
+        set current_stock = #{quantity},
+            is_alert = #{isAlert},
+            update_time = #{updateTime}
+            <if test="lastSupplyTime != null">, last_supply_time = #{lastSupplyTime}</if>
         where id = #{id}
     </update>
 

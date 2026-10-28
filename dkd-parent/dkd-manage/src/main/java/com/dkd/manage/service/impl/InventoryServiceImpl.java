@@ -2,13 +2,19 @@ package com.dkd.manage.service.impl;
 
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
+import com.dkd.common.exception.ServiceException;
 import com.dkd.common.utils.DateUtils;
+import com.dkd.common.utils.SecurityUtils;
 import com.dkd.manage.domain.InventoryLog;
 import com.dkd.manage.domain.dto.InventoryAlertDto;
 import com.dkd.manage.domain.dto.RestockSuggestionDto;
 import com.dkd.manage.mapper.InventoryLogMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -25,6 +31,8 @@ import com.dkd.manage.service.IInventoryService;
 @Service
 public class InventoryServiceImpl implements IInventoryService
 {
+    private static final Logger log = LoggerFactory.getLogger(InventoryServiceImpl.class);
+
     @Autowired
     private InventoryMapper inventoryMapper;
 
@@ -56,43 +64,92 @@ public class InventoryServiceImpl implements IInventoryService
     }
 
     /**
-     * 新增库存
+     * 新增库存（库存行 + 初始化流水，同一事务）
+     *
+     * <p>新增库存等价于"初始化"：按清晰版 §4.3 必须写 change_type=4（调整，含初始化）流水，
+     * business_type=INIT；否则会出现"台账有行、审计无记录"的库存。
      *
      * @param inventory 库存
      * @return 结果
      */
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public int insertInventory(Inventory inventory)
     {
-        // 检查是否已存在库存记录
-        if (inventory.getVmId() != null && inventory.getSkuId() != null && inventory.getChannelId() != null)
+        if (inventory == null)
         {
-            Inventory existInventory = inventoryMapper.selectByVmIdAndSkuIdAndChannelId(
-                inventory.getVmId(),
-                inventory.getSkuId(),
-                inventory.getChannelId()
-            );
-            if (existInventory != null)
-            {
-                throw new RuntimeException("该售货机货道已存在该商品的库存记录，请使用修改操作");
-            }
+            throw new ServiceException("新增库存失败：参数不能为空");
+        }
+        // 检查是否已存在库存记录（货道优先、旧唯一键回退，与库存变更服务同一口径）
+        Inventory existInventory = locateInventory(inventory.getVmId(), inventory.getSkuId(), inventory.getChannelId());
+        if (existInventory != null)
+        {
+            throw new ServiceException("该售货机货道已存在该商品的库存记录，请使用修改操作");
         }
 
-        inventory.setCreateTime(DateUtils.getNowDate());
-        return inventoryMapper.insertInventory(inventory);
+        Date now = DateUtils.getNowDate();
+        inventory.setCreateTime(now);
+        inventory.setUpdateTime(now);
+        int result = inventoryMapper.insertInventory(inventory);
+        if (result <= 0)
+        {
+            throw new ServiceException("新增库存失败：库存记录写入失败");
+        }
+
+        int quantity = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
+        // 通用插入语句不含 is_alert，按清晰版口径补写预警标记
+        inventoryMapper.updateInventoryStockState(inventory.getId(), quantity,
+                buildAlertFlag(quantity, inventory.getMinQuantity()), null, now);
+        // 初始化流水（change_type=4 / business_type=INIT）
+        writeInventoryLog(inventory.getVmId(), inventory.getSkuId(), inventory.getChannelId(),
+                quantity, 0, quantity, InventoryLog.CHANGE_TYPE_ADJUST, InventoryLog.BUSINESS_TYPE_INIT,
+                resolveCurrentOperator(), now);
+        return result;
     }
 
     /**
-     * 修改库存
+     * 修改库存（阈值/档案类字段直接更新；数量变更转交库存变更流水）
+     *
+     * <p>为什么把 quantity 从通用更新里摘出来：current_stock 是库存数量事实，按清晰版 §4.3
+     * 必须经"校验 → 台账 → 流水"的唯一入口；否则会出现"数量变了但审计没有记录"。
+     * 后台库存编辑（PUT /manage/inventory）传 quantity 时按 change_type=4（调整）落流水。
      *
      * @param inventory 库存
      * @return 结果
      */
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public int updateInventory(Inventory inventory)
     {
+        if (inventory == null || inventory.getId() == null)
+        {
+            throw new ServiceException("修改库存失败：库存主键不能为空");
+        }
+
+        // 1) 数量从通用更新中摘出，其余字段（预警阈值、补货时间等）照常更新
+        Integer targetQuantity = inventory.getQuantity();
+        inventory.setQuantity(null);
         inventory.setUpdateTime(DateUtils.getNowDate());
-        return inventoryMapper.updateInventory(inventory);
+        int result = inventoryMapper.updateInventory(inventory);
+
+        if (targetQuantity == null)
+        {
+            return result;
+        }
+
+        // 2) 数量差异走统一入口（范围校验 + 重算 is_alert + 写调整流水）
+        Inventory current = inventoryMapper.selectInventoryById(inventory.getId());
+        if (current == null)
+        {
+            throw new ServiceException("修改库存失败：库存记录不存在，id=" + inventory.getId());
+        }
+        int beforeQuantity = current.getQuantity() == null ? 0 : current.getQuantity();
+        if (targetQuantity.intValue() != beforeQuantity)
+        {
+            applyInventoryChange(current, targetQuantity.intValue() - beforeQuantity,
+                    InventoryLog.CHANGE_TYPE_ADJUST, resolveCurrentOperator());
+        }
+        return result;
     }
 
     /**
@@ -131,6 +188,19 @@ public class InventoryServiceImpl implements IInventoryService
     public Inventory selectByVmIdAndSkuIdAndChannelId(Long vmId, Long skuId, Long channelId)
     {
         return inventoryMapper.selectByVmIdAndSkuIdAndChannelId(vmId, skuId, channelId);
+    }
+
+    /**
+     * 根据售货机ID、货道ID查询库存
+     *
+     * @param vmId 售货机ID
+     * @param channelId 货道ID
+     * @return 库存信息
+     */
+    @Override
+    public Inventory selectByVmIdAndChannelId(Long vmId, Long channelId)
+    {
+        return inventoryMapper.selectByVmIdAndChannelId(vmId, channelId);
     }
 
     /**
@@ -177,82 +247,128 @@ public class InventoryServiceImpl implements IInventoryService
     }
 
     /**
-     * 更新库存数量（同时记录日志）
+     * 更新库存数量（库存变更的唯一入口：校验 → 更新台账 → 写流水，同一事务）
+     *
+     * <p>清晰版口径（docs/DKD业务规范-清晰版.md §4.3）：
+     * <ul>
+     *   <li>查询按 (vmId, channelId) 优先（库存粒度以货道为准），未命中回退 (vmId, skuId)——兼容旧唯一键 uk_vm_sku；</li>
+     *   <li>after 必须 &gt;= 0；after 必须 &lt;= max_stock（max 为空不校验）；补货类型按剩余容量夹取而不是拒绝；</li>
+     *   <li>每次变更重算 is_alert = (after &lt;= min_stock)，补货同时更新 last_supply_time；</li>
+     *   <li>流水写真实列，change_amount 记"实际变动量"（夹取后的值），不是请求量。</li>
+     * </ul>
      *
      * @param vmId 售货机ID
-     * @param skuId 商品ID
-     * @param channelId 货道ID
+     * @param skuId 商品ID（channelId 未命中时用于旧唯一键回退）
+     * @param channelId 货道ID（优先按它定位台账）
      * @param changeQuantity 变动数量（正数为增加，负数为减少）
-     * @param changeType 变动类型：1-入库 2-出库 3-补货 4-调整
-     * @param operator 操作人
+     * @param changeType 变动类型：1-销售 2-补货 3-损耗 4-调整 5-盘点（见 InventoryLog.CHANGE_TYPE_*）
+     * @param operator 操作人姓名（写 operator_name）
      * @return 结果
      */
     @Override
     @Transactional(rollbackFor = Exception.class)
     public int updateInventoryQuantity(Long vmId, Long skuId, Long channelId, Integer changeQuantity, Integer changeType, String operator)
     {
+        if (vmId == null)
+        {
+            throw new ServiceException("库存变更失败：售货机ID不能为空");
+        }
+        if (channelId == null && skuId == null)
+        {
+            throw new ServiceException("库存变更失败：货道ID与商品ID不能同时为空");
+        }
+        if (changeType == null || !isValidChangeType(changeType))
+        {
+            throw new ServiceException("库存变更失败：变动类型不合法");
+        }
         if (changeQuantity == null || changeQuantity == 0)
         {
             return 0;
         }
 
-        // 查询当前库存
-        Inventory inventory = inventoryMapper.selectByVmIdAndSkuIdAndChannelId(vmId, skuId, channelId);
+        // 1) 定位台账：货道优先，未命中再按旧唯一键 (vm_id, sku_id) 回退
+        Inventory inventory = locateInventory(vmId, skuId, channelId);
         if (inventory == null)
         {
-            throw new RuntimeException("库存信息不存在");
+            throw new ServiceException("库存信息不存在，请先初始化库存（vmId=" + vmId + "，channelId=" + channelId + "，skuId=" + skuId + "）");
         }
 
-        Integer beforeQuantity = inventory.getQuantity();
-        Integer afterQuantity = beforeQuantity + changeQuantity;
+        // 2)~4) 统一变更逻辑：范围校验 → 更新台账 → 写流水
+        return applyInventoryChange(inventory, changeQuantity.intValue(), changeType, operator);
+    }
 
-        // 检查库存是否足够
-        if (afterQuantity < 0)
+    /**
+     * 库存变更的统一实现（校验 → 更新台账 → 写流水），供数量接口、后台编辑、初始化共用。
+     *
+     * <p>为什么抽成私有方法：清晰版 §4.3 要求"库存变更只能经唯一入口"，
+     * 后台编辑（updateInventory）与数量接口（updateInventoryQuantity）必须走同一份校验与流水逻辑，
+     * 否则两条路径的 before/after 与 is_alert 口径会分叉。
+     *
+     * @param inventory 已定位到的台账行
+     * @param changeQuantity 变动数量（正数增加/负数减少）
+     * @param changeType 变动类型（1~5）
+     * @param operator 操作人姓名
+     * @return 更新的行数；无实际变化时返回 0
+     */
+    private int applyInventoryChange(Inventory inventory, int changeQuantity, Integer changeType, String operator)
+    {
+        if (inventory == null || inventory.getId() == null)
         {
-            throw new RuntimeException("库存不足，当前库存：" + beforeQuantity + "，变动数量：" + changeQuantity);
+            throw new ServiceException("库存变更失败：库存记录不存在");
         }
 
-        // 检查是否超过最大库存
-        if (inventory.getMaxQuantity() != null && afterQuantity > inventory.getMaxQuantity())
+        // 计算并夹取变更后库存。用 long 中间量避免 before + change 的 int 溢出
+        int beforeStock = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
+        long targetStock = (long) beforeStock + changeQuantity;
+        if (targetStock < 0)
         {
-            throw new RuntimeException("库存超过最大容量，最大容量：" + inventory.getMaxQuantity() + "，变动后库存：" + afterQuantity);
+            throw new ServiceException("库存不足，当前库存：" + beforeStock + "，变动数量：" + changeQuantity);
         }
-
-        // 更新库存
-        inventory.setQuantity(afterQuantity);
-        inventory.setUpdateTime(DateUtils.getNowDate());
-
-        // 如果是补货操作，更新上次补货时间
-        if (changeType == 3)
+        Integer maxStock = inventory.getMaxQuantity();
+        boolean restock = InventoryLog.CHANGE_TYPE_RESTOCK.equals(changeType);
+        if (maxStock != null && targetStock > maxStock)
         {
-            inventory.setLastSupplyTime(DateUtils.getNowDate());
+            if (!restock)
+            {
+                throw new ServiceException("库存超过最大容量，最大容量：" + maxStock + "，变动后库存：" + targetStock);
+            }
+            // 补货按剩余容量夹取（清晰版 §2.2：不允许超过容量，流水记实际数量）
+            targetStock = maxStock;
         }
-
-        int result = inventoryMapper.updateInventory(inventory);
-
-        // 记录库存变动日志
-        if (result > 0)
+        if (targetStock > Integer.MAX_VALUE)
         {
-            InventoryLog log = new InventoryLog();
-            log.setVmId(vmId);
-            log.setSkuId(skuId);
-            log.setChannelId(channelId);
-            log.setChangeType(changeType);
-            log.setChangeQuantity(changeQuantity);
-            log.setBeforeQuantity(beforeQuantity);
-            log.setAfterQuantity(afterQuantity);
-            log.setChangeTime(DateUtils.getNowDate());
-            log.setOperator(operator);
-            log.setCreateTime(DateUtils.getNowDate());
-
-            inventoryLogMapper.insertInventoryLog(log);
+            throw new ServiceException("库存变更失败：变动后库存超出可表示范围");
+        }
+        int afterStock = (int) targetStock;
+        int actualChange = afterStock - beforeStock;
+        if (actualChange == 0)
+        {
+            // 夹取后没有实际变化（例如已满容量仍补货）：不写 change_amount=0 的流水，避免审计噪声
+            return 0;
         }
 
+        // 3) 更新台账数量事实（current_stock / is_alert / last_supply_time）
+        Date now = DateUtils.getNowDate();
+        Integer isAlert = buildAlertFlag(afterStock, inventory.getMinQuantity());
+        Date lastSupplyTime = restock ? now : null;
+        int result = inventoryMapper.updateInventoryStockState(inventory.getId(), afterStock, isAlert, lastSupplyTime, now);
+        if (result <= 0)
+        {
+            throw new ServiceException("库存更新失败，库存ID：" + inventory.getId());
+        }
+
+        // 4) 写流水（真实列）；change_amount 记实际变动量，操作人写 operator_name
+        writeInventoryLog(inventory.getVmId(), inventory.getSkuId(), inventory.getChannelId(),
+                actualChange, beforeStock, afterStock, changeType, buildBusinessType(changeType),
+                operator, now);
         return result;
     }
 
     /**
      * 初始化库存（用于新设备或新商品）
+     *
+     * <p>初始化也属于库存变更：必须经本服务写流水，change_type=4（调整含初始化）、
+     * business_type=INIT、operator_name="系统"（清晰版 §4.3）。
      *
      * @param vmId 售货机ID
      * @param skuId 商品ID
@@ -266,12 +382,31 @@ public class InventoryServiceImpl implements IInventoryService
     @Transactional(rollbackFor = Exception.class)
     public int initInventory(Long vmId, Long skuId, Long channelId, Integer quantity, Integer minQuantity, Integer maxQuantity)
     {
-        // 检查是否已存在库存记录
-        Inventory existInventory = inventoryMapper.selectByVmIdAndSkuIdAndChannelId(vmId, skuId, channelId);
+        if (vmId == null || channelId == null || skuId == null)
+        {
+            throw new ServiceException("初始化库存失败：售货机ID、商品ID、货道ID都不能为空");
+        }
+        if (quantity == null || quantity < 0)
+        {
+            throw new ServiceException("初始化库存失败：初始库存数量不能为空且不能为负数");
+        }
+        if (maxQuantity != null && quantity > maxQuantity)
+        {
+            throw new ServiceException("初始化库存失败：初始库存：" + quantity + " 超过最大容量：" + maxQuantity);
+        }
+
+        // 判重口径与 updateInventoryQuantity 一致：货道优先，旧唯一键回退
+        Inventory existInventory = inventoryMapper.selectByVmIdAndChannelId(vmId, channelId);
+        if (existInventory == null)
+        {
+            existInventory = inventoryMapper.selectByVmIdAndSkuId(vmId, skuId);
+        }
         if (existInventory != null)
         {
-            throw new RuntimeException("库存记录已存在，请使用更新操作");
+            throw new ServiceException("库存记录已存在，请使用更新操作");
         }
+
+        Date now = DateUtils.getNowDate();
 
         // 创建库存记录
         Inventory inventory = new Inventory();
@@ -281,30 +416,174 @@ public class InventoryServiceImpl implements IInventoryService
         inventory.setQuantity(quantity);
         inventory.setMinQuantity(minQuantity);
         inventory.setMaxQuantity(maxQuantity);
-        inventory.setLastSupplyTime(DateUtils.getNowDate());
-        inventory.setCreateTime(DateUtils.getNowDate());
+        inventory.setLastSupplyTime(now);
+        inventory.setCreateTime(now);
+        inventory.setUpdateTime(now);
 
         int result = inventoryMapper.insertInventory(inventory);
-
-        // 记录初始化日志
-        if (result > 0)
+        if (result <= 0)
         {
-            InventoryLog log = new InventoryLog();
-            log.setVmId(vmId);
-            log.setSkuId(skuId);
-            log.setChannelId(channelId);
-            log.setChangeType(1); // 初始化视为入库
-            log.setChangeQuantity(quantity);
-            log.setBeforeQuantity(0);
-            log.setAfterQuantity(quantity);
-            log.setChangeTime(DateUtils.getNowDate());
-            log.setOperator("系统");
-            log.setCreateTime(DateUtils.getNowDate());
-
-            inventoryLogMapper.insertInventoryLog(log);
+            throw new ServiceException("初始化库存失败：库存记录写入失败");
         }
 
+        // 通用插入语句不含 is_alert，落库后按清晰版口径补写预警标记
+        inventoryMapper.updateInventoryStockState(inventory.getId(), quantity, buildAlertFlag(quantity, minQuantity), null, now);
+
+        // 记录初始化流水：change_type=4（调整，含初始化），business_type=INIT，操作人=系统
+        writeInventoryLog(vmId, skuId, channelId, quantity, 0, quantity,
+                InventoryLog.CHANGE_TYPE_ADJUST, InventoryLog.BUSINESS_TYPE_INIT,
+                InventoryLog.OPERATOR_SYSTEM, now);
+
         return result;
+    }
+
+    /**
+     * 定位库存台账：货道优先（库存粒度以货道为准），未命中回退旧唯一键 (vm_id, sku_id)。
+     *
+     * <p>为什么要有回退：Phase B 之前 tb_inventory 的唯一键仍是 uk_vm_sku (vm_id, sku_id)，
+     * 按货道只可能是历史数据里的"一 sku 多货道"共用一个库存行（清晰版 §8-1 待决策）。
+     *
+     * @param vmId 售货机ID
+     * @param skuId 商品ID
+     * @param channelId 货道ID
+     * @return 库存台账；不存在返回 null
+     */
+    private Inventory locateInventory(Long vmId, Long skuId, Long channelId)
+    {
+        if (vmId == null)
+        {
+            return null;
+        }
+        Inventory inventory = null;
+        if (channelId != null)
+        {
+            inventory = inventoryMapper.selectByVmIdAndChannelId(vmId, channelId);
+        }
+        if (inventory == null && skuId != null)
+        {
+            inventory = inventoryMapper.selectByVmIdAndSkuId(vmId, skuId);
+        }
+        return inventory;
+    }
+
+    /**
+     * 写库存流水（真实列），库存变更的唯一审计出口。
+     *
+     * @param vmId 售货机ID
+     * @param skuId 商品ID
+     * @param channelId 货道ID
+     * @param changeAmount 变动数量（正数增加/负数减少，记实际值）
+     * @param beforeStock 变动前库存
+     * @param afterStock 变动后库存
+     * @param changeType 变动类型（1~5）
+     * @param businessType 业务类型字符串（SALE/RESTOCK/LOSS/ADJUST/INIT 等）
+     * @param operator 操作人姓名
+     * @param createTime 流水时间
+     */
+    private void writeInventoryLog(Long vmId, Long skuId, Long channelId, int changeAmount, int beforeStock,
+                                   int afterStock, Integer changeType, String businessType, String operator,
+                                   Date createTime)
+    {
+        InventoryLog inventoryLog = new InventoryLog();
+        inventoryLog.setVmId(vmId);
+        inventoryLog.setSkuId(skuId);
+        inventoryLog.setChannelId(channelId);
+        inventoryLog.setChangeType(changeType);
+        inventoryLog.setChangeAmount(changeAmount);
+        inventoryLog.setBeforeStock(beforeStock);
+        inventoryLog.setAfterStock(afterStock);
+        inventoryLog.setBusinessType(businessType);
+        inventoryLog.setOperatorName(operator);
+        inventoryLog.setCreateTime(createTime);
+        inventoryLogMapper.insertInventoryLog(inventoryLog);
+    }
+
+    /**
+     * 取当前登录人账号作为流水操作人；无认证上下文（定时任务/内部调用）时记"系统"。
+     *
+     * <p>为什么允许降级而不是抛错：后台库存编辑接口必然有登录人；而定时对账等内部调用
+     * 没有 SecurityContext，"取不到登录人"不是业务失败，不应把一次合法变更变成异常。
+     *
+     * @return 操作人；取不到时返回"系统"
+     */
+    private String resolveCurrentOperator()
+    {
+        try
+        {
+            String username = SecurityUtils.getUsername();
+            if (username != null && !username.isEmpty())
+            {
+                return username;
+            }
+            return InventoryLog.OPERATOR_SYSTEM;
+        }
+        catch (Exception e)
+        {
+            log.debug("无认证上下文，库存流水操作人按系统记录：{}", e.getMessage());
+            return InventoryLog.OPERATOR_SYSTEM;
+        }
+    }
+
+    /**
+     * 校验变动类型是否在清晰版 §4.3 的白名单内（1~5），类型非法必须拒绝而不是静默放行。
+     *
+     * @param changeType 变动类型
+     * @return 是否合法
+     */
+    private boolean isValidChangeType(Integer changeType)
+    {
+        if (changeType == null)
+        {
+            return false;
+        }
+        return changeType.intValue() >= InventoryLog.CHANGE_TYPE_SALE.intValue()
+                && changeType.intValue() <= InventoryLog.CHANGE_TYPE_STOCKTAKE.intValue();
+    }
+
+    /**
+     * 计算预警标记 is_alert = (current_stock &lt;= min_stock)（清晰版 §4.3）。
+     *
+     * <p>min_stock 为空时按 0 处理：current_stock=0 必须预警，否则"缺货"不会被提醒。
+     *
+     * @param currentStock 变更后库存
+     * @param minStock 预警阈值
+     * @return 1-预警 0-正常
+     */
+    private Integer buildAlertFlag(Integer currentStock, Integer minStock)
+    {
+        if (currentStock == null)
+        {
+            return 0;
+        }
+        int threshold = minStock == null ? 0 : minStock;
+        return currentStock <= threshold ? 1 : 0;
+    }
+
+    /**
+     * 把变动类型映射为流水 business_type 字符串（清晰版 §2.2 / §4.3）。
+     *
+     * @param changeType 变动类型
+     * @return 业务类型字符串
+     */
+    private String buildBusinessType(Integer changeType)
+    {
+        if (InventoryLog.CHANGE_TYPE_SALE.equals(changeType))
+        {
+            return InventoryLog.BUSINESS_TYPE_SALE;
+        }
+        if (InventoryLog.CHANGE_TYPE_RESTOCK.equals(changeType))
+        {
+            return InventoryLog.BUSINESS_TYPE_RESTOCK;
+        }
+        if (InventoryLog.CHANGE_TYPE_LOSS.equals(changeType))
+        {
+            return InventoryLog.BUSINESS_TYPE_LOSS;
+        }
+        if (InventoryLog.CHANGE_TYPE_STOCKTAKE.equals(changeType))
+        {
+            return InventoryLog.BUSINESS_TYPE_STOCKTAKE;
+        }
+        return InventoryLog.BUSINESS_TYPE_ADJUST;
     }
 
     /**
@@ -317,21 +596,28 @@ public class InventoryServiceImpl implements IInventoryService
     {
         List<InventoryAlertDto> alerts = new ArrayList<>();
 
-        // 获取所有低库存
+        // 获取所有低库存（current_stock <= min_stock）
         List<Inventory> lowInventoryList = inventoryMapper.selectLowInventoryList();
-        for (Inventory inventory : lowInventoryList)
-        {
-            InventoryAlertDto alert = checkInventoryAlert(inventory);
-            if (alert != null)
-            {
-                alerts.add(alert);
-            }
-        }
-
-        // 获取所有缺货
+        // 获取所有缺货（current_stock = 0）
         List<Inventory> outOfStockList = inventoryMapper.selectOutOfStockList();
-        for (Inventory inventory : outOfStockList)
+
+        // 去重：两段口径在 current_stock=0 时重叠（0 <= min_stock 且 =0），
+        // 不去重会对同一货道重复产出"缺货"与"低库存"两条预警（清晰版 §4.4 要求两者口径分离）
+        List<Inventory> mergedList = new ArrayList<>(lowInventoryList.size() + outOfStockList.size());
+        mergedList.addAll(lowInventoryList);
+        mergedList.addAll(outOfStockList);
+
+        Set<Long> seenStockIds = new HashSet<>();
+        for (Inventory inventory : mergedList)
         {
+            if (inventory == null)
+            {
+                continue;
+            }
+            if (inventory.getId() != null && !seenStockIds.add(inventory.getId()))
+            {
+                continue;
+            }
             InventoryAlertDto alert = checkInventoryAlert(inventory);
             if (alert != null)
             {
@@ -419,11 +705,23 @@ public class InventoryServiceImpl implements IInventoryService
         List<Inventory> lowInventoryList = inventoryMapper.selectLowInventoryList();
         List<Inventory> outOfStockList = inventoryMapper.selectOutOfStockList();
 
-        // 合并列表
-        lowInventoryList.addAll(outOfStockList);
+        // 去重后合并：两段口径在 current_stock=0 时重叠，直接 addAll 会让同一货道出两条建议。
+        // 缺货先加入（更严重），排序与优先级仍由 generateRestockSuggestion 统一计算。
+        List<Inventory> mergedList = new ArrayList<>(lowInventoryList.size() + outOfStockList.size());
+        mergedList.addAll(outOfStockList);
+        mergedList.addAll(lowInventoryList);
 
-        for (Inventory inventory : lowInventoryList)
+        Set<Long> seenStockIds = new HashSet<>();
+        for (Inventory inventory : mergedList)
         {
+            if (inventory == null)
+            {
+                continue;
+            }
+            if (inventory.getId() != null && !seenStockIds.add(inventory.getId()))
+            {
+                continue;
+            }
             RestockSuggestionDto suggestion = generateRestockSuggestion(inventory);
             if (suggestion != null)
             {

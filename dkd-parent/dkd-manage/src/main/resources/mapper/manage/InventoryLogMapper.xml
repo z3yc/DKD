@@ -4,26 +4,32 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
 "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.dkd.manage.mapper.InventoryLogMapper">
 
+    <!-- 列名以真实表结构为准：tb_inventory_log 共 14 列，没有 change_quantity/before_quantity/
+         after_quantity/change_time/operator（2026-10-01 实测，docs/ddl/legacy_tables_tb_order_tb_inventory_log.md） -->
     <resultMap type="InventoryLog" id="InventoryLogResult">
         <result property="id"    column="id"    />
         <result property="vmId"    column="vm_id"    />
         <result property="skuId"    column="sku_id"    />
         <result property="channelId"    column="channel_id"    />
         <result property="changeType"    column="change_type"    />
-        <result property="changeQuantity"    column="change_quantity"    />
-        <result property="beforeQuantity"    column="before_quantity"    />
-        <result property="afterQuantity"    column="after_quantity"    />
-        <result property="changeTime"    column="change_time"    />
-        <result property="operator"    column="operator"    />
+        <result property="changeAmount"    column="change_amount"    />
+        <result property="beforeStock"    column="before_stock"    />
+        <result property="afterStock"    column="after_stock"    />
+        <result property="orderId"    column="order_id"    />
+        <result property="businessType"    column="business_type"    />
+        <result property="operatorId"    column="operator_id"    />
+        <result property="operatorName"    column="operator_name"    />
         <result property="createTime"    column="create_time"    />
+        <result property="remark"    column="remark"    />
         <result property="innerCode"    column="inner_code"    />
         <result property="skuName"    column="sku_name"    />
         <result property="channelCode"    column="channel_code"    />
     </resultMap>
 
     <sql id="selectInventoryLogVo">
-        select il.id, il.vm_id, il.sku_id, il.channel_id, il.change_type, il.change_quantity,
-               il.before_quantity, il.after_quantity, il.change_time, il.operator, il.create_time,
+        select il.id, il.vm_id, il.sku_id, il.channel_id, il.change_type, il.change_amount,
+               il.before_stock, il.after_stock, il.order_id, il.business_type,
+               il.operator_id, il.operator_name, il.create_time, il.remark,
                vm.inner_code, s.sku_name, c.channel_code
         from tb_inventory_log il
         left join tb_vending_machine vm on il.vm_id = vm.id
@@ -38,18 +44,23 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
             <if test="skuId != null">and il.sku_id = #{skuId}</if>
             <if test="channelId != null">and il.channel_id = #{channelId}</if>
             <if test="changeType != null">and il.change_type = #{changeType}</if>
-            <if test="operator != null and operator != ''">and il.operator like concat('%', #{operator}, '%')</if>
+            <if test="orderId != null">and il.order_id = #{orderId}</if>
+            <if test="businessType != null and businessType != ''">and il.business_type = #{businessType}</if>
+            <if test="operatorName != null and operatorName != ''">and il.operator_name like concat('%', #{operatorName}, '%')</if>
             <if test="innerCode != null and innerCode != ''">and vm.inner_code like concat('%', #{innerCode}, '%')</if>
             <if test="skuName != null and skuName != ''">and s.sku_name like concat('%', #{skuName}, '%')</if>
             <if test="channelCode != null and channelCode != ''">and c.channel_code like concat('%', #{channelCode}, '%')</if>
+            <!-- 时间过滤必须用「列 >= 参数」的范围比较，禁止 date_format() 包裹索引列（AGENTS.md §10）。
+                 上界用半开区间 < endTime+1天：前端日期控件传的是 yyyy-MM-dd，直接 < endTime 会漏掉结束日当天，
+                 且函数只作用在参数上、不影响索引（与 AgentDecisionLogMapper.xml / AgentRunMapper.xml 同一口径）。 -->
             <if test="params.beginTime != null and params.beginTime != ''"><!-- 开始时间检索 -->
-                AND date_format(il.change_time,'%y%m%d') &gt;= date_format(#{params.beginTime},'%y%m%d')
+                and il.create_time &gt;= #{params.beginTime}
             </if>
             <if test="params.endTime != null and params.endTime != ''"><!-- 结束时间检索 -->
-                AND date_format(il.change_time,'%y%m%d') &lt;= date_format(#{params.endTime},'%y%m%d')
+                and il.create_time &lt; DATE_ADD(#{params.endTime}, INTERVAL 1 DAY)
             </if>
         </where>
-        order by il.change_time desc
+        order by il.create_time desc, il.id desc
     </select>
 
     <select id="selectInventoryLogById" parameterType="Long" resultMap="InventoryLogResult">
@@ -60,19 +71,19 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
     <select id="selectByVmId" parameterType="Long" resultMap="InventoryLogResult">
         <include refid="selectInventoryLogVo"/>
         where il.vm_id = #{vmId}
-        order by il.change_time desc
+        order by il.create_time desc, il.id desc
     </select>
 
     <select id="selectBySkuId" parameterType="Long" resultMap="InventoryLogResult">
         <include refid="selectInventoryLogVo"/>
         where il.sku_id = #{skuId}
-        order by il.change_time desc
+        order by il.create_time desc, il.id desc
     </select>
 
     <select id="selectByChannelId" parameterType="Long" resultMap="InventoryLogResult">
         <include refid="selectInventoryLogVo"/>
         where il.channel_id = #{channelId}
-        order by il.change_time desc
+        order by il.create_time desc, il.id desc
     </select>
 
     <insert id="insertInventoryLog" parameterType="InventoryLog" useGeneratedKeys="true" keyProperty="id">
@@ -82,24 +93,30 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
             <if test="skuId != null">sku_id,</if>
             <if test="channelId != null">channel_id,</if>
             <if test="changeType != null">change_type,</if>
-            <if test="changeQuantity != null">change_quantity,</if>
-            <if test="beforeQuantity != null">before_quantity,</if>
-            <if test="afterQuantity != null">after_quantity,</if>
-            <if test="changeTime != null">change_time,</if>
-            <if test="operator != null">operator,</if>
+            <if test="changeAmount != null">change_amount,</if>
+            <if test="beforeStock != null">before_stock,</if>
+            <if test="afterStock != null">after_stock,</if>
+            <if test="orderId != null">order_id,</if>
+            <if test="businessType != null">business_type,</if>
+            <if test="operatorId != null">operator_id,</if>
+            <if test="operatorName != null">operator_name,</if>
             <if test="createTime != null">create_time,</if>
+            <if test="remark != null">remark,</if>
         </trim>
         <trim prefix="values (" suffix=")" suffixOverrides=",">
             <if test="vmId != null">#{vmId},</if>
             <if test="skuId != null">#{skuId},</if>
             <if test="channelId != null">#{channelId},</if>
             <if test="changeType != null">#{changeType},</if>
-            <if test="changeQuantity != null">#{changeQuantity},</if>
-            <if test="beforeQuantity != null">#{beforeQuantity},</if>
-            <if test="afterQuantity != null">#{afterQuantity},</if>
-            <if test="changeTime != null">#{changeTime},</if>
-            <if test="operator != null">#{operator},</if>
+            <if test="changeAmount != null">#{changeAmount},</if>
+            <if test="beforeStock != null">#{beforeStock},</if>
+            <if test="afterStock != null">#{afterStock},</if>
+            <if test="orderId != null">#{orderId},</if>
+            <if test="businessType != null">#{businessType},</if>
+            <if test="operatorId != null">#{operatorId},</if>
+            <if test="operatorName != null">#{operatorName},</if>
             <if test="createTime != null">#{createTime},</if>
+            <if test="remark != null">#{remark},</if>
         </trim>
     </insert>
 

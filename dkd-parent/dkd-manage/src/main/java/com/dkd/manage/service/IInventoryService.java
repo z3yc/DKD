@@ -72,6 +72,15 @@ public interface IInventoryService
     public Inventory selectByVmIdAndSkuIdAndChannelId(Long vmId, Long skuId, Long channelId);
 
     /**
+     * 根据售货机ID、货道ID查询库存（按货道的库存粒度）
+     *
+     * @param vmId 售货机ID
+     * @param channelId 货道ID
+     * @return 库存信息
+     */
+    public Inventory selectByVmIdAndChannelId(Long vmId, Long channelId);
+
+    /**
      * 查询低库存预警列表
      *
      * @return 低库存列表
