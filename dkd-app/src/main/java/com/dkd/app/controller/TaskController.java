@@ -11,7 +11,6 @@ import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
-import java.util.HashMap;
 import java.util.Map;
 
 // 工单
@@ -50,13 +49,10 @@ public class TaskController{
         return taskService.search(pageIndex, pageSize, innerCode, userId, taskCode, status, isRepair, start, end);
     }
 
-    // 获取用户排名情况
+    // 获取用户排名情况（P2-26：原先返回 {total:3, rank:3} 假数据，现只委托 Service 真实查询）
     @GetMapping("/rank/{userId}")
     public Map<String, Object> rank(@PathVariable("userId") Long userId) {
-        Map<String, Object> result = new HashMap<>();
-        result.put("total", 3);
-        result.put("rank", 3);
-        return result;
+        return taskService.getRank(userId);
     }
 
 

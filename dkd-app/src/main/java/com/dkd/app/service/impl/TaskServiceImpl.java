@@ -26,7 +26,9 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 @Service
@@ -240,5 +242,45 @@ public class TaskServiceImpl extends ServiceImpl<TaskMapper, Task> implements Ta
             throw new LogicException("工单完成失败：设备状态或库存回写未生效，请重试");
         }
         return b;
+    }
+
+    /**
+     * 查询员工排名（P2-26）。
+     *
+     * <p>原实现 {@code TaskController.rank()} 直接返回 {@code {total:3, rank:3}} 的假数据，
+     * 移动端首页排名不可信。本方法改为真实查询，口径（<b>自主决策，待产品确认</b>）：
+     * <ul>
+     *   <li>{@code total} = 该员工历史累计已完成工单数（{@code task_status=4}，不限时间窗口）；</li>
+     *   <li>{@code rank} = 按已完成数降序、1-based、<b>并列取最小名次</b>
+     *       （= 完成数严格更多的人数 + 1，competition ranking）；</li>
+     *   <li>只统计已完成：待处理/进行中/已取消都不计入（契约表
+     *       {@code docs/CONTRACTS/status-codes.md}，常量见 {@link VmSystemConstant#TASK_STATUS_FINISH}）。</li>
+     * </ul>
+     * 若产品要「本月/本季」口径，只需在 {@link com.dkd.app.mapper.TaskMapper} 的 SQL 加时间条件，
+     * 接口结构与 Controller 不变。
+     *
+     * <p>为什么防御 mapper 返回 null：COUNT 聚合在无行时返回 0 而不是 null，但 Mapper/连接异常
+     * 场景下不应把 {@code total=null} 塞给前端；统一兜底为 0 单、rank=1。
+     *
+     * @param userId 员工Id
+     * @return {@code {total: Long, rank: Long}}
+     * @throws LogicException userId 为空或非正数（登录态缺失，走全局异常处理器返回提示）
+     */
+    @Override
+    public Map<String, Object> getRank(Long userId) {
+        if (userId == null || userId.longValue() <= 0L) {
+            throw new LogicException("未获取到登录人信息");
+        }
+        // 1.历史累计已完成数
+        Long totalFromDb = baseMapper.countFinishedByUserId(userId);
+        long total = totalFromDb == null ? 0L : totalFromDb.longValue();
+        // 2.领先人数：已完成数严格大于我的人数；并列同分不互相领先 → 并列取最小名次
+        Long aheadFromDb = baseMapper.countUsersAhead(total);
+        long ahead = aheadFromDb == null ? 0L : aheadFromDb.longValue();
+        // 3.返回结构与改造前一致（移动端不感知），js 数字精度无影响（工单数为整数）
+        Map<String, Object> result = new HashMap<String, Object>();
+        result.put("total", total);
+        result.put("rank", ahead + 1L);
+        return result;
     }
 }
