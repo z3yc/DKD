@@ -26,6 +26,17 @@ import com.dkd.manage.service.IChannelService;
 @Service
 public class ChannelServiceImpl implements IChannelService
 {
+    /**
+     * 批量插入货道的分片大小（P2-29）。
+     *
+     * <p>为什么是 500：{@code ChannelMapper.xml} 的 {@code batchInsertChannels} 是单条
+     * {@code INSERT ... VALUES <foreach>}，行数越多单条 SQL 的包体越大；机型 vmRow×vmCol
+     * 可达上万行，单条语句可能超过 MySQL {@code max_allowed_packet}（默认 4MB/64MB），
+     * 表现为插入失败或连接被重置。每行 8 列、约百字节量级，500 行 ≈ 几十 KB，
+     * 离默认包上限有两个数量级余量，同时把 network/参数绑定的往返次数压在个位数。
+     */
+    private static final int CHANNEL_INSERT_BATCH_SIZE = 500;
+
     @Autowired
     private ChannelMapper channelMapper;
 
@@ -104,13 +115,35 @@ public class ChannelServiceImpl implements IChannelService
     }
 
     /**
-     * 批量新增
-     * @param channels
-     * @return
+     * 批量新增货道（按 {@link #CHANNEL_INSERT_BATCH_SIZE} 分片插入，P2-29）。
+     *
+     * <p>为什么分片：原实现把全部货道塞进一条多值 INSERT，大机型（vmRow×vmCol 上万）
+     * 可能超 {@code max_allowed_packet}；分片后单条语句包体可控。分片保持原始顺序
+     * （subList 只读视图，不复制元素），返回值为各片影响行数之和。
+     *
+     * <p>事务：本方法不加事务注解（保持既有事务语义）——调用方
+     * {@code VendingMachineServiceImpl.insertVendingMachine} 在 {@code @Transactional} 内，
+     * 任一分片失败整体回滚；若将来出现无事务调用方，需由调用方保证「全成或全不成」。
+     *
+     * <p>空列表/null/小列表（≤ 分片大小）行为保持现状：仍以原对象一次委托 mapper
+     * （不新增早返回/过滤），由 MyBatis/数据库按原路径处理，不在本次分批改造中改变入参语义。
+     *
+     * @param channels 货道列表
+     * @return 各分片影响行数合计
      */
     @Override
     public int batchInsertChannels(List<Channel> channels) {
-        return channelMapper.batchInsertChannels(channels);
+        // 小列表（含空列表/null）保持一次调用、原对象透传：大多数机型的 vmRow×vmCol ≤ 500，
+        // 不引入 subList 开销；空列表也从这里原路委托 mapper（行为与改造前一致）。
+        if (channels == null || channels.size() <= CHANNEL_INSERT_BATCH_SIZE) {
+            return channelMapper.batchInsertChannels(channels);
+        }
+        int affected = 0;
+        for (int from = 0; from < channels.size(); from += CHANNEL_INSERT_BATCH_SIZE) {
+            int to = Math.min(from + CHANNEL_INSERT_BATCH_SIZE, channels.size());
+            affected += channelMapper.batchInsertChannels(channels.subList(from, to));
+        }
+        return affected;
     }
 
     /**

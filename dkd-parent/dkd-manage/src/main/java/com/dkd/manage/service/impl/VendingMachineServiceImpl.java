@@ -96,9 +96,10 @@ public class VendingMachineServiceImpl implements IVendingMachineService
         vendingMachine.setClientId(UUID.randomUUID().toString());
         int result = vendingMachineMapper.insertVendingMachine(vendingMachine);
         //新增货道
-        //声明货道集合
+        // 声明货道集合
         List<Channel> channelList = new ArrayList<>();
-        //双层for循环
+        // 双层 for 循环只是「按 vmRow×vmCol 在内存里构造货道对象」，循环体内没有任何查库/写库，
+        // 因此不是 N+1（P2-29 核实结论，勿改成“预查货道”式的伪优化）；真正的写库在循环外一次批量插入。
         for (int i = 0; i < vmType.getVmRow(); i++) {//外层行遍历
             for (int j = 0; j < vmType.getVmCol(); j++) {//内层列遍历
                 //封装货道对象
