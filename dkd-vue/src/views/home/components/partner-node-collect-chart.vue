@@ -31,7 +31,13 @@ import PartnerNodeCollectPieChart from './partner-node-collect-pie-chart.vue'
 const router = useRouter()
 
 const handleMoreClick = () => {
-  router.push('/node/partner')
+  // P2-22：原路径 '/node/partner' 在本仓库不存在（后端 sys_menu 下发的业务路由是
+  // 「目录路径/页面路径」，如 /ai/restock、/vm/vm，没有 node 下挂 partner 的页面），
+  // 点击必然 404。本卡片的排行实体是**合作商**（饼图数据是各合作商名下的点位数），
+  // 合作商管理页 partner/index.vue 正好有「点位数」列（prop=nodeCount），是同一指标的
+  // 完整列表，故改为 /partner/partner。若后续 sys_menu 里合作商路由 path 不是
+  // 'partner'，以库里的 path 为准同步此处。
+  router.push('/partner/partner')
 }
 
 // 定义变量

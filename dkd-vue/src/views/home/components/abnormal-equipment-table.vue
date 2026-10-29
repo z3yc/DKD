@@ -160,7 +160,12 @@ const listData = ref([
 
 // 点击更多
 const handleMore = () => {
-  router.push({ path: 'vm/machine' });
+  // P2-22：原写法 `{ path: 'vm/machine' }` 是不带前导斜杠的相对路径，且本仓库没有
+  // vm/machine 这个页面，点击会解析到错误地址（/vm/machine）。本卡片是「异常设备监控」，
+  // 对应「设备状态监控」页 vmStatus/index.vue（列表列：设备编号/型号/地址/运营状态/
+  // 设备状态，与卡片展示的字段一致），其业务路由按 sys_menu 约定为 /vm/vmStatus
+  // （同域已验证的真实路由是 /vm/vm；report 页的设备状态卡片也用 /vm/vmStatus）。
+  router.push('/vm/vmStatus')
 };
 </script>
 <style lang="scss" scoped>

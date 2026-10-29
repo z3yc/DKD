@@ -83,32 +83,6 @@ export const constantRoutes = [
         meta: { title: '个人中心', icon: 'user' }
       }
     ]
-  },
-  {
-    path: '/manage/inventory',
-    component: Layout,
-    redirect: '/manage/inventory',
-    children: [
-      {
-        path: 'index',
-        component: () => import('@/views/manage/inventory'),
-        name: 'Inventory',
-        meta: { title: '库存预警', icon: 'list' }
-      }
-    ]
-  },
-  {
-    path: '/manage/report',
-    component: Layout,
-    redirect: '/manage/report',
-    children: [
-      {
-        path: 'index',
-        component: () => import('@/views/manage/report/index'),
-        name: 'Report',
-        meta: { title: 'AI报表分析', icon: 'chart' }
-      }
-    ]
   }
 ]
 
@@ -181,6 +155,47 @@ export const dynamicRoutes = [
         component: () => import('@/views/tool/gen/editTable'),
         name: 'GenEdit',
         meta: { title: '修改生成配置', activeMenu: '/tool/gen' }
+      }
+    ]
+  },
+  // P2-22：以下两条原写在 constantRoutes 里。constantRoutes 是「登录即注册」的静态路由，
+  // 不经过 store/modules/permission.js 的 filterDynamicRoutes（权限过滤只作用于 dynamicRoutes），
+  // 因此任何已登录用户都能用 URL 直达这两页，绕过 sys_menu 的角色授权（页面按钮上的
+  // v-hasPermi 只挡操作、不挡进入）。迁到 dynamicRoutes 后改为按权限串注册：
+  //   · 有该权限（含超管 *:*:* 命中 hasPermiOr）→ 路由注册，URL 可达；
+  //   · 无该权限 → 路由不注册，URL 落到 404，与其它受控页面行为一致。
+  // 权限串与后端 @PreAuthorize 同名（InventoryController / ReportController），保证
+  // 「菜单可见 ⇔ 接口可调 ⇔ 页面可达」三方口径一致；侧边栏仍由后端 sys_menu 下发决定，
+  // 本改动只堵「URL 直达」旁路，**不删除页面、不改 path/name/meta/redirect**。
+  // ⚠️ 遗留事实（迁移前就存在，本次按「只改注册方式」原则不动）：两条的 redirect 指向
+  // 自身 path（如 /manage/inventory），而真实页面在子路由 /manage/inventory/index —— 直接
+  // 访问父路径可能触发 vue-router 的重定向环；侧边栏单子路由菜单实际用子路径，故日常可用。
+  // 已登记给后续任务单独确认，避免把本次改动与 redirect 语义混在一起。
+  {
+    path: '/manage/inventory',
+    component: Layout,
+    redirect: '/manage/inventory',
+    permissions: ['manage:inventory:list'],
+    children: [
+      {
+        path: 'index',
+        component: () => import('@/views/manage/inventory'),
+        name: 'Inventory',
+        meta: { title: '库存预警', icon: 'list' }
+      }
+    ]
+  },
+  {
+    path: '/manage/report',
+    component: Layout,
+    redirect: '/manage/report',
+    permissions: ['manage:report:list'],
+    children: [
+      {
+        path: 'index',
+        component: () => import('@/views/manage/report/index'),
+        name: 'Report',
+        meta: { title: 'AI报表分析', icon: 'chart' }
       }
     ]
   }
