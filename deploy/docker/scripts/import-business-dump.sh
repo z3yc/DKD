@@ -7,7 +7,8 @@
 # 所以自动初始化只能建出“半个库”。管理后台与智能体的读工具都依赖这些业务表。
 #
 # 用法：./scripts/import-business-dump.sh /path/to/dkd_prod_20260923.sql[.gz]
-# 之后：./scripts/install-agent-db.sh —— 业务表到位后重跑，补上白名单授权
+# 之后：./scripts/setup-agent-db.sh —— 业务表到位后重跑：按 docs/ddl/create_agent_db_user.sql
+#       幂等补上 dkd_agent 的白名单只读授权，并当场验证三条否决路径（脚本本体的职责声明见其文件头）
 # ============================================================================
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"

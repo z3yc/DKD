@@ -41,7 +41,11 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=build /src/dkd-admin/target/dkd-admin.jar /app/app.jar
-# RuoYi 的 logback 写到工作目录下的 logs/（见 logback-spring.xml），提前建好并挂卷持久化
+# 日志配置是 classpath 上的 logback.xml（dkd-admin/src/main/resources/logback.xml），
+# 其中 log.path=/home/ruoyi/logs —— 即应用把日志写到 /home/ruoyi/logs，**不是**工作目录下的 logs/。
+# 下面的 mkdir + docker-compose 的 `admin_logs:/app/logs` 是为 /app/logs 准备的，
+# 与 logback 实际写出的 /home/ruoyi/logs 不一致（P0-4 待统一：改路径还是改挂载点需单独评审）。
+# ⚠️ 本次只更正注释；路径与挂载行为保持不变（不是 P2 范围，改了会牵动日志卷/权限）。
 RUN mkdir -p /app/logs
 
 EXPOSE 8080

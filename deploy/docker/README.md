@@ -51,7 +51,7 @@ deploy/docker/
 
 | 项 | 要求 | 为什么 |
 | --- | --- | --- |
-| Docker | 24+ 与 `compose` v2 插件 | 用到 BuildKit 缓存挂载与 `depends_on: required: false` |
+| Docker | 24+ 与 `compose` v2 插件 | 用到 BuildKit 缓存挂载；跨文件 `depends_on` 写在 infra 文件里（**不是** `depends_on: required: false`——本机实测不生效，见 §1 设计决定 1 与 infra 文件末尾注释） |
 | 资源 | 建议 ≥2C4G，磁盘 ≥20G | 4 个 Java/Python/Node 镜像 + Maven 依赖缓存 |
 | 端口 | `DKD_HTTP_PORT`(80)、可选 `DKD_APP_PORT`(9070) | 其余端口只绑回环（MySQL 3306、后台 18080） |
 | 出网 | 构建期需访问 Maven/npm/PyPI（建议走国内镜像） | 三处镜像地址在 `.env.deploy` 里可配 |
