@@ -74,6 +74,83 @@ public class DkdContants {
     public static final Long VM_STATUS_REVOKE = 3l;
 
     /**
+     * 订单状态：创建（待支付）。
+     *
+     * <p>P2-24 收敛：口径来源 {@code docs/CONTRACTS/status-codes.md}「订单状态 tb_order.status」。
+     * 取值与 dkd-app {@code VmSystemConstant.ORDER_STATUS_CREATE}（Integer）一致；类型差异
+     * （Long vs Integer）是两工程独立 POM 的历史原因，语义以契约表为准。
+     */
+    public static final Long ORDER_STATUS_CREATE = 0L;
+
+    /**
+     * 订单状态：支付完成。
+     *
+     * <p>口径来源 {@code docs/CONTRACTS/status-codes.md}；对齐 dkd-app
+     * {@code VmSystemConstant.ORDER_STATUS_PAYED}。
+     */
+    public static final Long ORDER_STATUS_PAYED = 1L;
+
+    /**
+     * 订单状态：出货成功。
+     *
+     * <p>口径来源 {@code docs/CONTRACTS/status-codes.md}；对齐 dkd-app
+     * {@code VmSystemConstant.ORDER_STATUS_VENDOUT_SUCCESS}。报表营收/订单只认本状态（业务规范 §4.5）。
+     */
+    public static final Long ORDER_STATUS_VENDOUT_SUCCESS = 2L;
+
+    /**
+     * 订单状态：出货失败。
+     *
+     * <p>口径来源 {@code docs/CONTRACTS/status-codes.md}；对齐 dkd-app
+     * {@code VmSystemConstant.ORDER_STATUS_VENDOUT_FAIL}。
+     */
+    public static final Long ORDER_STATUS_VENDOUT_FAIL = 3L;
+
+    /**
+     * 订单状态：失效（INVALID）。
+     *
+     * <p>口径来源 {@code docs/CONTRACTS/status-codes.md}；对齐 dkd-app
+     * {@code VmSystemConstant.ORDER_STATUS_INVALID}。
+     * <b>注意</b>：取消订单（{@code OrderServiceImpl.cancelOrder}）写入的正是本状态——
+     * 业务上叫「取消」，契约表与库口径叫「失效」；订单详情页的状态文案沿用历史「已取消」，
+     * 属用户可见文案，P2-24 不改显示，只统一代码注释口径。
+     */
+    public static final Long ORDER_STATUS_INVALID = 4L;
+
+    /**
+     * 支付状态：未支付。
+     *
+     * <p>口径来源 {@code docs/CONTRACTS/status-codes.md}「支付状态 tb_order.pay_status」；
+     * 对齐 dkd-app {@code VmSystemConstant.PAY_STATUS_NOPAY}。
+     */
+    public static final Long PAY_STATUS_NOPAY = 0L;
+
+    /**
+     * 支付状态：支付完成。
+     *
+     * <p>口径来源 {@code docs/CONTRACTS/status-codes.md}；对齐 dkd-app
+     * {@code VmSystemConstant.PAY_STATUS_PAYED}。
+     */
+    public static final Long PAY_STATUS_PAYED = 1L;
+
+    /**
+     * 支付状态：退款中。
+     *
+     * <p>口径来源 {@code docs/CONTRACTS/status-codes.md}；对齐 dkd-app
+     * {@code VmSystemConstant.PAY_STATUS_REFUNDING}。
+     */
+    public static final Long PAY_STATUS_REFUNDING = 2L;
+
+    /**
+     * 支付状态：退款完成。
+     *
+     * <p>口径来源 {@code docs/CONTRACTS/status-codes.md}；对齐 dkd-app
+     * {@code VmSystemConstant.PAY_STATUS_REFUNDIED}。拼写 {@code REFUNDIED} 沿袭 dkd-app
+     * 历史命名（语义 = 退款完成），改名属行为无关清理、需两侧同步，另行评审。
+     */
+    public static final Long PAY_STATUS_REFUNDIED = 3L;
+
+    /**
      * 员工启用
      */
     public static final Long EMP_STATUS_NORMAL = 1L;

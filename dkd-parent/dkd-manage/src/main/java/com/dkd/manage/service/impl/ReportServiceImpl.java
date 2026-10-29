@@ -25,8 +25,14 @@ public class ReportServiceImpl implements IReportService
 {
     private static final Logger log = LoggerFactory.getLogger(ReportServiceImpl.class);
 
-    /** 统计营收/订单只认「出货成功」（业务规范 §4.5；3-出货失败、4-失效不得计入） */
-    private static final int ORDER_STATUS_SUCCESS = 2;
+    /**
+     * 统计营收/订单只认「出货成功」（业务规范 §4.5；3-出货失败、4-失效不得计入）。
+     *
+     * <p>P2-24：不再独立写字面量 2，统一从 {@link DkdContants#ORDER_STATUS_VENDOUT_SUCCESS}
+     * 派生，避免契约取值变化时报表口径成为第二个真值来源。ReportMapper 的聚合形参是
+     * {@code Integer}（历史签名），故在此转成 Integer 保持 SQL 参数类型兼容，不改 Mapper 签名。
+     */
+    private static final Integer ORDER_STATUS_SUCCESS = DkdContants.ORDER_STATUS_VENDOUT_SUCCESS.intValue();
 
     /** tb_report.status：0-生成中 1-成功 2-失败 */
     private static final int REPORT_STATUS_FAILED = 2;

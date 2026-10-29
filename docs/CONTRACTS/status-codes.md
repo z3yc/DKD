@@ -49,18 +49,38 @@
 | 2 | 停机 | VM_STATUS_STOPPED | VM_STATUS_STOPPED（P1-14 补齐） | 报表「故障」唯一口径（业务规范 §4.5） |
 | 3 | 已撤机 | VM_STATUS_REVOKE | VM_STATUS_REVOKE | 正常生命周期，**不是故障** |
 
-## 订单状态 tb_order.status / 支付状态 tb_order.pay_status（dkd-app 定义）
+## 订单状态 tb_order.status / 支付状态 tb_order.pay_status
 
-| 值 | 订单状态 | 支付状态 |
-| --- | --- | --- |
-| 0 | 创建 | 未支付（PAY_STATUS_NOPAY） |
-| 1 | 支付完成（PAYED） | 支付完成（PAY_STATUS_PAYED） |
-| 2 | 出货成功（VENDOUT_SUCCESS） | 退款中（PAY_STATUS_REFUNDING） |
-| 3 | 出货失败（VENDOUT_FAIL） | 退款完成（PAY_STATUS_REFUNDIED） |
-| 4 | 失效（INVALID） | — |
+> P2-24 起 dkd-parent 侧不再是裸字面量：订单/支付状态常量定义在 `DkdContants`
+> （`dkd-parent/dkd-common/.../constant/DkdContants.java`，类型 Long），与 dkd-app
+> `VmSystemConstant`（类型 Integer）**按表取值对齐**；两工程独立 POM，类型差异是历史原因。
 
-> 报表口径：营收/订单只认 `status=2`（出货成功；业务规范 §4.5），dkd-parent 侧以
-> `ReportServiceImpl.ORDER_STATUS_SUCCESS` 私有常量表达，未入 VmSystemConstant。
+| 值 | 订单状态 | dkd-parent `DkdContants`（Long） | dkd-app `VmSystemConstant`（Integer） |
+| --- | --- | --- | --- |
+| 0 | 创建（待支付） | ORDER_STATUS_CREATE | ORDER_STATUS_CREATE |
+| 1 | 支付完成（PAYED） | ORDER_STATUS_PAYED | ORDER_STATUS_PAYED |
+| 2 | 出货成功（VENDOUT_SUCCESS） | ORDER_STATUS_VENDOUT_SUCCESS | ORDER_STATUS_VENDOUT_SUCCESS |
+| 3 | 出货失败（VENDOUT_FAIL） | ORDER_STATUS_VENDOUT_FAIL | ORDER_STATUS_VENDOUT_FAIL |
+| 4 | 失效（INVALID） | ORDER_STATUS_INVALID | ORDER_STATUS_INVALID |
+
+| 值 | 支付状态 | dkd-parent `DkdContants`（Long） | dkd-app `VmSystemConstant`（Integer） |
+| --- | --- | --- | --- |
+| 0 | 未支付 | PAY_STATUS_NOPAY | PAY_STATUS_NOPAY |
+| 1 | 支付完成 | PAY_STATUS_PAYED | PAY_STATUS_PAYED |
+| 2 | 退款中 | PAY_STATUS_REFUNDING | PAY_STATUS_REFUNDING |
+| 3 | 退款完成 | PAY_STATUS_REFUNDIED | PAY_STATUS_REFUNDIED |
+
+> **4 的双重叫法（P2-24 已核实并统一注释口径）**：`OrderServiceImpl.cancelOrder` 把「取消订单」
+> 写入 `status=4`，契约表/库口径该值是 **失效 INVALID**——取消是业务动作，失效是状态列取值。
+> 原代码注释写「4-已取消」与契约表冲突，已改为显式引用 `ORDER_STATUS_INVALID`；
+> 订单详情页的 `statusDesc` 文案仍返回「已取消」，属**用户可见文案**，本轮不改（改显示需另立需求）。
+>
+> 另：`PAY_STATUS_REFUNDIED` 的拼写（REFUNDIED）沿袭 dkd-app 历史命名，语义=退款完成；
+> 重命名属行为无关清理，需两侧同步、另行评审。
+
+> 报表口径：营收/订单只认 `status=2`（出货成功；业务规范 §4.5）。dkd-parent 侧
+> `ReportServiceImpl.ORDER_STATUS_SUCCESS` 已改为由 `DkdContants.ORDER_STATUS_VENDOUT_SUCCESS`
+> 派生（`intValue()` 兼容 ReportMapper 的 Integer 形参），不再有第二个字面量真值来源。
 
 ## 员工状态 tb_emp.status
 

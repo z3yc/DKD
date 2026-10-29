@@ -1,6 +1,8 @@
 package com.dkd.manage.service.impl;
 
 import java.util.List;
+import com.dkd.common.constant.DkdContants;
+import com.dkd.common.exception.ServiceException;
 import com.dkd.common.utils.DateUtils;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -105,13 +107,15 @@ public class OrderServiceImpl implements IOrderService
     @Override
     public OrderDetailDto getOrderDetail(Long id)
     {
+        // P2-24：业务异常统一走 ServiceException（RuoYi 全局异常处理器转用户可见文案）。
+        // 文案逐字保留——OrderController 会把它拼进 "获取订单详情失败: xxx"，前端/运维按此排障。
         if (id == null) {
-            throw new RuntimeException("订单ID不能为空");
+            throw new ServiceException("订单ID不能为空");
         }
         
         Order order = orderMapper.selectOrderById(id);
         if (order == null) {
-            throw new RuntimeException("订单不存在，订单ID: " + id);
+            throw new ServiceException("订单不存在，订单ID: " + id);
         }
         
         OrderDetailDto orderDetailDto = new OrderDetailDto();
@@ -143,11 +147,16 @@ public class OrderServiceImpl implements IOrderService
     }
 
     /**
-     * 取消订单
-     * 
+     * 取消订单。
+     *
+     * <p>口径说明（P2-24 修正，以 {@code docs/CONTRACTS/status-codes.md} 为准）：
+     * 取消订单写入的是 {@link DkdContants#ORDER_STATUS_INVALID}（4=失效 INVALID），
+     * 原注释「4-已取消」与契约表/库口径冲突——「取消」是业务动作，「失效」是该状态列的取值语义。
+     * 订单详情页的状态文案仍显示「已取消」（用户可见文案本轮不变，见 {@link #getStatusDesc}）。
+     *
      * @param id 订单主键
      * @param cancelDesc 取消原因
-     * @return 结果
+     * @return 结果（订单不存在或当前状态不可取消时返回 0）
      */
     @Override
     public int cancelOrder(Long id, String cancelDesc)
@@ -159,7 +168,8 @@ public class OrderServiceImpl implements IOrderService
         
         Order updateOrder = new Order();
         updateOrder.setId(id);
-        updateOrder.setStatus(4L); // 4-已取消
+        // 取消订单落「失效」状态（4=INVALID），不是独立的状态码 5
+        updateOrder.setStatus(DkdContants.ORDER_STATUS_INVALID);
         updateOrder.setCancelDesc(cancelDesc);
         updateOrder.setUpdateTime(DateUtils.getNowDate());
         
@@ -182,31 +192,41 @@ public class OrderServiceImpl implements IOrderService
         
         Order updateOrder = new Order();
         updateOrder.setId(id);
-        updateOrder.setPayStatus(2L); // 2-退款中
+        // 支付状态 → 退款中（2）；退款完成(3)由支付回调链路写入，不在本方法
+        updateOrder.setPayStatus(DkdContants.PAY_STATUS_REFUNDING);
         updateOrder.setUpdateTime(DateUtils.getNowDate());
         
         return orderMapper.updateOrder(updateOrder);
     }
 
     /**
-     * 获取订单状态描述
-     * 
+     * 获取订单状态描述。
+     *
+     * <p>P2-24：状态码改用 {@link DkdContants} 常量。因 Java 8 的 switch case 只接受
+     * 编译期 int 常量（Long 常量/方法调用都不合法），这里改为 if/else 常量比较；
+     * 状态文案逐字保留（前端直接展示），其中 4=失效在页面仍显示「已取消」。
+     *
      * @param status 状态码
      * @return 状态描述
      */
     private String getStatusDesc(Long status)
     {
-        if (status == null) {
-            return "未知";
+        if (DkdContants.ORDER_STATUS_CREATE.equals(status)) {
+            return "待支付";
         }
-        switch (status.intValue()) {
-            case 0: return "待支付";
-            case 1: return "支付完成";
-            case 2: return "出货成功";
-            case 3: return "出货失败";
-            case 4: return "已取消";
-            default: return "未知";
+        if (DkdContants.ORDER_STATUS_PAYED.equals(status)) {
+            return "支付完成";
         }
+        if (DkdContants.ORDER_STATUS_VENDOUT_SUCCESS.equals(status)) {
+            return "出货成功";
+        }
+        if (DkdContants.ORDER_STATUS_VENDOUT_FAIL.equals(status)) {
+            return "出货失败";
+        }
+        if (DkdContants.ORDER_STATUS_INVALID.equals(status)) {
+            return "已取消";
+        }
+        return "未知";
     }
 
     /**
@@ -235,8 +255,8 @@ public class OrderServiceImpl implements IOrderService
      */
     private Boolean canRefund(Long status)
     {
-        // 只有出货成功的订单可以申请退款
-        return status != null && status == 2L;
+        // 只有出货成功的订单可以申请退款（2=VENDOUT_SUCCESS，口径见契约表）
+        return DkdContants.ORDER_STATUS_VENDOUT_SUCCESS.equals(status);
     }
 
     /**
@@ -247,7 +267,7 @@ public class OrderServiceImpl implements IOrderService
      */
     private Boolean canCancel(Long status)
     {
-        // 只有待支付的订单可以取消
-        return status != null && status == 0L;
+        // 只有待支付的订单可以取消（0=CREATE，口径见契约表）
+        return DkdContants.ORDER_STATUS_CREATE.equals(status);
     }
 }
