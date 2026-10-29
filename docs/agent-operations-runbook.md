@@ -1,9 +1,9 @@
 # 智能体服务 · 运维手册与 Runbook（排期任务 4-1）
 
-> 版本：V1.0（2026-10-01）
+> 版本：V1.1（2026-10-29，追加 §八「超时预算」）
 > 适用：`dkd-agent`（Python 智能体服务）+ `dkd-parent` 里的 Java 网关/回调
 > 相关：`docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.3、`docs/DKD智能体接入项目排期计划.md` V2.10、
-> `docs/ddl/create_agent_pg_role.sql`、`deploy/docker/README.md`、`docs/security-credential-rotation.md`
+> `docs/ddl/create_agent_pg_role.sql`、`deploy/docker/README.md`、`docs/security-credential-rotation.md`、`docs/agent-timeout-budget-2026-10-29.md`
 >
 > **本手册的每一条都来自实测**（不是照着“标准运维手册”抄的）。
 > 凡未验证的，都明确写了「未验证」。
@@ -279,3 +279,41 @@ DKD_AGENT_ENABLED=false   # 网关层：/agent/status 报 enabled=false；对话
 
 > ⚠️ 这些脚本会**读写真实环境**（部分会写业务数据，如 `verify-1-3-build-task.py` 真建单）。
 > 人工显式执行、执行后按脚本提示清理；**不要塞进 CI**（AGENTS §8）。
+
+---
+
+## 八、超时预算（2026-10-29 新增）
+
+> 完整核算、证据（文件:行）与建议清单见 **`docs/agent-timeout-budget-2026-10-29.md`**（P2-30）。
+> 这里只放运维要用的三件事：**谁先掐、怎么判断、不要做什么**。
+
+### 8.1 各层超时速查
+
+| 层 | 超时 | 语义（关键区别） | 位置 |
+| --- | --- | --- | --- |
+| 前端 SSE 空闲 | **60s** | 收不到**任何字节**就 abort，且被当成“用户取消”（不续传） | `dkd-vue/src/utils/sse.js:22`、`AgentAssistant/index.vue:446-450` |
+| Java 网关读超时 | **120s** | 对话（SSE）上是**帧间**上限（不是总时长）；非 SSE 接口近似“总时长” | `application.yml:166-169`、`AgentUpstreamClient.java:121-141,154-175,344-348` |
+| Python LLM | **60s/次**（SDK 最多 3 次尝试） | 单次调用上限；重试会让单次最坏到 180s | `dkd-agent/app/config.py:47`、`app/llm.py:57-64` |
+| Python 只读查询 | **5s** | 单条 SQL 熔断（单主库护栏） | `app/config.py:120-125`、`app/tools/read_tools.py:216-218` |
+| Python → Java 回调 | **10s** | 建单；**不自动重试**（非幂等写） | `app/config.py:132-135`、`app/tools/task_tools.py:159-185` |
+| nginx 反代 | **3600s** | 为 SSE 放大，当前不是瓶颈 | `deploy/docker/nginx/default.conf:68-69` |
+
+> 「10s 回调 vs 120s 网关」**不是倒挂**：10s 发生在 120s 这次等待的内部，是正确嵌套。
+> 真正的缺口是「一次 Java 等待」对「Python 一整张图（N 次串行 LLM）」——详见 P2-30 文档 §3.2/§4。
+
+### 8.2 判定顺序：先看谁先掐
+
+1. 对话显示「（已取消）」但用户**没有**点取消 → 多半是**前端 60s 空闲**先到（工具轮次可能不产出正文帧）。
+   拿同一 `request_id` 去 Python 日志确认它是否还在跑，不要按“用户操作”结案。
+2. 对话出现 `degrade:true` 帧 → **Java 120s 帧间**超时（上游连续 2 分钟没有任何字节）。
+3. 06:00 定时任务 `sys_job_log` 显示「已尝试 3/3 次失败」，但工作台/`agent_restock_plan` 有当天计划 →
+   是 **Java 120s 等不及 Python 的串行 LLM 校准**（N 台设备各一次，单次上限 60s）。Python 侧没被中断、分析会跑完。
+   **不要**据此认定数据错乱；也**不要**立刻手工重复触发——重试会把 LLM 成本再乘一遍。
+
+### 8.3 不要做
+
+- 不要只把 `read-timeout` 调大就收工：缺口在「一次等待 vs N 次串行 LLM」，调大只是把失败点往后推
+  （P2-30 文档 §5 的 R1~R3 才是解法；R3「校准总预算」是最小止血；任何改动都要单独评审）。
+- 不要拿回调超时（10s）和网关读超时（120s）比大小——它们不在同一层。
+- 不要把「批量建单 ⌈N/4⌉×10s」当现网风险：当前生产路径是单计划单回调，批量路径只被脚本/测试使用
+  （P2-30 文档 §3.5 有可达性证据）。
