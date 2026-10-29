@@ -180,6 +180,8 @@ function getList() {
   listVmType(queryParams.value).then(response => {
     vmTypeList.value = response.rows;
     total.value = response.total;
+  }).finally(() => {
+    // P2-19：请求 reject 时也必须复位，否则错误路径下表格永久转圈（AGENTS §2.2）
     loading.value = false;
   });
 }

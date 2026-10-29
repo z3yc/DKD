@@ -286,7 +286,10 @@
 </template>
 
 <script setup name="Vm">
-import { listVm, getVm, delVm, addVm, updateVm ,getAiDiagnosis} from "@/api/manage/vm";
+import { listVm, getVm, delVm, addVm, updateVm } from "@/api/manage/vm";
+// P2-20：getAiDiagnosis 曾在此处从 vm.js 导入，而 vm.js 与 ai.js 各有一份逐字重复的实现。
+// 现在唯一实现在 ai.js（vm.js 的副本已删除），避免"改了一处漏了另一处"。
+import { getAiDiagnosis } from "@/api/manage/ai";
 import { listVmType } from "@/api/manage/vmType";
 import { listPartner } from "@/api/manage/partner";
 import { loadAllParams } from "@/api/page";
@@ -390,6 +393,8 @@ function getList() {
   listVm(queryParams.value).then(response => {
     vmList.value = response.rows;
     total.value = response.total;
+  }).finally(() => {
+    // P2-19：请求 reject 时也必须复位，否则错误路径下表格永久转圈（AGENTS §2.2）
     loading.value = false;
   });
 }

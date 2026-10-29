@@ -226,9 +226,13 @@ const getVmType = async () => {
 // 获取货道列表
 const channelList = async () => {
   listLoading.value = true;
-  const { data } = await getGoodsList(props.goodData.innerCode);
-  channels.value = data;
-  listLoading.value = false;
+  try {
+    const { data } = await getGoodsList(props.goodData.innerCode);
+    channels.value = data;
+  } finally {
+    // P2-19：请求失败也要复位，否则货道弹层永久转圈（AGENTS §2.2）
+    listLoading.value = false;
+  }
 };
 const computedCurrentIndex = (vmRowIndex, vmColIndex) => {
   return (vmRowIndex - 1) * vmType.value.vmCol + vmColIndex - 1;
@@ -271,11 +275,15 @@ const channelModelView = ref({});
 // 商品弹层列表
 const handleListOpen = async () => {
   listSkuLoading.value = true;
-  listQuery.value.skuName = listQuery.value.skuName || undefined;
-  const data = await listSku(listQuery.value);
-  listSkuData.value = data;
-  pageCount.value = Math.ceil(data.total / 10);
-  listSkuLoading.value = false;
+  try {
+    listQuery.value.skuName = listQuery.value.skuName || undefined;
+    const data = await listSku(listQuery.value);
+    listSkuData.value = data;
+    pageCount.value = Math.ceil(data.total / 10);
+  } finally {
+    // P2-19：请求失败也要复位，否则商品选择弹层永久转圈（AGENTS §2.2）
+    listSkuLoading.value = false;
+  }
 };
 // 打开商品选择弹层
 const openSetSkuDialog = (index, code) => {
