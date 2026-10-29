@@ -1,44 +1,20 @@
-import request from '@/utils/request'
+import { createCrud } from '@/api/manage/crudFactory'
+
+// 商品管理：CRUD 五件套与 RuoYi 生成器样板逐字同构（URL/method/params 见 crudFactory），
+// 命名导出保持不变，调用方 import 一行都不用改（P2-21）
+const crud = createCrud('/manage/sku')
 
 // 查询商品管理列表
-export function listSku(query) {
-  return request({
-    url: '/manage/sku/list',
-    method: 'get',
-    params: query
-  })
-}
+export const listSku = crud.list
 
 // 查询商品管理详细
-export function getSku(skuId) {
-  return request({
-    url: '/manage/sku/' + skuId,
-    method: 'get'
-  })
-}
+export const getSku = crud.get
 
 // 新增商品管理
-export function addSku(data) {
-  return request({
-    url: '/manage/sku',
-    method: 'post',
-    data: data
-  })
-}
+export const addSku = crud.add
 
 // 修改商品管理
-export function updateSku(data) {
-  return request({
-    url: '/manage/sku',
-    method: 'put',
-    data: data
-  })
-}
+export const updateSku = crud.update
 
 // 删除商品管理
-export function delSku(skuId) {
-  return request({
-    url: '/manage/sku/' + skuId,
-    method: 'delete'
-  })
-}
+export const delSku = crud.del

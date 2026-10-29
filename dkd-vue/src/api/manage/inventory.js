@@ -1,47 +1,26 @@
+import { createCrud } from '@/api/manage/crudFactory'
 import request from '@/utils/request'
 
+// 库存：CRUD 五件套与 RuoYi 生成器样板逐字同构（URL/method/params 见 crudFactory），
+// 命名导出保持不变，调用方 import 一行都不用改（P2-21）。
+// 库存预警/低库存/缺货/初始化等是自定义方法，保留原实现（不改 URL/method），
+// 其中 /alerts /restock 自 P1-11 起返回 TableDataInfo 分页结构（rows/total）。
+const crud = createCrud('/manage/inventory')
+
 // 查询库存列表
-export function listInventory(query) {
-    return request({
-        url: '/manage/inventory/list',
-        method: 'get',
-        params: query
-    })
-}
+export const listInventory = crud.list
 
 // 获取库存详情
-export function getInventory(id) {
-    return request({
-        url: '/manage/inventory/' + id,
-        method: 'get'
-    })
-}
+export const getInventory = crud.get
 
 // 新增库存
-export function addInventory(data) {
-    return request({
-        url: '/manage/inventory',
-        method: 'post',
-        data: data
-    })
-}
+export const addInventory = crud.add
 
 // 修改库存
-export function updateInventory(data) {
-    return request({
-        url: '/manage/inventory',
-        method: 'put',
-        data: data
-    })
-}
+export const updateInventory = crud.update
 
 // 删除库存
-export function delInventory(id) {
-    return request({
-        url: '/manage/inventory/' + id,
-        method: 'delete'
-    })
-}
+export const delInventory = crud.del
 
 // 查询低库存列表
 export function listLowInventory(query) {

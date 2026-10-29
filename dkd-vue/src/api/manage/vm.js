@@ -1,52 +1,22 @@
-import request from '@/utils/request'
+import { createCrud } from '@/api/manage/crudFactory'
+
+// 设备管理：CRUD 五件套与 RuoYi 生成器样板逐字同构（URL/method/params 见 crudFactory），
+// 命名导出保持不变，调用方 import 一行都不用改（P2-21）。
+// 注意：AI 智能诊断接口的**唯一实现**在 api/manage/ai.js（P2-20 去重），本文件不再导出该接口；
+// 设备页请从 '@/api/manage/ai' 导入。
+const crud = createCrud('/manage/vm')
 
 // 查询设备管理列表
-export function listVm(query) {
-  return request({
-    url: '/manage/vm/list',
-    method: 'get',
-    params: query
-  })
-}
+export const listVm = crud.list
 
 // 查询设备管理详细
-export function getVm(id) {
-  return request({
-    url: '/manage/vm/' + id,
-    method: 'get'
-  })
-}
+export const getVm = crud.get
 
 // 新增设备管理
-export function addVm(data) {
-  return request({
-    url: '/manage/vm',
-    method: 'post',
-    data: data
-  })
-}
+export const addVm = crud.add
 
 // 修改设备管理
-export function updateVm(data) {
-  return request({
-    url: '/manage/vm',
-    method: 'put',
-    data: data
-  })
-}
+export const updateVm = crud.update
 
 // 删除设备管理
-export function delVm(id) {
-  return request({
-    url: '/manage/vm/' + id,
-    method: 'delete'
-  })
-}
-//人工智能
-export function getAiDiagnosis(innerCode) {
-  return request({
-    url: '/manage/ai/diagnose', // 对应后端 Controller 的路径
-    method: 'get',
-    params: { innerCode }
-  })
-}
+export const delVm = crud.del

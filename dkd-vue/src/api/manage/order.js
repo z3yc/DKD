@@ -1,47 +1,25 @@
+import { createCrud } from '@/api/manage/crudFactory'
 import request from '@/utils/request'
 
+// 订单管理：CRUD 五件套与 RuoYi 生成器样板逐字同构（URL/method/params 见 crudFactory），
+// 命名导出保持不变，调用方 import 一行都不用改（P2-21）。
+// cancelOrder / refundOrder 是本域自定义方法，保留原实现（不改 URL/method）。
+const crud = createCrud('/manage/order')
+
 // 查询订单管理列表
-export function listOrder(query) {
-  return request({
-    url: '/manage/order/list',
-    method: 'get',
-    params: query
-  })
-}
+export const listOrder = crud.list
 
 // 查询订单管理详细
-export function getOrder(id) {
-  return request({
-    url: '/manage/order/' + id,
-    method: 'get'
-  })
-}
+export const getOrder = crud.get
 
 // 新增订单管理
-export function addOrder(data) {
-  return request({
-    url: '/manage/order',
-    method: 'post',
-    data: data
-  })
-}
+export const addOrder = crud.add
 
 // 修改订单管理
-export function updateOrder(data) {
-  return request({
-    url: '/manage/order',
-    method: 'put',
-    data: data
-  })
-}
+export const updateOrder = crud.update
 
 // 删除订单管理
-export function delOrder(id) {
-  return request({
-    url: '/manage/order/' + id,
-    method: 'delete'
-  })
-}
+export const delOrder = crud.del
 
 // 取消订单（仅 status=0 待支付可取消；cancelDesc 为取消原因纯文本，对应后端 @RequestBody String）
 export function cancelOrder(id, cancelDesc) {
