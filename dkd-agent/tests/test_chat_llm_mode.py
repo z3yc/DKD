@@ -159,7 +159,15 @@ def test_llm_tokens_arrive_as_multiple_delta_frames(client_with_llm: TestClient,
         def bind_tools(self, _tools):  # noqa: ANN001, ANN202
             return self
 
-    fake = _Fake(messages=iter([AIMessage(content="建议给 A1 货道补货 六 瓶 可乐 以备 周末 高峰")]))
+    # 回答必须**长于前导缓冲阈值**（DKD_AGENT_PREAMBLE_BUFFER_CHARS，默认 40）：
+    # FIX-26 会给每次 LLM 调用的开头缓冲 40 字（隐藏“我先查一下”这类前言），
+    # 短回答因此会一次性到达。用长回答才能同时验证「缓冲放行之后仍逐 token 下发」。
+    reply = (
+        "建议给 A1 货道补货六瓶可乐：周末销量上升，建议在周五前完成补货，"
+        "并同步检查同区域其它设备的库存水位。"
+    )
+    assert len(reply) > 40
+    fake = _Fake(messages=iter([AIMessage(content=reply)]))
     monkeypatch.setattr(chat_graph, "build_chat_model", lambda *a, **kw: fake)
 
     resp = client_with_llm.post("/agent/chat", json={"message": "补货建议", "scene": 2})
@@ -170,5 +178,5 @@ def test_llm_tokens_arrive_as_multiple_delta_frames(client_with_llm: TestClient,
     assert [i for i, _ in deltas] == list(range(1, len(deltas) + 1)), (
         "帧 id 必须自增（断点续传锚点）"
     )
-    assert "".join(text for _, text in deltas) == "建议给 A1 货道补货 六 瓶 可乐 以备 周末 高峰"
+    assert "".join(text for _, text in deltas) == reply
     assert _done(resp.text)["finish_reason"] == "llm"

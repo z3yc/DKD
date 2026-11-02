@@ -459,6 +459,63 @@ def _chunk_text(token: object) -> str:
     return ""
 
 
+class _PreambleBuffer:
+    """按「一次 LLM 调用」缓冲正文，若这次调用最终要调工具就丢弃已缓冲的前言（FIX-26）。
+
+    缺陷原貌：模型在 tool_calls 之前常先输出一句前言（实测英文
+    `I'll check the device's history.`），流式模式下它会被逐 token 推给用户，
+    造成中英混排碎片；而这一幕**没有任何报错**，只能靠人看见。
+
+    为什么要缓冲：只有等到“这次调用有没有工具”确定后，才能决定那句前言要不要发出去。
+    **代价**：缓冲会推迟首字；阈值（字符数）就是延迟上限——超过阈值立即放行并转为直通，
+    因为此时它更可能是一段真正的回答而不是一句前言。
+    **按原始分片保存**：放行时把缓冲的每个分片**分别**交出（不是拼成一大帧），
+    这样 token 级流式的帧粒度不会因为加了缓冲而退化（M1 的防回归锚点依赖这点）。
+    **不可撤回**：一旦放行，后续再出现工具调用也无法收回已发出的文字（流式语义如此）。
+    """
+
+    __slots__ = ("_dropped", "_limit", "_chunks", "_size", "_released")
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(0, int(limit))
+        self._chunks: list[str] = []
+        self._size = 0
+        self._released = False
+        self._dropped = False
+
+    def feed(self, text: str, *, tools_pending: bool) -> list[str]:
+        """喂入一段正文，返回此刻**可以下发**的分片列表（可能为空）。"""
+        if not text or self._dropped:
+            return []
+        if tools_pending:
+            # 已确定这一轮要调工具：前言整段丢弃（已放行的部分收不回来，见类 docstring）
+            self._dropped = True
+            self._chunks = []
+            self._size = 0
+            return []
+        if self._released or self._limit == 0:
+            self._released = True
+            return [text]
+        self._chunks.append(text)
+        self._size += len(text)
+        if self._size < self._limit:
+            return []
+        self._released = True
+        out, self._chunks, self._size = self._chunks, [], 0
+        return out
+
+    def finish(self, *, tools_pending: bool) -> list[str]:
+        """本次 LLM 调用结束：要调工具则丢弃缓冲，否则把剩下的正文分片交出来。"""
+        if self._dropped or tools_pending:
+            self._dropped = True
+            self._chunks = []
+            self._size = 0
+            return []
+        out, self._chunks, self._size = self._chunks, [], 0
+        self._released = True
+        return out
+
+
 async def _stream_graph_tokens(
     graph: object, *, message: str, scene: int, config: dict, outcome: _TurnOutcome
 ) -> AsyncIterator[str]:
@@ -477,9 +534,17 @@ async def _stream_graph_tokens(
     分片类型过滤（实测踩坑）：`stream_mode="messages"` 除了 LLM 的分片回调，还会把节点**直接返回的
     完整 `AIMessage`** 也当作一条 messages 事件吐出（echo 节点就是这样）。若不过滤，echo 模式会先按
     “整段 token”发一帧、再被兜底分片重复发一遍。只有 `AIMessageChunk` 才是真分片。
+
+    FIX-26：正文先经 `_PreambleBuffer` 按「一次 LLM 调用」缓冲——这次调用若最终要调工具，
+    已经缓冲的前言整段丢弃（那些“我先查一下”的碎片本来就不该给用户看见）。
+    阈值来自 `DKD_AGENT_PREAMBLE_BUFFER_CHARS`（0 = 关闭，首字最快但前言会漏出）。
     """
     final_state: dict[str, Any] = {}
     markup = ModelMarkupFilter()
+    buffer_limit = get_settings().preamble_buffer_chars
+    buffer = _PreambleBuffer(buffer_limit)
+    step_key: object = None
+    tools_pending = False
     async for mode, chunk in graph.astream(  # type: ignore[attr-defined]
         {"messages": [HumanMessage(content=message)], "scene": scene},
         config,
@@ -493,15 +558,33 @@ async def _stream_graph_tokens(
             continue
         if not isinstance(token, AIMessageChunk):
             continue
+        # 一次 LLM 调用 = 一个 langgraph_step（同一次调用的分片共享它）。
+        # 没有 step 元数据时退化为“整轮一个缓冲”，宁可晚一点也不能把前言漏出去。
+        step = (metadata or {}).get("langgraph_step")
+        key: object = step if step is not None else "single-turn"
+        if key != step_key:
+            for piece in buffer.finish(tools_pending=tools_pending):
+                outcome.streamed += piece
+                yield piece
+            buffer = _PreambleBuffer(buffer_limit)
+            tools_pending = False
+            step_key = key
+        if getattr(token, "tool_call_chunks", None) or getattr(token, "tool_calls", None):
+            tools_pending = True
         text = markup.feed(_chunk_text(token))
         if text:
-            outcome.streamed += text
-            yield text
+            for piece in buffer.feed(text, tools_pending=tools_pending):
+                outcome.streamed += piece
+                yield piece
 
     tail = markup.flush()  # 收尾：把缓冲里的正文吐出来（真标记已剥掉）
     if tail:
-        outcome.streamed += tail
-        yield tail
+        for piece in buffer.feed(tail, tools_pending=tools_pending):
+            outcome.streamed += piece
+            yield piece
+    for piece in buffer.finish(tools_pending=tools_pending):
+        outcome.streamed += piece
+        yield piece
     outcome.reply = _strip_model_markup(str(final_state.get("reply", ""))) or outcome.streamed
     outcome.history_len = len(final_state.get("messages", []))
     model = final_state.get("model")

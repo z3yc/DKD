@@ -45,6 +45,18 @@ class Settings(BaseSettings):
     )
     llm_model: str = Field(default="deepseek-chat", validation_alias="DKD_AGENT_LLM_MODEL")
     llm_timeout_s: float = Field(default=60.0, validation_alias="DKD_AGENT_LLM_TIMEOUT")
+    # --- 流式前导缓冲（FIX-26）---
+    # 模型在“决定调工具”之前可能先输出一句前言（实测英文 `I'll check the device's history.`），
+    # 流式模式下它会逐 token 推到用户眼前，造成中英混排碎片。
+    # **代价**：缓冲会给每个回答的首字增加延迟，所以阈值要卡在“挡得住前言、又不至于让人等”：
+    # 40 字符 ≈ 中文一句短前言 / 英文那句实测前言（`I'll check the device's history.` 33 字符）。
+    # 0 = 关闭缓冲（首字最快，但前言会漏出去）；上限 200 防止误把整段回答扣住。
+    preamble_buffer_chars: int = Field(
+        default=40,
+        ge=0,
+        le=200,
+        validation_alias="DKD_AGENT_PREAMBLE_BUFFER_CHARS",
+    )
 
     # --- 会话持久化（checkpointer，任务 0-10）---
     #
