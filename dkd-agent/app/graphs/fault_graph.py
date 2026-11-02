@@ -44,6 +44,7 @@ from app.services.diagnosis import (
     DiagnosisEvidence,
     compose_diagnosis,
 )
+from app.services.repair_task_desc import compose_repair_task_desc
 from app.tools import read_tools
 
 logger = logging.getLogger("dkd.agent.graphs.fault")
@@ -407,10 +408,9 @@ def build_dispatch_proposal(
         empty.reason = "no_assignee"
         return empty
 
-    kinds = sorted({str(item.get("kind")) for item in (diagnosis.get("evidence") or [])})
-    desc = f"智能诊断建议：{inner_code} 检出 {len(evidence_ids)} 条异常证据（{'、'.join(kinds)}）"
+    desc = compose_repair_task_desc(diagnosis)
     if inflight:
-        desc += f"；设备已有 {len(inflight)} 张在途工单，处置前请先核对"
+        desc += f"\n设备已有 {len(inflight)} 张在途工单，处置前请先核对"
     return DispatchProposal(
         inner_code=inner_code,
         assignee_id=getattr(assignee, "emp_id", None),
