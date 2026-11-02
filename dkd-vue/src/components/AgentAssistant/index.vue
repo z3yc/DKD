@@ -423,8 +423,30 @@ async function probeStatus(force) {
   }
 }
 
-watch(visible, (val) => {
-  if (val) probeStatus(false)
+/**
+ * 打开抽屉时的两件事：探测状态 +（可能）消费入口透传的预置问题。
+ *
+ * 2-6：设备/点位页的「AI 诊断」会带 scene=3 与一句预置问题进来，这里自动发起；
+ * 2-8：若状态探测为降级，**不自动发**——那会把用户带进一个必然失败的请求，
+ * 保持降级横幅、把问题留在输入框里，等恢复后用户一点就能发。
+ */
+watch(visible, async (val) => {
+  if (!val) return
+  const pending = agentStore.consumePending()
+  if (!pending.prompt) {
+    probeStatus(false)
+    return
+  }
+  await probeStatus(true)
+  // 从设备/点位页跳进来 = 一次**新的诊断会话**：scene 决定 Python 侧图路由，
+  // 复用旧会话会把不同场景的消息混在同一条 thread 里。
+  conversationId.value = undefined
+  messages.value = []
+  focusCode.value = ''
+  lastEventId.value = undefined
+  if (pending.scene) scene.value = pending.scene
+  draft.value = pending.prompt
+  if (!degraded.value) await send(pending.prompt)
 })
 
 /** 单帧处理：协议见 dkd-agent/app/api/chat.py（meta / delta / done / error） */

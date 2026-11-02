@@ -290,6 +290,8 @@ import { listVm, getVm, delVm, addVm, updateVm } from "@/api/manage/vm";
 // P2-20：getAiDiagnosis 曾在此处从 vm.js 导入，而 vm.js 与 ai.js 各有一份逐字重复的实现。
 // 现在唯一实现在 ai.js（vm.js 的副本已删除），避免"改了一处漏了另一处"。
 import { getAiDiagnosis } from "@/api/manage/ai";
+import { probeAgentStatus } from "@/api/manage/agent";
+import useAgentStore from "@/store/modules/agent";
 import { listVmType } from "@/api/manage/vmType";
 import { listPartner } from "@/api/manage/partner";
 import { loadAllParams } from "@/api/page";
@@ -303,9 +305,26 @@ import ChannelDialog from './components/ChannelDialog.vue';
 const aiOpen = ref(false);
 const aiLoading = ref(false);
 const aiResult = ref("");
+const agentStore = useAgentStore();
 
-/** 点击 AI 诊断 */
-function handleAiDiagnose(row) {
+/**
+ * 点击 AI 诊断。
+ *
+ * 2-6：智能体可用时**入口切到对话页**（scene=3 诊断场景，预置这台设备的编号），
+ * 多轮问诊与结论卡片都由助手承担；
+ * 2-8：智能体不可用（未启用 / Python 未就绪）时**回落旧单轮诊断**——主业务零影响，
+ * 不把用户带进一个必然失败的对话。
+ */
+async function handleAiDiagnose(row) {
+  const status = await probeAgentStatus().catch(() => ({ enabled: false, upstream: "down" }));
+  if (status.enabled && status.upstream === "up") {
+    agentStore.openWith({
+      scene: 3,
+      prompt: `诊断设备 ${row.innerCode}：请按排查清单检查这台设备最近的出货与库存异常。`
+    });
+    return;
+  }
+
   aiOpen.value = true;
   aiResult.value = "";
   aiLoading.value = true;

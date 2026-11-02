@@ -256,6 +256,8 @@
 <script setup name="Node">
 import { getToken } from "@/utils/auth";
 import { getNodeAnalysis } from "@/api/manage/nodeAi";
+import { probeAgentStatus } from "@/api/manage/agent";
+import useAgentStore from "@/store/modules/agent";
 import { listNode, getNode, delNode, addNode, updateNode, getImportTemplate } from "@/api/manage/node";
 import { listRegion } from "@/api/manage/region";
 import { listPartner } from "@/api/manage/partner";
@@ -398,9 +400,25 @@ function getNodeInfo(row) {
 const aiDialogOpen = ref(false);
 const aiLoading = ref(false);
 const aiAnalysisResult = ref("");
+const agentStore = useAgentStore();
 
-/** AI 诊断按钮操作 */
-function handleAiDiagnose(row) {
+/**
+ * AI 诊断按钮操作。
+ *
+ * 2-6：智能体可用时切到对话页（scene=3），预置点位名让助手先定位该点位的设备；
+ * 2-8：不可用时回落旧单轮「点位分析」（与设备页同一套降级策略）。
+ */
+async function handleAiDiagnose(row) {
+  const status = await probeAgentStatus().catch(() => ({ enabled: false, upstream: "down" }));
+  if (status.enabled && status.upstream === "up") {
+    const name = row.nodeName || row.name || `id=${row.id}`;
+    agentStore.openWith({
+      scene: 3,
+      prompt: `分析点位「${name}」：请排查该点位下设备最近的出货与库存异常。`
+    });
+    return;
+  }
+
   aiDialogOpen.value = true;
   aiLoading.value = true;
   aiAnalysisResult.value = "";
