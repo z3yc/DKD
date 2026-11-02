@@ -645,6 +645,36 @@ def test_conclusion_extraction_is_defensive():
     assert len(json.dumps(projected, ensure_ascii=False)) < 2000, "投影必须体量有界"
 
 
+def test_compact_conclusion_projects_expandable_evidence_without_detail() -> None:
+    """2-4：卡片要能展开逐条证据，但帧里只给 kind/severity/summary，且条数/长度有界。"""
+    from app.api.chat import (
+        _MAX_EVIDENCE_SUMMARY_CHARS,
+        _MAX_PROJECTED_EVIDENCE,
+        _compact_conclusion,
+    )
+
+    payload = {
+        "innerCode": "A1000001",
+        "confidence": "high",
+        "evidence": [
+            {
+                "kind": f"order_anomaly:k{i}",
+                "severity": "medium",
+                "summary": "卡单" * 200,
+                "detail": {"raw": "y" * 5000},
+            }
+            for i in range(_MAX_PROJECTED_EVIDENCE + 4)
+        ],
+    }
+    out = _compact_conclusion(payload)
+
+    assert out["evidenceCount"] == _MAX_PROJECTED_EVIDENCE + 4
+    assert len(out["evidence"]) == _MAX_PROJECTED_EVIDENCE
+    assert set(out["evidence"][0]) == {"kind", "severity", "summary"}
+    assert len(out["evidence"][0]["summary"]) == _MAX_EVIDENCE_SUMMARY_CHARS
+    assert "detail" not in json.dumps(out, ensure_ascii=False)
+
+
 # ------------------------------------------------------------------------------------
 # 2-3 多轮问诊：`focus_inner_code`（“正在诊断哪台设备”是状态，不是模型的记性）
 # ------------------------------------------------------------------------------------

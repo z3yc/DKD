@@ -133,6 +133,26 @@
                 </span>
                 · <span class="muted">置信度 = 证据强度刻度，不是概率；本结论不含病因推断</span>
               </div>
+              <!--
+                2-4：逐条证据默认折叠。帧里只投影前 3 条（后端有界，见 app/api/chat.py 的
+                _project_evidence），总量看 evidenceCount——不要在这里假装「全部展开」。
+              -->
+              <div v-if="(msg.conclusion.evidence || []).length" class="conclusion-block evidence">
+                <div class="t evidence-toggle" @click="msg.evidenceExpanded = !msg.evidenceExpanded">
+                  <span class="caret">{{ msg.evidenceExpanded ? '▾' : '▸' }}</span>
+                  证据明细（前 {{ msg.conclusion.evidence.length }} 条 / 共
+                  {{ msg.conclusion.evidenceCount || 0 }} 条）
+                </div>
+                <ul v-show="msg.evidenceExpanded" class="evidence-list">
+                  <li v-for="(item, i) in msg.conclusion.evidence" :key="i">
+                    <span class="sev" :class="'sev-' + (item.severity || 'info')">
+                      {{ severityLabel(item.severity) }}
+                    </span>
+                    <span class="kind">{{ item.kind }}</span>
+                    <div class="summary">{{ item.summary }}</div>
+                  </li>
+                </ul>
+              </div>
             </div>
             <!--
               本次查询口径（FIX-27）。
@@ -310,6 +330,16 @@ function confidenceLabel(value) {
   return CONFIDENCE_LABEL[value] || String(value || '—')
 }
 
+/**
+ * 证据档位的中文标签（2-4 证据明细展开用）。
+ * 为什么不在模板里写三元：档位与颜色是两处（文案 + class），集中在这里避免漂移。
+ */
+const EVIDENCE_SEVERITY_LABEL = { high: '高', medium: '中', info: '信息' }
+
+function severityLabel(value) {
+  return EVIDENCE_SEVERITY_LABEL[value] || String(value || '—')
+}
+
 function renderMarkdown(text) {
   if (!text) return ''
   // 必须经过 DOMPurify（AGENTS §2.2/§7.7：v-html 只允许渲染 sanitize 后的内容）
@@ -346,6 +376,8 @@ function pushMessage(role, content) {
     streaming: false,
     error: '',
     conclusion: null,
+    // 2-4：证据明细默认折叠（展开状态属于该条消息自己的 UI 状态）
+    evidenceExpanded: false,
     // 口径帧与保真核对（FIX-27）：没调工具时为空数组/空对象，前端据此不画
     dataCaliber: [],
     grounding: null
@@ -774,6 +806,77 @@ onBeforeUnmount(stop)
         border-top: 1px dashed #e4e7ed;
         font-size: 11px;
         color: #909399;
+      }
+
+      /* 2-4 证据明细：默认折叠，点标题展开；档位用颜色区分（高红 / 中橙 / 信息灰） */
+      .evidence {
+        .evidence-toggle {
+          cursor: pointer;
+          user-select: none;
+
+          .caret {
+            display: inline-block;
+            width: 12px;
+            color: #909399;
+            font-weight: 400;
+          }
+        }
+
+        .evidence-list {
+          list-style: none;
+          padding-left: 12px;
+          margin-top: 4px;
+
+          li {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 6px;
+            padding: 3px 0;
+            border-bottom: 1px dashed #ebeef5;
+
+            &:last-child {
+              border-bottom: none;
+            }
+          }
+
+          .sev {
+            flex: none;
+            padding: 0 6px;
+            border-radius: 8px;
+            font-size: 11px;
+            line-height: 18px;
+
+            &.sev-high {
+              background: #fef0f0;
+              color: #f56c6c;
+            }
+
+            &.sev-medium {
+              background: #fdf6ec;
+              color: #e6a23c;
+            }
+
+            &.sev-info {
+              background: #f4f4f5;
+              color: #909399;
+            }
+          }
+
+          .kind {
+            flex: none;
+            font-size: 11px;
+            color: #909399;
+            font-family: var(--el-font-family-mono, monospace);
+          }
+
+          .summary {
+            flex: 1 1 100%;
+            font-size: 12px;
+            color: #606266;
+            line-height: 1.6;
+          }
+        }
       }
     }
 

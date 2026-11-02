@@ -263,6 +263,31 @@ _CONCLUSION_TOOL = "build_device_diagnosis"
 _MAX_RAW_CONCLUSION_CHARS = 20000
 # 投影里的列表上限（卡片是给人扫读的，不是完整报告）
 _MAX_PROJECTED_ITEMS = 10
+# 2-4 卡片可展开的证据条数/摘要长度：done 帧要经 Java 网关逐字节转发，
+# 10 条 × 160 字会把帧撑到几 KB（实测），因此只投影前 3 条、摘要截断到 120 字，
+# 其余靠 evidenceCount 告诉用户总量。
+_MAX_PROJECTED_EVIDENCE = 3
+_MAX_EVIDENCE_SUMMARY_CHARS = 120
+
+
+def _project_evidence(evidence: list[dict]) -> list[dict]:
+    """把证据投影成卡片可展开的明细（**不带 detail**，summary 截断）。
+
+    2-4 的验收是「点开能看到逐条证据」，但把 evidence 原样塞进 done 帧会沿着 Java 网关
+    逐字节转发整段 detail（实测单条可到几 KB）。所以只给前端三样：
+    `kind`（哪一类异常）、`severity`（档位）、`summary`（一句话，截断）。
+    需要完整字段时按 `innerCode` 去「决策审计」或库里对账，不在聊天帧里传。
+    """
+    out: list[dict] = []
+    for item in evidence[:_MAX_PROJECTED_EVIDENCE]:
+        out.append(
+            {
+                "kind": str(item.get("kind") or "")[:80],
+                "severity": str(item.get("severity") or "")[:16],
+                "summary": str(item.get("summary") or "")[:_MAX_EVIDENCE_SUMMARY_CHARS],
+            }
+        )
+    return out
 
 
 def _compact_conclusion(payload: dict) -> dict:
@@ -279,6 +304,8 @@ def _compact_conclusion(payload: dict) -> dict:
         ],
         "evidenceCount": len(evidence),
         "evidenceKinds": sorted({str(e.get("kind")) for e in evidence})[:_MAX_PROJECTED_ITEMS],
+        # 2-4：卡片可展开的逐条证据（有界、无 detail）
+        "evidence": _project_evidence(evidence),
         "caliber": payload.get("caliber"),
     }
 
