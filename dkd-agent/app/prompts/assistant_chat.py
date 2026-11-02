@@ -189,13 +189,19 @@ _WINDOW_LINE = (
 
 
 def system_prompt(
-    scene: int = SCENE_GENERAL, *, focus_inner_code: str = "", window_days: int | None = None
+    scene: int = SCENE_GENERAL,
+    *,
+    focus_inner_code: str = "",
+    window_days: int | None = None,
+    diagnosis_hint: str = "",
 ) -> str:
     """按场景生成 system 提示词。
 
     @param scene 场景码（1-通用问答 2-补货 3-诊断 4-运营分析）；未知值按通用问答处理
     @param focus_inner_code 本次会话正在诊断的设备（空 = 未确定）；多轮追问靠它落到同一台设备
     @param window_days 本轮用户原话里的时间窗口（`time_hint.parse_window_days` 的结果，None = 没提）
+    @param diagnosis_hint 诊断场景的排查清单进度（`diagnosis_checklist.guidance` 的结果）；
+                         只对场景 3 注入，避免把诊断专用约束带进别的场景
     """
     focus_code = (focus_inner_code or "").strip()
     focus = _SCENE_FOCUS.get(scene, _SCENE_FOCUS[SCENE_GENERAL])
@@ -210,6 +216,8 @@ def system_prompt(
         prompt += _FOCUS_LINE.format(code=focus_code)
     if window_days:
         prompt += _WINDOW_LINE.format(days=int(window_days))
+    if scene == SCENE_DIAGNOSE and diagnosis_hint:
+        prompt += diagnosis_hint
     return prompt
 
 

@@ -28,8 +28,8 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from app.llm import LlmError, build_chat_model
-from app.prompts.assistant_chat import SCENE_GENERAL, system_prompt
-from app.services import time_hint
+from app.prompts.assistant_chat import SCENE_DIAGNOSE, SCENE_GENERAL, system_prompt
+from app.services import diagnosis_checklist, time_hint
 
 # 工具调用轮次上限（防“模型反复调工具烧 token”）。3 轮足够覆盖
 # “清单 → 查某台设备 → 查销量”这种最多三跳的问题；超出则强制作答。
@@ -180,6 +180,89 @@ def _tool_rounds_used(state: ChatState) -> int:
     return sum(1 for m in _current_turn_messages(state) if isinstance(m, ToolMessage))
 
 
+def _diagnosis_hint(state: ChatState) -> str:
+    """诊断场景的「本轮排查进度」提示词片段（2-3 问诊循环状态机）。
+
+    为什么从工具调用推导、而不是让模型自己记：排查次序是**可回归的规则**，
+    模型记不记得住取决于措辞与模型版本；而“本轮调了哪些工具”是确定事实。
+    判定逻辑与下一步都在 `app/services/diagnosis_checklist.py`（纯函数，可单测）。
+
+    只对诊断场景生效：补货/通用场景没有这条清单，注入会变成无意义的噪声。
+    """
+    if int(state.get("scene", 0) or 0) != SCENE_DIAGNOSE:
+        return ""
+    names = [
+        str(getattr(msg, "name", "") or "")
+        for msg in _current_turn_messages(state)
+        if isinstance(msg, ToolMessage)
+    ]
+    return diagnosis_checklist.guidance(
+        names, has_focus=bool(str(state.get("focus_inner_code") or ""))
+    )
+
+
+def _turn_tool_names(state: ChatState) -> list[str]:
+    """本轮已执行过的工具名（切本轮，见 `_current_turn_messages`）。"""
+    return [
+        str(getattr(msg, "name", "") or "")
+        for msg in _current_turn_messages(state)
+        if isinstance(msg, ToolMessage)
+    ]
+
+
+def _guard_diagnosis_tool_calls(
+    state: ChatState, tool_calls: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], str | None]:
+    """2-3 问诊循环的硬约束：必需排查项没做完时，不允许调用 build_device_diagnosis。
+
+    为什么要在图里拦、而不只是提示词里写：提示词是软约束，实测模型会“先下结论再补依据”。
+    拦截方式不是报错，而是**把这次结论调用换成清单里的下一步**（对同一台设备重新发起查询），
+    这样这一轮就真的把缺的那步查了，而不是把活退还给用户。
+
+    联动的提示词进度见 `_diagnosis_hint`（告诉模型下一步该查什么，减少被拦次数）。
+
+    @return (允许执行的调用列表, 需要作为用户可见说明的文案或 None)
+    """
+    if int(state.get("scene", 0) or 0) != SCENE_DIAGNOSE or not tool_calls:
+        return list(tool_calls), None
+    conclusion = diagnosis_checklist.CONCLUSION_TOOL
+    conclusions = [call for call in tool_calls if str(call.get("name") or "") == conclusion]
+    if not conclusions:
+        return list(tool_calls), None
+    turn_names = _turn_tool_names(state)
+    has_focus = bool(str(state.get("focus_inner_code") or ""))
+    if diagnosis_checklist.can_conclude(turn_names, has_focus=has_focus):
+        return list(tool_calls), None
+
+    kept = [call for call in tool_calls if str(call.get("name") or "") != conclusion]
+    step = diagnosis_checklist.missing_required(turn_names, has_focus=has_focus)[0]
+    inner_code = ""
+    for call in conclusions:
+        args = call.get("args") or {}
+        inner_code = str(args.get("inner_code") or "").strip()
+        if inner_code:
+            break
+    if not inner_code or step.tool == "find_devices":
+        # 没有设备编码（或缺的是“定位”本身）：没有可替换的查询参数，只能如实请用户先给设备
+        return kept, (
+            f"按排查清单，需要先完成「{step.label}」（`{step.tool}`）才能给结论。"
+            "请先告诉我设备编码或点位名称，我从这一步开始排。"
+        )
+    logger.info(
+        "诊断场景拦截过早结论：inner_code=%s 缺失项=%s，改为先调用 %s",
+        inner_code,
+        step.key,
+        step.tool,
+    )
+    synthesized = {
+        "name": step.tool,
+        "args": {"inner_code": inner_code},
+        "id": str(conclusions[0].get("id") or f"guard-{step.key}"),
+        "type": "tool_call",
+    }
+    return kept + [synthesized], None
+
+
 async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, Any]:
     """LLM 回复节点（带工具调用，需 DKD_DEEPSEEK_API_KEY + DKD_AGENT_USE_LLM=1）。
 
@@ -228,6 +311,9 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
                 # 它**不是会话状态**（下一轮不该沿用上一轮的窗口，见 time_hint 模块注释），
                 # 进 state 反而会把它变成“会记住的东西”。
                 window_days=time_hint.current_window_hint_days(),
+                # 2-3 问诊循环：把「本轮排查到哪一步、下一步查什么」写进提示词，
+                # 避免模型一上来就下结论（硬拦截在工具侧的 can_conclude 守卫）。
+                diagnosis_hint=_diagnosis_hint(state),
             )
         )
     ]
@@ -256,9 +342,20 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
         raise LlmError(f"LLM 调用失败：{type(exc).__name__}") from exc
 
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
-    tool_calls = list(getattr(resp, "tool_calls", None) or [])
+    original_calls = list(getattr(resp, "tool_calls", None) or [])
+    # 用量/元数据必须从**重建前**的 resp 取：下面可能用过滤后的 AIMessage 替换 resp，
+    # 替换后 usage_metadata 就没了——那会让本轮 token 成本（0-12）被系统性低估。
     usage = getattr(resp, "usage_metadata", None) or {}
     meta = getattr(resp, "response_metadata", None) or {}
+    # 2-3 问诊循环的硬约束：过早的结论调用会被替换成清单里的下一步（或如实请用户先给设备）。
+    # 必须在这里做：ToolNode 只看最后一条 AIMessage 的 tool_calls，事后过滤拦不住执行。
+    tool_calls, guard_reply = _guard_diagnosis_tool_calls(state, original_calls)
+    if guard_reply is not None:
+        resp = AIMessage(content=guard_reply)
+        content = guard_reply
+    elif len(tool_calls) != len(original_calls):
+        resp = AIMessage(content="", tool_calls=tool_calls)
+        content = ""
     # 多轮必须累加（见 docstring 第 2 点）：字段是后写覆盖，不累加就会低估成本
     tokens_in = int(state.get("tokens_in", 0) or 0) + int(usage.get("input_tokens", 0) or 0)
     tokens_out = int(state.get("tokens_out", 0) or 0) + int(usage.get("output_tokens", 0) or 0)

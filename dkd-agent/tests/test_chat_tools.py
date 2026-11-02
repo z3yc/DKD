@@ -549,7 +549,8 @@ async def test_done_frame_carries_diagnosis_conclusion(monkeypatch, tmp_path):
     fake = _ToolCallingFake(
         messages=iter(
             [
-                _tool_call("build_device_diagnosis", {"inner_code": "A1000001"}),
+                _tool_call("list_device_anomalies", {"inner_code": "A1000001"}),
+                _tool_call("build_device_diagnosis", {"inner_code": "A1000001"}, call_id="call-2"),
                 AIMessage(content="结论如上。"),
             ]
         )
@@ -563,12 +564,19 @@ async def test_done_frame_carries_diagnosis_conclusion(monkeypatch, tmp_path):
         graph = build_chat_graph(
             checkpointer=saver,
             use_llm=True,
-            tools=[_stub_tool(name="build_device_diagnosis", result=json.dumps(payload))],
+            tools=[
+                # 2-3 问诊循环：必须先完成「出货/库存异常」这一步，才允许下结论
+                _stub_tool(name="list_device_anomalies", result=json.dumps({"ok": True})),
+                _stub_tool(name="build_device_diagnosis", result=json.dumps(payload)),
+            ],
         )
         config = {"configurable": {"thread_id": "t-conclusion"}}
         # ainvoke 返回最终 state（dict）；别写 .values（那是 dict.values 方法）
         state = await graph.ainvoke(
-            {"messages": [{"role": "user", "content": "给个结论"}], "scene": SCENE_DIAGNOSE},
+            {
+                "messages": [{"role": "user", "content": "A1000001 给个结论"}],
+                "scene": SCENE_DIAGNOSE,
+            },
             config=config,
         )
     finally:
@@ -800,7 +808,8 @@ async def test_structured_frames_do_not_leak_across_turns(monkeypatch, tmp_path)
     fake = _ToolCallingFake(
         messages=iter(
             [
-                _tool_call("build_device_diagnosis", {"inner_code": "A1000001"}),
+                _tool_call("list_device_anomalies", {"inner_code": "A1000001"}),
+                _tool_call("build_device_diagnosis", {"inner_code": "A1000001"}, call_id="call-2"),
                 AIMessage(content="结论如上。"),
                 AIMessage(content="不客气，还有其他设备要看吗？"),
             ]
@@ -815,15 +824,20 @@ async def test_structured_frames_do_not_leak_across_turns(monkeypatch, tmp_path)
             checkpointer=saver,
             use_llm=True,
             tools=[
+                # 2-3 问诊循环：结论前必须先完成异常排查
+                _stub_tool(name="list_device_anomalies", result=json.dumps({"ok": True})),
                 _stub_tool(
                     name="build_device_diagnosis",
                     result=json.dumps(payload, ensure_ascii=False),
-                )
+                ),
             ],
         )
         config = {"configurable": {"thread_id": "t-turn-scope"}}
         await graph.ainvoke(
-            {"messages": [{"role": "user", "content": "给个结论"}], "scene": SCENE_DIAGNOSE},
+            {
+                "messages": [{"role": "user", "content": "A1000001 给个结论"}],
+                "scene": SCENE_DIAGNOSE,
+            },
             config=config,
         )
         turn1 = _current_turn_messages((await graph.aget_state(config)).values.get("messages"))
