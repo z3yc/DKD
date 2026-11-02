@@ -118,7 +118,8 @@ public interface IInventoryService
      * @param skuId 商品ID
      * @param channelId 货道ID
      * @param changeQuantity 变动数量（正数为增加，负数为减少）
-     * @param changeType 变动类型：1-入库 2-出库 3-补货 4-调整
+     * @param changeType 变动类型：1-销售 2-补货 3-损耗 4-调整（含初始化/对账） 5-盘点
+     *                   （权威取值见 {@code InventoryLog.CHANGE_TYPE_*} 与业务规范 §4.3）
      * @param operator 操作人
      * @return 结果
      */
