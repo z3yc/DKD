@@ -39,7 +39,9 @@ cd dkd-vue; npm run build:prod                          # 前端构建（含语�
 cd dkd-agent; .venv\Scripts\python.exe -m pytest        # 全量测试
 .venv\Scripts\ruff.exe check .                           # lint 必须全过
 ```
-> 当前项目尚无统一 CI，本地验证全绿是合并的前置条件（见 §10）。
+> **已接入统一 CI（2026-11-02）**：`.github/workflows/ci.yml` 在 push/PR 到 `main`/`develop` 时跑
+> Java（dkd-parent + dkd-app）、Python（ruff + pytest）、前端（`npm ci` + `build:prod`）与 compose 配置校验
+> （见梳理报告 P0-2）。**CI 是第二道门禁，不替代本地验证**——本地验证全绿仍是合并的前置条件（见 §10）。
 
 ---
 
