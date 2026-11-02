@@ -37,6 +37,7 @@ from sqlalchemy import bindparam, text
 from app.config import get_settings
 from app.constants import CASE_WINDOW_DAYS_PROGRAMMATIC, ROLE_CODE_BUSINESS, ROLE_CODE_REPAIR
 from app.db import assert_table_allowed
+from app.sql_guard import assert_declared_tables_match
 
 logger = logging.getLogger("dkd.agent.tools.read")
 
@@ -205,8 +206,13 @@ async def _fetch_all(
     `session` 只要求实现 `execute(text, params)`（SQLAlchemy AsyncSession 的 `execute` 签名），
     便于单测用假会话断言 SQL 形状而不连库。
     """
+    # P0-7：两级校验，顺序不能反。
+    # ① 先按「声明」逐表过白名单（与既有拒绝路径保持一致：直接声明越权表 → TableNotAllowedError）；
+    # ② 再校验「SQL 实际读的表」与「声明」完全一致——只做①的话，漏传/写错表名就能绕过白名单，
+    #    越权读取不会报错，只会安静地多读一张表。两级都 fail-closed。
     for table in tables:
         assert_table_allowed(table)
+    assert_declared_tables_match(sql, tables)
     settings = get_settings()
     statement = text(sql)
     if expanding:
