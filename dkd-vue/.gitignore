@@ -19,6 +19,8 @@ selenium-debug.log
 *.sln
 *.local
 
-package-lock.json
+# 锁定文件：本项目统一用 npm（Dockerfile 用 npm ci、AGENTS §1 的命令是 npm run build:prod），
+# 因此 package-lock.json **必须入库**——忽略它会让干净 clone / CI / docker build 里的
+# `COPY package-lock.json` 与 `npm ci` 直接失败（2026-11-02 P0-3 修复；pnpm/bun 锁文件已删除）。
 yarn.lock
 .gstack/
