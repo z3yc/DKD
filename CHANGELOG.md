@@ -6,7 +6,9 @@
 分类：`Added` 新增 / `Changed` 变更 / `Fixed` 修复 / `Security` 安全 / `Removed` 移除 / `Docs` 文档。
 版本与 tag 规则见 `AGENTS.md` §5.3。
 
-## [Unreleased]
+## [0.4.0] - 2026-11-02
+
+性能与一致性治理（P1 性能 11 项 + P2 治理 12 项，其中 1 项只出规格）与业务口径收口；升级前请先读 `### Changed` 里的两条行为变更。
 
 ### Added
 
@@ -18,6 +20,9 @@
   （补货完成同事务写货道缓存 + 库存台账 + `tb_inventory_log`，容量夹取、`is_alert` 重算）。
 - 建单校验新增拒绝路径单测（非法类型/停用员工/角色不匹配/货道不归属/超容量/无明细/sku 不一致）与
   报表口径用例（`TaskServiceValidationTest`、`ReportServiceReportMetricsTest`、`ReportTaskFailureTest`）。
+- **运维端排名真实统计**：`GET /task-service/task/rank/{userId}` 原返回硬编码 `{total:3, rank:3}`，
+  改为按 `tb_task` 真实统计（历史累计已完成、仅 `task_status=4`、并列取最小名次），接口结构不变。
+- **个人开发体系 DevKit V1.0**：`dev-kit/`（契约、模板、脚手架；独立成仓前的过渡寄居）。
 
 ### Changed
 
@@ -31,6 +36,20 @@
 - **权限**：`/manage/ai/**` 三个接口纳入 `manage:vm:query`；补货工作台前端按钮使用与网关一致的
   `manage:task:list/add`。
 - **智能体派单**：故障派单接单人过滤改为维修角色 1003（补货仍为 1002），与 Java 建单校验和运维端作业队列一致。
+- **性能（P1，8 项）**：报表设备统计下推 SQL（不再全量物化设备表）；订单时间过滤改半开区间，恢复
+  `create_time` 索引（原 `date_format()` 包裹索引列 → 全索引扫描）；两处 N+1 整改（点位导入判重预载、
+  货道按设备批量建索引）；库存预警/补货建议分页 + 两次全表查询合并为单条 SQL + ID 反查下沉 Service；
+  限额查询加索引 + global 30s TTL 缓存；补货建单串行回调改 `Semaphore(4)` 有界并发；
+  前端 `manualChunks` + 登录背景图 WebP（dist 8.7M→6.6M，首屏 gzip ~2.4M→~590K）。
+- **一致性（P2）**：状态/角色常量三侧收敛到契约表 `docs/CONTRACTS/status-codes.md`；订单/支付状态去裸
+  字面量（`DkdContants` 派生，报表里第二个 `2` 消灭）；`RuntimeException`→`ServiceException`；
+  货道批量插入按 500 行分片，避免大机型超 `max_allowed_packet`；前端 CRUD 五件套抽 `crudFactory`
+  （迁移 14 个逐字同构文件，255 次请求配置机器比对 0 差异）；三套 HTTP 通道收敛（restock 回归 axios，
+  错误分支透传业务文案）。
+- ⚠️ **行为变更（升级需知）**：① `/manage/inventory/alerts`、`/manage/inventory/restock` 返回结构由
+  `AjaxResult` 改为 `TableDataInfo`（分页），前端已同步，**其它调用方需自查**；② 前端路由
+  `/manage/inventory`、`/manage/report` 从 `constantRoutes` 迁入 `dynamicRoutes`，进入需
+  `manage:inventory:list` / `manage:report:list`（超管 `*:*:*` 仍命中）。
 
 ### Fixed
 
@@ -39,6 +58,18 @@
   订单详情"设备编号"错绑订单号、el-tag 非法 `primary`。
 - 后端：补货完成"失败但工单已提交"（改为整体回滚）、Integer 状态比较用 `==`、
   补货只写货道不写台账、库存流水列名与真实表不一致、报表任务失败被吞（现已抛异常进 `sys_job_log`）。
+- 前端 15 个管理页 `loading` 未复位（请求失败时永久转圈）；`getAiDiagnosis` 两份重复实现（保留
+  `api/manage/ai.js` 单一实现）；`store/index.js` 缺 `createPinia` 显式导入（依赖 auto-import 的隐式行为）；
+  home 两处必然 404 的跳转。
+- 注释/文档漂移：`install-business-dump.sh` 引用的 `install-agent-db.sh` 实际是 `setup-agent-db.sh`；
+  `dkd-parent/Dockerfile` 引用的 `logback-spring.xml` 不存在（实际是 `logback.xml`）。
+
+### Docs
+
+- 新增 P1 性能优化、P2 治理与一致性两份详细执行计划与全仓系统性梳理（`docs/`，逐项证据可回溯提交号）。
+- 智能体超时预算证据化：纠正"120s 网关 vs 10s 回调"的误判，登记真实倒挂（06:00 串行 LLM vs Java 120s×3）。
+- 合作商分成核算规格草案（7 项口径待业务拍板，**本轮只出规格未实现**）。
+- 排期计划、接入方案、状态码契约表、安全审计/凭据轮换 runbook 同步更新。
 
 ## [0.3.0] - 2026-10-28
 
