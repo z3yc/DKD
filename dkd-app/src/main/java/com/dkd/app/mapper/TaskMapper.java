@@ -5,6 +5,9 @@ import com.dkd.app.domain.Task;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
+
+import java.time.LocalDateTime;
 
 @Mapper
 public interface TaskMapper extends BaseMapper<Task> {
@@ -41,4 +44,60 @@ public interface TaskMapper extends BaseMapper<Task> {
             + "SELECT user_id FROM tb_task WHERE task_status = 4 AND user_id IS NOT NULL "
             + "GROUP BY user_id HAVING COUNT(*) > #{myFinishedCount}) ahead")
     Long countUsersAhead(@Param("myFinishedCount") Long myFinishedCount);
+
+    /**
+     * 条件接单（P0-6）：把「状态仍是待处理 + 执行人是我」放进同一条 UPDATE 的 WHERE。
+     *
+     * <p>为什么用注解 SQL 而不是 MyBatis-Plus 的 {@code LambdaUpdateWrapper}：
+     * <ol>
+     *   <li>并发正确性靠这条 SQL 的语义，写死在 Mapper 里最不容易被后来者改回 check-then-act；</li>
+     *   <li>{@code LambdaUpdateWrapper} 依赖实体的 lambda 元数据缓存，纯单测（不启 Spring）会抛
+     *       {@code can not find lambda cache for this entity}，SQL 就没法被单测覆盖到；</li>
+     *   <li>注解 SQL 不能引用 Java 常量，故状态值一律由调用方以参数传入（不在 SQL 里写死 1/2），
+     *       契约仍由 {@code docs/CONTRACTS/status-codes.md} 单一维护。</li>
+     * </ol>
+     *
+     * <p>返回 0 表示「并发下已被别人改走 / 不存在 / 不是我的单」——由 Service 回查后归因，
+     * 不能靠影响行数区分原因。
+     *
+     * @param taskId 工单Id
+     * @param userId 登录人Id
+     * @param expectStatus 期望的当前状态（待处理）
+     * @param targetStatus 目标状态（进行中）
+     * @param updateTime 更新时间（应用侧统一时钟，与 MyBatis-Plus 的自动填充保持一致）
+     * @return 影响行数（1 成功，0 未命中）
+     */
+    @Update("UPDATE tb_task SET task_status = #{targetStatus}, update_time = #{updateTime} "
+            + "WHERE task_id = #{taskId} AND task_status = #{expectStatus} AND user_id = #{userId}")
+    int acceptIfPending(@Param("taskId") Long taskId,
+                        @Param("userId") Integer userId,
+                        @Param("expectStatus") Integer expectStatus,
+                        @Param("targetStatus") Integer targetStatus,
+                        @Param("updateTime") LocalDateTime updateTime);
+
+    /**
+     * 条件取消/拒绝工单（P0-6）：只有「未完成且未取消」且执行人是我的单才能被改。
+     *
+     * <p>与 {@link #acceptIfPending} 同一思路；额外写入驳回原因 {@code desc}
+     * （列名是 MySQL 关键字，必须反引号）。
+     *
+     * @param taskId 工单Id
+     * @param userId 登录人Id
+     * @param finishedStatus 已完成状态（排除值之一）
+     * @param cancelledStatus 已取消状态（排除值之一）
+     * @param targetStatus 目标状态（已取消）
+     * @param desc 取消/拒绝原因
+     * @param updateTime 更新时间
+     * @return 影响行数（1 成功，0 未命中）
+     */
+    @Update("UPDATE tb_task SET task_status = #{targetStatus}, `desc` = #{desc}, update_time = #{updateTime} "
+            + "WHERE task_id = #{taskId} AND task_status NOT IN (#{finishedStatus}, #{cancelledStatus}) "
+            + "AND user_id = #{userId}")
+    int cancelIfActive(@Param("taskId") Long taskId,
+                       @Param("userId") Integer userId,
+                       @Param("finishedStatus") Integer finishedStatus,
+                       @Param("cancelledStatus") Integer cancelledStatus,
+                       @Param("targetStatus") Integer targetStatus,
+                       @Param("desc") String desc,
+                       @Param("updateTime") LocalDateTime updateTime);
 }

@@ -133,50 +133,67 @@ public class TaskServiceImpl extends ServiceImpl<TaskMapper, Task> implements Ta
 
     // 接受工单
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public Boolean accept(Long taskId, Integer userId) {
-        // 1.判断工单是否存在
+        // P0-6：用「条件 UPDATE」替代 getById → 判断 → updateById 的 check-then-act。
+        // 为什么：原写法两个请求可以同时读到「待处理」，然后各自 updateById 成功——后写的覆盖先写的，
+        // 工单在无人察觉的情况下被两个人「接单」。条件 UPDATE 把「状态必须仍是待处理 + 必须是我」
+        // 塞进同一条 SQL 的 WHERE 里，由数据库的行锁保证只有一条能命中。
+        if (userId == null) {
+            throw new LogicException("未获取到登录人信息，无法接受工单");
+        }
+        int rows = baseMapper.acceptIfPending(taskId, userId,
+                VmSystemConstant.TASK_STATUS_CREATE,
+                VmSystemConstant.TASK_STATUS_PROGRESS,
+                LocalDateTime.now());
+        if (rows == 1) {
+            return true;
+        }
+        // 0 行说明并发已改变状态、或工单不存在、或不是我的单。此时才回查一次，只为给出与改造前
+        // **逐字一致**的用户文案（失败原因的区分是展示问题，不能反过来用「先查后判」来保证正确性）。
         Task task = this.getById(taskId);
         if (ObjectUtil.isEmpty(task)) {
             throw new LogicException("工单不存在");
         }
-        // 2.判断工单状态是否为刚创建（待处理）；Integer 比较用 equals，避免包装类型 == 的缓存陷阱
         if (!VmSystemConstant.TASK_STATUS_CREATE.equals(task.getTaskStatus())) {
             throw new LogicException("此工单状态不是待处理，无法接受");
         }
-        // 3.判断登录人是否有权接受工单
         if (!userId.equals(task.getUserId())) {
             throw new LogicException("此登录人无权接受工单");
         }
-        // 4.修改工单状态
-        task.setTaskStatus(VmSystemConstant.TASK_STATUS_PROGRESS);
-        // 5.返回结果
-        return this.updateById(task);
+        // 状态与归属都符合却更新失败：说明在 UPDATE 与回查之间又被别人改走了
+        throw new LogicException("工单状态已变化，请刷新后重试");
     }
 
     // 拒绝/取消工单
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public Boolean cancel(Long taskId, CancelTaskDto cancelTaskDto, Integer userId) {
-        // 1.判断工单是否存在
-        Task tassk = this.getById(taskId);
-        if (ObjectUtil.isEmpty(tassk)) {
+        // P0-6：同 accept，改为条件 UPDATE；可取消 = 状态不属于「已完成/已取消」且是我的单
+        if (userId == null) {
+            throw new LogicException("未获取到登录人信息，无法取消工单");
+        }
+        int rows = baseMapper.cancelIfActive(taskId, userId,
+                VmSystemConstant.TASK_STATUS_FINISH,
+                VmSystemConstant.TASK_STATUS_CANCEL,
+                VmSystemConstant.TASK_STATUS_CANCEL,
+                cancelTaskDto.getDesc(),
+                LocalDateTime.now());
+        if (rows == 1) {
+            return true;
+        }
+        Task task = this.getById(taskId);
+        if (ObjectUtil.isEmpty(task)) {
             throw new LogicException("工单不存在");
         }
-        // 2.判断工单状态是否为刚创建（待处理）；Integer 比较用 equals，避免包装类型 == 的缓存陷阱
-        if (VmSystemConstant.TASK_STATUS_FINISH.equals(tassk.getTaskStatus()) ||
-                VmSystemConstant.TASK_STATUS_CANCEL.equals(tassk.getTaskStatus())) {
+        if (VmSystemConstant.TASK_STATUS_FINISH.equals(task.getTaskStatus()) ||
+                VmSystemConstant.TASK_STATUS_CANCEL.equals(task.getTaskStatus())) {
             throw new LogicException("此工单状态不是待处理或进行中，无法取消");
         }
-        // 3.判断登录人是否有权取消工单
-        if (!userId.equals(tassk.getUserId())) {
+        if (!userId.equals(task.getUserId())) {
             throw new LogicException("此登录人无权取消/拒绝工单");
         }
-        // 4.修改工单状态
-        tassk.setTaskStatus(VmSystemConstant.TASK_STATUS_CANCEL);
-        tassk.setDesc(cancelTaskDto.getDesc());
-        boolean b = this.updateById(tassk);
-
-        // 5.返回结果
-        return b;
+        throw new LogicException("工单状态已变化，请刷新后重试");
     }
 
     /**
