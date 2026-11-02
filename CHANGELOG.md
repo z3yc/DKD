@@ -6,6 +6,39 @@
 分类：`Added` 新增 / `Changed` 变更 / `Fixed` 修复 / `Security` 安全 / `Removed` 移除 / `Docs` 文档。
 版本与 tag 规则见 `AGENTS.md` §5.3。
 
+## [0.4.1] - 2026-11-02
+
+P0 治理收口（P0-1 ~ P0-7，7/7）：交易链路接线、接单并发、表白名单强制校验，以及 CI / 锁文件 / 容器配置。
+
+### Added
+
+- **全仓质量门禁 CI**：`.github/workflows/ci.yml`，5 个 job——dkd-parent、dkd-app、Python（ruff + pytest）、
+  前端（`npm ci` + `build:prod`）、compose 配置校验（默认 / infra 合并 / mobile profile）。
+- **交易链路接线（P0-1）**：订单落库为「出货成功」时同事务扣减销售库存（`change_type=1`，流水带 `order_id`）；
+  库存回写走独立事务、失败不阻断订单，账面不足夹到 0 并留 WARN（差额交对账收敛）。
+  订单主键回填（`insertOrder` 补 `useGeneratedKeys`），否则销售流水拿不到 `order_id`。
+
+### Changed
+
+- **接单/取消改条件 UPDATE（P0-6）**：`UPDATE ... WHERE task_id=? AND task_status=? AND user_id=?`，
+  由行锁保证并发下只有一条命中；影响 0 行时才回查归因，前三类文案不变，
+  新增「工单状态已变化，请刷新后重试」。
+- **前端包管理器收敛到 npm（P0-3）**：`package-lock.json` 入库并补齐 `dompurify`/`marked`，
+  删除 `pnpm-lock.yaml`/`bun.lock`（此前干净 clone 下 `Dockerfile` 的 `COPY package-lock.json` 与 `npm ci` 必失败）。
+- **容器配置（P0-4/P0-5）**：admin 日志卷统一挂到 logback 实际路径 `/home/ruoyi/logs`（此前挂 `/app/logs`，
+  容器重建即丢日志）；mobile profile 补 `DKD_APP_JWT_SECRET`/`EXPIRE_MINUTES`（此前漏注入 → dkd-app 启动必失败）。
+
+### Security
+
+- **Agent 只读表白名单强制校验（P0-7）**：从 SQL 解析实际读取的表，与调用方声明**双向**交叉校验；
+  少声明（可能越权）、多声明（声明写错）、解析不出/引号未闭合一律拒绝（fail-closed），
+  堵住「漏传表名绕过白名单」的越权读取面。
+
+### Fixed
+
+- 6 个 Python 文件按 `ruff format 0.16.8` 重新格式化（CI 门禁需要，纯格式无行为变化）。
+- 补记：`dkd-vue` 构建已验证 `npm ci` + `build:prod` 均可从锁文件干净重建（同 Docker 构建路径）。
+
 ## [0.4.0] - 2026-11-02
 
 性能与一致性治理（P1 性能 11 项 + P2 治理 12 项，其中 1 项只出规格）与业务口径收口；升级前请先读 `### Changed` 里的两条行为变更。
