@@ -1,0 +1,106 @@
+# 全仓质量门禁（AGENTS.md §1 / §10）
+#
+# 为什么把测试和构建都放进 CI：本仓的 Java/Python 测试全是纯单测（不连 MySQL/Redis/LLM，
+# 外部依赖由夹具打桩），跑得动就该跑；否则"本地验证全绿"只能靠人肉复述，且极易过期。
+# 四个 job 与 AGENTS §1 的验证命令一一对应，改门禁时请同步改那份文档。
+name: ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+# 同一分支重复触发时取消旧运行，避免排队浪费额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  java-parent:
+    name: dkd-parent（Java 8，mvn test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+          cache: maven
+      # 与 AGENTS §1 一致：只测 dkd-admin 及其上游模块，不跑全 reactor
+      - name: mvn -pl dkd-admin -am test
+        working-directory: dkd-parent
+        run: mvn -B -pl dkd-admin -am test
+
+  java-app:
+    name: dkd-app（Java 8，mvn test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+          cache: maven
+      - name: mvn test
+        working-directory: dkd-app
+        run: mvn -B test
+
+  python-agent:
+    name: dkd-agent（Python 3.11，ruff + pytest）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # uv 会读 dkd-agent/.python-version 与 uv.lock，依赖版本以锁文件为准
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: uv sync（按 uv.lock）
+        working-directory: dkd-agent
+        run: uv sync --frozen --all-extras --dev
+      - name: ruff check
+        working-directory: dkd-agent
+        run: uv run --frozen ruff check .
+      - name: ruff format --check
+        working-directory: dkd-agent
+        run: uv run --frozen ruff format --check .
+      - name: pytest
+        working-directory: dkd-agent
+        run: uv run --frozen pytest
+
+  vue:
+    name: dkd-vue（Node 20，npm ci + build）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: dkd-vue/package-lock.json
+      # npm ci 要求 package-lock.json 与 package.json 严格同步——它同时是锁文件漂移的守门人
+      # （2026-11-02 前锁文件缺 dompurify/marked，Dockerfile 的 npm ci 会直接失败）
+      - name: npm ci
+        working-directory: dkd-vue
+        run: npm ci --no-audit --no-fund
+      - name: npm run build:prod
+        working-directory: dkd-vue
+        run: npm run build:prod
+
+  deploy-config:
+    name: deploy/compose（配置可解析）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 用模板值渲染，只验证 compose 语法 / 变量插值 / 卷与网络合并，不启动任何容器
+      - name: docker compose config
+        working-directory: deploy/docker
+        run: |
+          cp .env.deploy.example .env.deploy
+          docker compose --env-file .env.deploy config > /dev/null
+          docker compose --env-file .env.deploy -f docker-compose.yml -f docker-compose.infra.yml config > /dev/null
+          docker compose --env-file .env.deploy --profile mobile config > /dev/null
