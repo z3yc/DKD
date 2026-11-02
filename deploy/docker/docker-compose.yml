@@ -52,7 +52,9 @@ services:
       # 只绑回环：给排查/SSH 隧道用；对外一律走 web 的 /prod-api 反代
       - "127.0.0.1:${DKD_ADMIN_PUBLISH_PORT:-18080}:8080"
     volumes:
-      - admin_logs:/app/logs
+      # 必须与 logback.xml 的 log.path 一致：应用写 /home/ruoyi/logs（见 dkd-parent/Dockerfile:44-48）。
+      # 原先挂 /app/logs，容器重建即丢日志（P0-4，2026-11-02 统一）
+      - admin_logs:/home/ruoyi/logs
     # 注意：这里**不能**写对 mysql/redis 的 depends_on。
     #   `depends_on` 引用的服务必须存在，而外部数据库模式下本文件会单独执行
     #   （此时 mysql/redis 未定义 → compose 直接报 “depends on undefined service”，项目起不来）。
@@ -145,6 +147,11 @@ services:
       DKD_REDIS_HOST: ${DKD_REDIS_HOST:-redis}
       DKD_REDIS_PORT: ${DKD_REDIS_PORT:-6379}
       DKD_REDIS_PASSWORD: ${DKD_REDIS_PASSWORD:?请在 .env.deploy 里设置 DKD_REDIS_PASSWORD}
+      # 移动端 JWT 密钥：dkd-app 的 application-dev.yml 里是 ${DKD_APP_JWT_SECRET}，
+      # 且启动时校验长度 ≥32 字节（不满足直接拒绝启动）。它与后台的 DKD_JWT_SECRET 是**两套体系**，
+      # 不得复用同一个值。原先漏注入 → `--profile mobile` 必启动失败（P0-5，2026-11-02 修复）。
+      DKD_APP_JWT_SECRET: ${DKD_APP_JWT_SECRET:?请在 .env.deploy 里设置 DKD_APP_JWT_SECRET（≥32 字节）}
+      DKD_APP_JWT_EXPIRE_MINUTES: ${DKD_APP_JWT_EXPIRE_MINUTES:-720}
     ports:
       - "${DKD_APP_PORT:-9070}:9070"
     volumes:
