@@ -41,9 +41,7 @@ async def fake_confirm(deps: Any, **kwargs: Any) -> ConfirmResult:
     )
 
 
-def test_start_run_returns_proposal(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_start_run_returns_proposal(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
 
     async def spy(deps: Any, *, inner_code: str, window_hours: int) -> dict[str, Any]:
@@ -65,9 +63,7 @@ def test_start_run_returns_proposal(
     assert calls == [{"inner_code": "A1000001", "window_hours": 24}]
 
 
-def test_start_run_failure_maps_502(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_start_run_failure_maps_502(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     async def boom(**_kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("db down")
 
@@ -79,9 +75,7 @@ def test_start_run_failure_maps_502(
     assert "诊断执行失败" in response.json()["msg"]
 
 
-def test_confirm_requires_user_header(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_confirm_requires_user_header(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(fault_api, "confirm_fault_dispatch", fake_confirm)
 
     response = client.post("/agent/fault/runs/fault-test0001/confirm", json={})
@@ -142,9 +136,7 @@ def test_confirm_maps_request_level_failures(
     assert response.json()["msg"] == f"{status}-message"
 
 
-def test_confirm_reject_passes_action(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_confirm_reject_passes_action(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, Any] = {}
 
     async def fake(deps: Any, **kwargs: Any) -> ConfirmResult:

@@ -113,9 +113,7 @@ async def start_run(payload: StartRunRequest, request: Request) -> dict[str, Any
 
 
 @router.post("/runs/{run_id}/confirm", summary="确认派单提案建维修工单 / 驳回提案（幂等）")
-async def confirm(
-    run_id: str, payload: ConfirmRequest, request: Request
-) -> dict[str, Any]:
+async def confirm(run_id: str, payload: ConfirmRequest, request: Request) -> dict[str, Any]:
     """人工确认（human-in-the-loop）：确认才经 Java 回调建单；重复确认返回同一工单。"""
     user_id = require_user_id(request)
     deps = _deps(request)

@@ -177,9 +177,7 @@ async def test_duplicate_confirm_returns_same_task_without_callback() -> None:
     confirm_store = FakeConfirmStore(confirmed={"taskId": 101, "taskCode": "T1"})
     callback = FakeCallback()
 
-    result = await confirm_fault_dispatch(
-        deps, run_id="r1", store=confirm_store, callback=callback
-    )
+    result = await confirm_fault_dispatch(deps, run_id="r1", store=confirm_store, callback=callback)
 
     assert result.status == "duplicate"
     assert result.task_id == 101
@@ -192,9 +190,7 @@ async def test_running_run_returns_in_progress() -> None:
     confirm_store = FakeConfirmStore(status="running")
     callback = FakeCallback()
 
-    result = await confirm_fault_dispatch(
-        deps, run_id="r1", store=confirm_store, callback=callback
-    )
+    result = await confirm_fault_dispatch(deps, run_id="r1", store=confirm_store, callback=callback)
 
     assert result.status == "in_progress"
     assert callback.calls == []
@@ -234,9 +230,7 @@ async def test_business_rejection_releases_for_retry() -> None:
     confirm_store = FakeConfirmStore()
     callback = FakeCallback(error=CallbackBusinessError("设备有未完成工单，请勿重复创建工单"))
 
-    result = await confirm_fault_dispatch(
-        deps, run_id="r1", store=confirm_store, callback=callback
-    )
+    result = await confirm_fault_dispatch(deps, run_id="r1", store=confirm_store, callback=callback)
 
     assert result.status == "rejected_by_business"
     assert "设备有未完成工单" in result.message
@@ -256,9 +250,7 @@ async def test_unavailable_releases_for_retry() -> None:
     confirm_store = FakeConfirmStore()
     callback = FakeCallback(error=CallbackUnavailableError("Java 服务不可达，建单未完成"))
 
-    result = await confirm_fault_dispatch(
-        deps, run_id="r1", store=confirm_store, callback=callback
-    )
+    result = await confirm_fault_dispatch(deps, run_id="r1", store=confirm_store, callback=callback)
 
     assert result.status == "unavailable"
     assert confirm_store.run["status"] == "waiting_confirm"
@@ -271,9 +263,7 @@ async def test_claim_conflict_returns_in_progress() -> None:
     confirm_store = FakeConfirmStore(claim_result=False)
     callback = FakeCallback()
 
-    result = await confirm_fault_dispatch(
-        deps, run_id="r1", store=confirm_store, callback=callback
-    )
+    result = await confirm_fault_dispatch(deps, run_id="r1", store=confirm_store, callback=callback)
 
     assert result.status == "in_progress"
     assert callback.calls == []
@@ -288,9 +278,7 @@ async def test_no_assignee_is_not_confirmed() -> None:
     )
     callback = FakeCallback()
 
-    result = await confirm_fault_dispatch(
-        deps, run_id="r1", store=confirm_store, callback=callback
-    )
+    result = await confirm_fault_dispatch(deps, run_id="r1", store=confirm_store, callback=callback)
 
     assert result.status == "rejected_by_business"
     assert "无接单人" in result.message
@@ -305,9 +293,7 @@ async def test_not_waiting_status_is_rejected() -> None:
     confirm_store = FakeConfirmStore(status="done")
     callback = FakeCallback()
 
-    result = await confirm_fault_dispatch(
-        deps, run_id="r1", store=confirm_store, callback=callback
-    )
+    result = await confirm_fault_dispatch(deps, run_id="r1", store=confirm_store, callback=callback)
 
     assert result.status == "not_waiting"
     assert callback.calls == []

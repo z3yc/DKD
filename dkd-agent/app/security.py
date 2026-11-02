@@ -183,4 +183,3 @@ def require_agent_gateway(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="服务间密钥校验失败（/agent/** 仅允许回环或持密钥的服务间调用）",
         )
-

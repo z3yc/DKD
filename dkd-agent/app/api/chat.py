@@ -41,9 +41,7 @@ from app.logging_conf import current_request_id
 from app.security import HEADER_REQUEST_ID, parse_user_context, require_agent_gateway
 from app.services import grounding, time_hint
 
-router = APIRouter(
-    prefix="/agent", tags=["chat"], dependencies=[Depends(require_agent_gateway)]
-)
+router = APIRouter(prefix="/agent", tags=["chat"], dependencies=[Depends(require_agent_gateway)])
 logger = logging.getLogger("dkd.agent.chat")
 
 _CHUNK = 24

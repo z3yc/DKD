@@ -160,9 +160,7 @@ async def collect_facts(
     calls: list[dict[str, Any]] = []
     seq = 0
 
-    async def run_tool(
-        tool_code: str, factory: Callable[[], Any], params: dict[str, Any]
-    ) -> Any:
+    async def run_tool(tool_code: str, factory: Callable[[], Any], params: dict[str, Any]) -> Any:
         nonlocal seq
         seq += 1
         began = time.perf_counter()
@@ -341,9 +339,7 @@ def trace_evidence(
         evidence.tool_call_id = f"s{call['step_no']}c{call['call_seq']}"
         kept.append(evidence)
 
-    has_anomaly = any(
-        item.kind.startswith(("order_anomaly", "inventory_anomaly")) for item in kept
-    )
+    has_anomaly = any(item.kind.startswith(("order_anomaly", "inventory_anomaly")) for item in kept)
     if not has_anomaly:
         conclusion.cannot_conclude = True
         conclusion.confidence = CONFIDENCE_NONE
@@ -685,9 +681,7 @@ def _make_diagnose_node(deps: FaultDeps) -> Callable[[FaultState], Any]:
             "evidence_count": len(trace.kept),
             "dropped_count": len(trace.dropped),
             "dispatch_allowed": trace.dispatch_allowed,
-            "stop_reason": None
-            if trace.dispatch_allowed
-            else "证据不足或不可回溯，未生成派单建议",
+            "stop_reason": None if trace.dispatch_allowed else "证据不足或不可回溯，未生成派单建议",
         }
 
     return diagnose
