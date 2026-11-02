@@ -37,14 +37,16 @@ jobs:
         run: mvn -B -pl dkd-admin -am test
 
   java-app:
-    name: dkd-app（Java 8，mvn test）
+    name: dkd-app（Java 11，mvn test）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # dkd-app 的 pom 里 maven.compiler.source/target 都是 11（不是 8）：
+      # 用 JDK 8 会直接编译失败（invalid target release: 11）。2026-11-02 CI 首跑实测。
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '8'
+          java-version: '11'
           cache: maven
       - name: mvn test
         working-directory: dkd-app

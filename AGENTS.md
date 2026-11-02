@@ -11,7 +11,7 @@
 | 子系统 | 技术栈 | 位置 | 说明 |
 | --- | --- | --- | --- |
 | 管理后台 | **Java 8** / Spring Boot 2.5.15 / MyBatis / Druid / Redis / Maven 多模块 | `dkd-parent/` | RuoYi-Vue 3.8.7 改造，业务事实唯一所有者，端口 8080 |
-| 运维移动端 | Java 8 / Spring Boot / MyBatis-Plus / JWT | `dkd-app/` | 与后台共用 `dkd` MySQL 库 |
+| 运维移动端 | **Java 11** / Spring Boot / MyBatis-Plus / JWT | `dkd-app/` | 与后台共用 `dkd` MySQL 库（pom 的 `maven.compiler.source/target=11`；2026-11-02 CI 实测：用 JDK 8 编译直接失败） |
 | 管理前端 | **Vue 3.4 + Element Plus + Vite（JavaScript，非 TS）** | `dkd-vue/` | RuoYi-Vue3 前端 |
 | 智能体服务（在建） | Python 3.11+ / FastAPI / LangGraph / SQLAlchemy(async) | `dkd-agent/`（规划，设计见 `docs/DKD智能体接入方案-LangChain-LangGraph.md` V1.1、排期见 `docs/DKD智能体接入项目排期计划.md` V2） | 旁路集成，读走 MySQL 只读账号、写走 Java REST 回调 |
 
@@ -21,7 +21,7 @@
 1. Java 系统是**业务事实唯一所有者**——所有写操作必须经 Java 服务的事务与校验链（如 `TaskServiceImpl.insertTaskDto` 的防重/状态/区域校验）；**dkd-agent 永远不得直连数据库写入**；
 2. Agent 读数据走 MySQL **只读账号 + 表白名单**；写操作一律回调 Java REST（`AgentCallbackController`，服务间密钥鉴权）。**唯一例外**：智能体自有表（`agent_*`）可由 Agent 直接读写（不含 DELETE），它不属“业务事实”，详见 §7.3；
 3. `agent.enabled` 开关必须保证 Python 服务不可用时主业务零影响（现有 `IAiService` 单轮链路兜底）；
-4. Java 8 语法边界：**禁止使用 var / record / switch 表达式 / List.of() 等高版本特性**（编译目标 1.8）；
+4. **Java 版本边界**：`dkd-parent` 编译目标 1.8——**禁止使用 var / record / switch 表达式 / List.of() 等高版本特性**；`dkd-app` 的 pom 目标是 **11**（可用 11 语法，但仍不要用 17+ 特性）；
 5. **基础设施实测边界（2026-09-21 核实，不得凭印象假设）**：
    - **业务表全部带 `tb_` 前缀**（`tb_inventory`/`tb_order`/`tb_task`/`tb_task_details`/`tb_inventory_log`/`tb_emp`/`tb_channel`/`tb_vending_machine`/`tb_node`/`tb_region`/`tb_sku`/`tb_job`/`tb_policy`/`tb_partner`/`tb_vm_type`/`tb_sku_class`/`tb_task_type`/`tb_role`/`tb_report`）——写 SQL、搞白名单、建 Agent 工具前先核 `dkd-manage/src/main/resources/mapper/manage/*.xml`；
    - **Redis 为 3.2.100（Microsoft 2016 移植版）**：无模块系统（不支持 RedisJSON/RediSearch）、内核 3.2 < 5.0（无 Streams）、`appendonly no`（仅 RDB）——**不得用它承载 LangGraph checkpointer，也不得用作 Stream 队列**（会话持久化用 SQLite/Postgres saver）；
