@@ -62,7 +62,9 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         where id = #{id}
     </select>
 
-    <insert id="insertOrder" parameterType="Order">
+    <!-- useGeneratedKeys 是 P0-1 的前提：扣减销售库存要把订单主键写进 tb_inventory_log.order_id，
+         回填不到 id 就只能拿 order_no 拼字符串，审计与幂等都做不了 -->
+    <insert id="insertOrder" parameterType="Order" useGeneratedKeys="true" keyProperty="id">
         insert into tb_order
         <trim prefix="(" suffix=")" suffixOverrides=",">
             <if test="id != null">id,</if>

@@ -21,6 +21,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import com.dkd.manage.mapper.InventoryMapper;
 import com.dkd.manage.domain.Inventory;
@@ -385,6 +386,45 @@ public class InventoryServiceImpl implements IInventoryService
     }
 
     /**
+     * 按订单扣减销售库存（P0-1 交易链路接线，口径见 {@link IInventoryService#deductForSale}）。
+     *
+     * <p>关键取舍：
+     * <ul>
+     *   <li><b>独立事务（REQUIRES_NEW）</b>：下单主事务不能因为库存回写失败而整体回滚——
+     *       订单是主业务事实、库存是派生数据；若共用事务，这里一抛异常就会把下单也带走，
+     *       等于"库存不准就不许卖"；</li>
+     *   <li><b>账面为 0 不抛异常</b>：销售已在设备侧发生，这里只返回 0 让调用方记 WARN，
+     *       不写 change_amount=0 的流水（审计噪声），差额留给 Phase B 的对账任务；</li>
+     *   <li><b>台账不存在返回 -1</b>：不在这里抛错，也不静默——调用方必须记 WARN，
+     *       否则"设备有订单但库存行丢了"会无人知晓。</li>
+     * </ul>
+     *
+     * @param vmId 售货机ID
+     * @param skuId 商品ID
+     * @param channelId 货道ID
+     * @param orderId 订单Id（写入流水并用于幂等）
+     * @return 1 已扣减；0 账面不足未扣减；-1 台账不存在
+     */
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
+    public int deductForSale(Long vmId, Long skuId, Long channelId, Long orderId)
+    {
+        Inventory inventory = locateInventory(vmId, skuId, channelId);
+        if (inventory == null)
+        {
+            return -1;
+        }
+        int beforeStock = inventory.getQuantity() == null ? 0 : inventory.getQuantity();
+        if (beforeStock <= 0)
+        {
+            return 0;
+        }
+        int result = applyInventoryChange(inventory, -1, InventoryLog.CHANGE_TYPE_SALE,
+                InventoryLog.OPERATOR_SYSTEM, orderId);
+        return result > 0 ? 1 : 0;
+    }
+
+    /**
      * 库存变更的统一实现（校验 → 更新台账 → 写流水），供数量接口、后台编辑、初始化共用。
      *
      * <p>为什么抽成私有方法：清晰版 §4.3 要求"库存变更只能经唯一入口"，
@@ -398,6 +438,25 @@ public class InventoryServiceImpl implements IInventoryService
      * @return 更新的行数；无实际变化时返回 0
      */
     private int applyInventoryChange(Inventory inventory, int changeQuantity, Integer changeType, String operator)
+    {
+        return applyInventoryChange(inventory, changeQuantity, changeType, operator, null);
+    }
+
+    /**
+     * 库存变更统一实现的重载：额外携带订单Id（P0-1 销售扣减用）。
+     *
+     * <p>为什么单独加参数而不是拼进 operator/remark：{@code tb_inventory_log.order_id} 是审计的强关联字段
+     * （能直接回答"这 1 件是被哪张订单扣的"），拼字符串会丢掉可查询性。
+     *
+     * @param inventory 已定位到的台账行
+     * @param changeQuantity 变动数量（正数增加/负数减少）
+     * @param changeType 变动类型（1~5）
+     * @param operator 操作人姓名
+     * @param orderId 关联订单Id（可为 null）
+     * @return 更新的行数；无实际变化时返回 0
+     */
+    private int applyInventoryChange(Inventory inventory, int changeQuantity, Integer changeType, String operator,
+                                     Long orderId)
     {
         if (inventory == null || inventory.getId() == null)
         {
@@ -447,7 +506,7 @@ public class InventoryServiceImpl implements IInventoryService
         // 4) 写流水（真实列）；change_amount 记实际变动量，操作人写 operator_name
         writeInventoryLog(inventory.getVmId(), inventory.getSkuId(), inventory.getChannelId(),
                 actualChange, beforeStock, afterStock, changeType, buildBusinessType(changeType),
-                operator, now);
+                operator, now, orderId);
         return result;
     }
 
@@ -571,6 +630,29 @@ public class InventoryServiceImpl implements IInventoryService
                                    int afterStock, Integer changeType, String businessType, String operator,
                                    Date createTime)
     {
+        writeInventoryLog(vmId, skuId, channelId, changeAmount, beforeStock, afterStock, changeType,
+                businessType, operator, createTime, null);
+    }
+
+    /**
+     * 写库存流水（带关联订单Id，P0-1 销售扣减专用）。
+     *
+     * @param vmId 售货机ID
+     * @param skuId 商品ID
+     * @param channelId 货道ID
+     * @param changeAmount 变动数量（正数增加/负数减少，记实际值）
+     * @param beforeStock 变动前库存
+     * @param afterStock 变动后库存
+     * @param changeType 变动类型（1~5）
+     * @param businessType 业务类型字符串（SALE/RESTOCK/LOSS/ADJUST/INIT 等）
+     * @param operator 操作人姓名
+     * @param createTime 流水时间
+     * @param orderId 关联订单Id（可为 null）
+     */
+    private void writeInventoryLog(Long vmId, Long skuId, Long channelId, int changeAmount, int beforeStock,
+                                   int afterStock, Integer changeType, String businessType, String operator,
+                                   Date createTime, Long orderId)
+    {
         InventoryLog inventoryLog = new InventoryLog();
         inventoryLog.setVmId(vmId);
         inventoryLog.setSkuId(skuId);
@@ -581,6 +663,7 @@ public class InventoryServiceImpl implements IInventoryService
         inventoryLog.setAfterStock(afterStock);
         inventoryLog.setBusinessType(businessType);
         inventoryLog.setOperatorName(operator);
+        inventoryLog.setOrderId(orderId);
         inventoryLog.setCreateTime(createTime);
         inventoryLogMapper.insertInventoryLog(inventoryLog);
     }

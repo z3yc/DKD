@@ -4,9 +4,18 @@ import java.util.List;
 import com.dkd.common.constant.DkdContants;
 import com.dkd.common.exception.ServiceException;
 import com.dkd.common.utils.DateUtils;
+import com.dkd.manage.domain.Channel;
+import com.dkd.manage.domain.VendingMachine;
+import com.dkd.manage.mapper.ChannelMapper;
+import com.dkd.manage.mapper.InventoryLogMapper;
+import com.dkd.manage.mapper.VendingMachineMapper;
+import com.dkd.manage.service.IInventoryService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import com.dkd.manage.mapper.OrderMapper;
 import com.dkd.manage.domain.Order;
 import com.dkd.manage.domain.dto.OrderDetailDto;
@@ -21,8 +30,23 @@ import com.dkd.manage.service.IOrderService;
 @Service
 public class OrderServiceImpl implements IOrderService 
 {
+    private static final Logger log = LoggerFactory.getLogger(OrderServiceImpl.class);
+
     @Autowired
     private OrderMapper orderMapper;
+
+    /** P0-1：出货成功后回写库存台账（唯一库存变更入口） */
+    @Autowired
+    private IInventoryService inventoryService;
+
+    @Autowired
+    private VendingMachineMapper vendingMachineMapper;
+
+    @Autowired
+    private ChannelMapper channelMapper;
+
+    @Autowired
+    private InventoryLogMapper inventoryLogMapper;
 
     /**
      * 查询订单管理
@@ -49,16 +73,93 @@ public class OrderServiceImpl implements IOrderService
     }
 
     /**
-     * 新增订单管理
-     * 
+     * 新增订单管理。
+     *
+     * <p>P0-1（交易链路接线）：订单落库状态为「2 出货成功」时，同事务内回写销售库存。
+     * 为什么只认 2：状态机是 {@code 0 待支付 → 1 支付完成 → 2 出货成功 / 3 出货失败}，
+     * 只有 2 代表货真的出了；在 1 扣减会和退款/出货失败纠缠，在 0 扣减是凭空预占。
+     *
+     * <p>为什么库存失败不回滚订单：订单是主业务事实、库存是派生数据（清晰版 §1.1）；
+     * 且销售已在设备侧发生，拦住订单只会让真实交易记录进不了库——比台账暂时不准更糟。
+     * 扣减方法自身用独立事务（REQUIRES_NEW），因此这里 catch 不会把主事务打成 rollback-only。
+     *
      * @param order 订单管理
      * @return 结果
      */
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public int insertOrder(Order order)
     {
         order.setCreateTime(DateUtils.getNowDate());
-        return orderMapper.insertOrder(order);
+        int rows = orderMapper.insertOrder(order);
+        if (rows > 0 && DkdContants.ORDER_STATUS_VENDOUT_SUCCESS.equals(order.getStatus()))
+        {
+            syncSaleInventory(order);
+        }
+        return rows;
+    }
+
+    /**
+     * 出货成功后回写库存台账（P0-1）。
+     *
+     * <p>定位链路：订单表没有 vm_id/channel_id，只能由
+     * {@code inner_code → tb_vending_machine.id}、{@code channel_code → tb_channel.id} 反查。
+     * 任一环缺失就**不扣减、不阻断订单**——实测 29% 订单的 {@code channel_code} 为空（排期 FIX-21），
+     * 这些单只能靠 Phase B 的对账任务收敛，强行扣减会扣到错误的货道。
+     *
+     * <p>失败一律只 WARN 不抛：调用方是订单落库主链路，库存回写是尽力而为。
+     *
+     * @param order 已落库（id 已回填）的订单
+     */
+    private void syncSaleInventory(Order order)
+    {
+        Long orderId = order.getId();
+        try
+        {
+            if (order.getInnerCode() == null || order.getChannelCode() == null || order.getSkuId() == null)
+            {
+                log.warn("订单出货成功但缺少设备/货道/商品信息，跳过库存回写：orderId={}，orderNo={}，innerCode={}，"
+                        + "channelCode={}，skuId={}", orderId, order.getOrderNo(), order.getInnerCode(),
+                        order.getChannelCode(), order.getSkuId());
+                return;
+            }
+            VendingMachine vm = vendingMachineMapper.selectVendingMachineByInnerCode(order.getInnerCode());
+            if (vm == null || vm.getId() == null)
+            {
+                log.warn("订单出货成功但设备不存在，跳过库存回写：orderId={}，innerCode={}", orderId, order.getInnerCode());
+                return;
+            }
+            Channel channel = channelMapper.getChannelInfo(order.getInnerCode(), order.getChannelCode());
+            if (channel == null || channel.getId() == null)
+            {
+                log.warn("订单出货成功但货道不存在，跳过库存回写：orderId={}，innerCode={}，channelCode={}",
+                        orderId, order.getInnerCode(), order.getChannelCode());
+                return;
+            }
+            // 幂等：同一订单只允许产生一条销售扣减流水（重复落库/补偿重放时不再扣）
+            if (orderId != null && inventoryLogMapper.countSaleByOrderId(orderId) > 0)
+            {
+                log.info("订单已扣减过销售库存，跳过：orderId={}", orderId);
+                return;
+            }
+            int result = inventoryService.deductForSale(vm.getId(), order.getSkuId(), channel.getId(), orderId);
+            if (result < 0)
+            {
+                log.warn("订单出货成功但库存台账不存在，未扣减（差额待对账）：orderId={}，vmId={}，channelId={}",
+                        orderId, vm.getId(), channel.getId());
+            }
+            else if (result == 0)
+            {
+                log.warn("订单出货成功但账面库存不足，已按 0 处理（差额待对账）：orderId={}，vmId={}，channelId={}",
+                        orderId, vm.getId(), channel.getId());
+            }
+        }
+        catch (Exception e)
+        {
+            // 订单是主业务事实：库存回写异常只告警，不得让下单失败
+            log.warn("订单出货成功但库存回写失败（订单保留，差额待对账）：orderId={}，orderNo={}",
+                    orderId, order.getOrderNo(), e);
+        }
     }
 
     /**

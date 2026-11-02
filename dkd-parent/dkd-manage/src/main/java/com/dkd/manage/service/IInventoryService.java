@@ -125,6 +125,28 @@ public interface IInventoryService
     public int updateInventoryQuantity(Long vmId, Long skuId, Long channelId, Integer changeQuantity, Integer changeType, String operator);
 
     /**
+     * 按订单扣减销售库存（P0-1：交易链路接线）。
+     *
+     * <p>为什么单独一个方法、而不是让调用方自己传 -1 调 {@link #updateInventoryQuantity}：
+     * 销售扣减有两条调用方不能错的口径——
+     * <ol>
+     *   <li>变动类型恒为「1 销售」且必须带 {@code order_id}（审计要能答「这 1 件是被哪张订单扣的」）；</li>
+     *   <li>账面不足时**不抛异常**（销售已在设备侧发生，拦住订单只会让真实交易记录进不了库），
+     *       夹到 0 并返回 0，由调用方记 WARN，差额交 Phase B 对账收敛。</li>
+     * </ol>
+     *
+     * <p>实现使用独立事务（REQUIRES_NEW）：扣减失败不得把下单主事务打成 rollback-only——
+     * 订单是主业务事实，库存是派生数据（清晰版 §1.1）。
+     *
+     * @param vmId 售货机ID
+     * @param skuId 商品ID（货道未命中时回退旧唯一键）
+     * @param channelId 货道ID
+     * @param orderId 订单Id（写入流水 order_id，同时作为幂等判据）
+     * @return 1 已扣减；0 账面不足未扣减；-1 库存台账不存在
+     */
+    public int deductForSale(Long vmId, Long skuId, Long channelId, Long orderId);
+
+    /**
      * 初始化库存（用于新设备或新商品）
      *
      * @param vmId 售货机ID

@@ -2,6 +2,8 @@ package com.dkd.manage.mapper;
 
 import java.util.List;
 import com.dkd.manage.domain.InventoryLog;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
 
 /**
  * 库存变动日志Mapper接口
@@ -74,4 +76,19 @@ public interface InventoryLogMapper
      * @return 库存变动日志列表
      */
     public List<InventoryLog> selectByChannelId(Long channelId);
+
+    /**
+     * 统计某订单已产生的「销售扣减」流水条数（P0-1 幂等判据）。
+     *
+     * <p>为什么是 {@code order_id + change_type} 而不是只看 {@code order_id}：
+     * 同一订单还可能因对账/损耗产生其它类型流水，只有「销售」类型才代表这次扣减已经做过。
+     *
+     * <p>注解 SQL 无法引用 Java 常量：{@code change_type = 1} 即
+     * {@link InventoryLog#CHANGE_TYPE_SALE}，改契约时两处一起改。
+     *
+     * @param orderId 订单Id（tb_order.id）
+     * @return 已扣减次数
+     */
+    @Select("SELECT COUNT(1) FROM tb_inventory_log WHERE order_id = #{orderId} AND change_type = 1")
+    int countSaleByOrderId(@Param("orderId") Long orderId);
 }
