@@ -120,6 +120,7 @@ function getList() {
   allocatedUserList(queryParams).then(response => {
     userList.value = response.rows;
     total.value = response.total;
+  }).finally(() => {
     loading.value = false;
   });
 }

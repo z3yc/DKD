@@ -105,6 +105,7 @@ function submitForm() {
           }
         });
       });
+    }).finally(() => {
       loading.value = false;
     });
   }

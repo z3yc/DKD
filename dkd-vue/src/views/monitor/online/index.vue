@@ -79,6 +79,7 @@ function getList() {
   initData(queryParams.value).then(response => {
     onlineList.value = response.rows;
     total.value = response.total;
+  }).finally(() => {
     loading.value = false;
   });
 }

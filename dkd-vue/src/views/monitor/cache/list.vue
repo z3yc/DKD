@@ -172,6 +172,7 @@ function getCacheNames() {
   loading.value = true;
   listCacheName().then(response => {
     cacheNames.value = response.data;
+  }).finally(() => {
     loading.value = false;
   });
 }

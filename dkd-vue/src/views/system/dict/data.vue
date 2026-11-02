@@ -244,6 +244,7 @@ function getList() {
   listData(queryParams.value).then(response => {
     dataList.value = response.rows;
     total.value = response.total;
+  }).finally(() => {
     loading.value = false;
   });
 }

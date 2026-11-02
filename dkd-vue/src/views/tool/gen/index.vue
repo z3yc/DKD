@@ -202,6 +202,7 @@ function getList() {
   listTable(proxy.addDateRange(queryParams.value, dateRange.value)).then(response => {
     tableList.value = response.rows;
     total.value = response.total;
+  }).finally(() => {
     loading.value = false;
   });
 }

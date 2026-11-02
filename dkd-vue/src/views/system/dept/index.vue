@@ -177,6 +177,7 @@ function getList() {
   loading.value = true;
   listDept(queryParams.value).then(response => {
     deptList.value = proxy.handleTree(response.data, "deptId");
+  }).finally(() => {
     loading.value = false;
   });
 }
