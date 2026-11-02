@@ -582,6 +582,49 @@ B线  [波2 PG底座] ──► [波4 知识库地基] ──► [波5 诊断Age
 > 本章是**专门为「新会话快速接手」写的**：读完这一章就能开工，不必翻前面的 500 行。
 > 写作原则：**每条都带可执行的命令或文件路径**，不含“建议关注”这类无法行动的句子。
 
+### 10.0 最新交接（2026-11-02，**新会话从这里开始**）
+
+**一句话现状**：P0 治理 7 项与 Phase 2 剩余 3 项（2-5/2-6/2-8）已落地并推送；`develop` = `e54ee16`，
+CI 5/5 全绿；**代码侧已无可独立推进的计划项**，剩余 19 项全部卡在数据/凭据/真机/业务拍板/上线窗口。
+
+**分支与版本**
+- 分支 `develop`，工作区干净、与 `origin/develop` 同步；最新 tag `v0.4.1`（`git describe` = `v0.4.1-13-ge54ee16`）
+- `main` **未动**（合并/推送需负责人批准，AGENTS §5.1）
+- CI：`.github/workflows/ci.yml`，5 个 job（dkd-parent / dkd-app / Python / 前端 / compose）
+
+**本轮（2026-11-02）做完的**
+1. **P0 收口**：P0-1 出货成功回写库存、P0-2 CI、P0-3 npm 锁文件入库、P0-4 日志卷、P0-5 mobile JWT、
+   P0-6 接单/取消条件 UPDATE、P0-7 SQL 表名交叉校验（详见 `docs/P0治理与交付收口详细计划-2026-11-02.md`）
+2. **Phase 2**：2-3 问诊循环状态机（`app/services/diagnosis_checklist.py`）、2-4 结论证据明细、
+   2-5 工单备注写结论（`app/services/repair_task_desc.py`）、2-6 诊断入口切对话页、2-8 不可用回落单轮
+3. **FIX-26** 工具轮前言缓冲（`_PreambleBuffer`，阈值 `DKD_AGENT_PREAMBLE_BUFFER_CHARS`）
+4. 18 个 RuoYi 模板页 `loading` 复位、ruff 废弃规则清理、决策/进度/待确认三本台账
+
+**门禁（先跑这三条再动手）**
+```powershell
+cd dkd-parent; mvn -pl dkd-admin -am test          # 166 passed
+cd dkd-app;    mvn -f pom.xml test                 # 16 passed
+cd dkd-agent;  .venv\Scripts\ruff.exe check .; .venv\Scripts\python.exe -m pytest   # 538 passed
+cd dkd-vue;    npm run build:prod                   # exit 0
+```
+
+**没完成的事（19 项，按解锁方式分组；逐条依据见 `docs/待确认.md`）**
+- **缺数据/环境（9）**：1-12 库存对账（FIX-5）、1-13 M2 验收 / 1-14 双跑 / 1-8 真机 / 3-8 双跑报告（FIX-6）、
+  2-5 备注可见性、2-6 浏览器手测、2-8 停服务演练、P0-1 真库 smoke / P0-6 并发实测
+- **需人工或业务（5）**：0-14 凭据轮换（FIX-7）、0-15 降级演练签字、2-7 案例库（FIX-22 数据）、
+  2-9 M3 真人验收、P2-25 分成口径拍板
+- **需上线窗口（4）**：4-1 文档评审、4-2 灰度、4-3 值守、3-10 M4
+- **计划内砍掉/后置（7，不算欠账）**：3-1~3-5、3-6、4-4（依据 §9.1）
+
+**规范口径（重要）**
+- 本仓**没有** `docs/核心模型.md`、`开发规范.md`、`前端规范.md`、`并行开发.md`，也没有 `composer check` /
+  `npm run check` / Redis 6390；检查一律按 `AGENTS.md` §1 的命令与 `.github/workflows/ci.yml`（详见 `docs/待确认.md` §1）
+- 本轮发现并修正：`dkd-app` 实际编译目标是 **Java 11**（AGENTS 原写 Java 8，CI 首跑即失败）
+
+**开工建议顺序**：① 跑上面四条门禁 → ② 读 `docs/进度.md` 与 `docs/待确认.md` →
+③ 有业务库凭据就先清 P0-1/P0-6/2-5 的真库验收；没有就等外部输入，不要造“假验收”。
+
+
 ### 10.1 一句话现状
 
 **（2026-10-03）补货 Agent 已交付且经两套独立工具验收（既有 Playwright 脚本 + gstack `browse` 人工式走查）；
