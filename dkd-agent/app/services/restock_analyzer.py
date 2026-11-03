@@ -27,7 +27,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+import uuid
+from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import Any
 
@@ -35,9 +36,12 @@ from pydantic import BaseModel, Field
 
 from app.audit import RESULT_FAIL, RESULT_OK, TRIGGER_SCHEDULE
 from app.config import Settings, get_settings
+from app.config_store import AgentConfigSnapshot
 from app.graphs.restock_graph import new_restock_state
 from app.graphs.restock_plan_store import PAUSE_SCOPE_GLOBAL
 from app.graphs.restock_state import SCENE_RESTOCK
+from app.obs.run_recorder import RunStore, finish_run, start_run
+from app.services import carrier_config
 from app.services.decision_audit import AuditWriter, write_decision
 
 logger = logging.getLogger("dkd.agent.services.restock_analyzer")
@@ -92,12 +96,18 @@ class RestockAnalyzer:
         settings: Settings | None = None,
         audit_writer: AuditWriter | None = None,
         today_provider: Callable[[], date] | None = None,
+        run_store: RunStore | None = None,
+        config_loader: Callable[[], Awaitable[AgentConfigSnapshot | None]] | None = None,
     ) -> None:
         self._graph_factory = graph_factory
         self._pause = pause_store
         self._settings = settings or get_settings()
         self._audit_writer = audit_writer
         self._today = today_provider or date.today
+        # 2-8：运行观测写入器（None = 默认 SqlRunStore；单测注入假 store，AGENTS §8）
+        self._run_store = run_store
+        # 2-7/2-8：本次运行生效的 restock 配置来源（默认读 agent_config 的 restock 行）
+        self._config_loader = config_loader or carrier_config.load_restock_config
 
     async def analyze(
         self, *, plan_date: date | None = None, request_id: str | None = None
@@ -141,6 +151,24 @@ class RestockAnalyzer:
                 pausedBy=state.paused_by,
             )
 
+        # 排期 2-8：运行侧埋点。版本取**本次实际生效**的配置快照；
+        # 配置回落 / DB 关闭（config_loader 返回 None）时写 None——**不编造版本号**。
+        snapshot = await self._load_config()
+        config_version = snapshot.version if snapshot is not None else None
+        # run_id 必须唯一（agent_run.uk_agent_run_id）；thread_id 仍按日期复用（重入安全）
+        run_id = f"restock-{date_text}-{uuid.uuid4().hex[:8]}"
+        await start_run(
+            self._settings,
+            self._run_store,
+            run_id=run_id,
+            scene_code="restock",
+            subject_type="plan_date",
+            subject_id=date_text,
+            trigger_type=TRIGGER_SCHEDULE,
+            config_version=config_version,
+            create_by="agent",
+        )
+
         # 每轮新建图与 deps：deps 内部有「本轮设备/员工/负载」缓存，
         # 跨轮复用会让长驻进程拿上一轮的员工名单派今天的单（1-6 的 load() 会重置，
         # 但并发两轮时会互相踩缓存——新建的代价只是编译一张 5 节点小图）
@@ -170,8 +198,16 @@ class RestockAnalyzer:
                     "threadId": thread_id,
                     "effect": "failed",
                     "errorType": type(exc).__name__,
+                    "configVersion": config_version,
                 },
                 error_msg=f"{type(exc).__name__}: {exc}"[:_ERROR_MSG_MAX],
+            )
+            await finish_run(
+                self._settings,
+                self._run_store,
+                run_id=run_id,
+                status="failed",
+                stop_reason=f"{type(exc).__name__}: {exc}"[:_ERROR_MSG_MAX],
             )
             raise RestockAnalyzeError(f"补货分析运行失败：{type(exc).__name__}: {exc}") from exc
 
@@ -212,7 +248,16 @@ class RestockAnalyzer:
                 "totalQuantity": total_quantity,
                 "interrupted": interrupted,
                 "calibrated": bool(result.get("calibration_notes")),
+                "configVersion": config_version,
             },
+        )
+        # 观测语义：在人工确认处中断的运行仍是“进行中”（waiting_confirm 非终态）
+        await finish_run(
+            self._settings,
+            self._run_store,
+            run_id=run_id,
+            status="waiting_confirm" if interrupted else "done",
+            stop_reason=None,
         )
         return AnalyzeOutcome(
             status=STATUS_ANALYZED,
@@ -223,6 +268,16 @@ class RestockAnalyzer:
             channelCount=channel_count,
             totalQuantity=total_quantity,
         )
+
+    async def _load_config(self) -> AgentConfigSnapshot | None:
+        """读本次运行生效的 restock 配置（失败 → None + WARN，回落 Settings 现状）。"""
+        try:
+            return await self._config_loader()
+        except Exception as exc:  # noqa: BLE001 —— 配置读取是旁路，不得让分析失败
+            logger.warning(
+                "读取 restock 配置失败，回落 Settings 默认值：err=%s", type(exc).__name__
+            )
+            return None
 
     async def _audit(
         self,
@@ -264,6 +319,7 @@ def build_default_analyzer(
             deps=SqlRestockDeps(settings=effective),
             checkpointer=checkpointer,
             settings=effective,
+            config_loader=carrier_config.load_restock_config,
         )
 
     return RestockAnalyzer(

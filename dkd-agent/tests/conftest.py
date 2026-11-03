@@ -15,10 +15,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
+from app.config_store import reset_config_store
 
 
 def _clear_caches() -> None:
     get_settings.cache_clear()
+    # 配置缓存是进程单例（TTL/总开关来自 Settings）：Settings 变了不丢单例，
+    # 后续用例会继续用旧 TTL 的缓存。测试间必须显式重置（排期 2-3）。
+    reset_config_store()
 
 
 @pytest.fixture(autouse=True)
@@ -115,6 +119,13 @@ def _isolate_env() -> Iterator[None]:
     # 要验观测的用例请显式注入假 store（见 tests/test_run_recorder.py）。
     os.environ["DKD_AGENT_OBS_ENABLED"] = "0"
     os.environ["DKD_AGENT_CHECKPOINT_BACKEND"] = "sqlite"
+    # 排期 2-3：统一关闭“从 DB 读智能体配置”，保证既有 538 用例行为与改造前一致。
+    # 为什么必须在 conftest 统一钉死而不是让每个用例自己处理：
+    # 配置化之后载体默认会查 `agent_config`（真库），而 AGENTS §8 要求“测试不得连外部依赖”；
+    # 不开这个旗标就等于每个跑单测的人都必须先建表灌 seed。
+    # 要验配置消费的用例请显式覆盖该旗标并注入假 loader / 假 store
+    # （见 tests/test_config_store.py）。
+    os.environ["DKD_AGENT_CONFIG_FROM_DB"] = "0"
     yield
     for k in [k for k in os.environ if k.startswith("DKD_") and k not in saved]:
         os.environ.pop(k, None)

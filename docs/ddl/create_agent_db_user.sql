@@ -63,6 +63,14 @@ GRANT SELECT, INSERT, UPDATE ON dkd.agent_restock_pause TO 'dkd_agent'@'127.0.0.
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_run        TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_step       TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_tool_call  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+-- 2026-11-03 追加（排期 2-1，DDL 见 agent_config.sql）：智能体配置是 **Java 的业务事实**
+-- （RuoYi 权限 + 审计 + 乐观锁），Python 只读消费；因此这里**只有 SELECT**，
+-- 从权限层堵死「绕过 Java 改配置」。history 同理（Java 回滚用，Python 不读也不写）。
+GRANT SELECT ON dkd.agent_config         TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT ON dkd.agent_config_history TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+-- 2026-11-03 追加（排期 2-4，DDL 见 agent_config.sql）：执行日志只增不改；
+-- 不授 UPDATE/DELETE —— 保留期清理属排期 4-4，由 Java/运维执行（Python 无删除权限）。
+GRANT SELECT, INSERT ON dkd.agent_log    TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 
 FLUSH PRIVILEGES;
 

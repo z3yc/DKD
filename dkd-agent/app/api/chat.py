@@ -21,12 +21,13 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, NamedTuple
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.agent_defaults import CUSTOM_SCENE_BASE
 from app.audit import (
     RESULT_OK,
     QuotaExceededError,
@@ -35,11 +36,12 @@ from app.audit import (
     record_message,
 )
 from app.config import Settings, get_settings
+from app.config_store import BUILTIN_CHAT_SCENES
 from app.db import get_sessionmaker
 from app.llm import LlmError
 from app.logging_conf import current_request_id
 from app.security import HEADER_REQUEST_ID, parse_user_context, require_agent_gateway
-from app.services import grounding, time_hint
+from app.services import carrier_config, grounding, time_hint
 
 router = APIRouter(prefix="/agent", tags=["chat"], dependencies=[Depends(require_agent_gateway)])
 logger = logging.getLogger("dkd.agent.chat")
@@ -86,9 +88,10 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = Field(
         default=None, max_length=64, description="会话ID（= LangGraph thread_id），缺省则新建"
     )
-    scene: int = Field(
-        default=1, ge=1, le=4, description="场景：1-通用问答 2-补货 3-诊断 4-运营分析"
-    )
+    # 排期 2-7：去掉 `le=4`——自定义 chat 场景从 101 起（1-4 保留内置）。
+    # 合法性与启用状态由 `_validate_scene()` 在建流前判定（HTTP 400），不在 Pydantic 层拒绝：
+    # 场景清单将来由后端下发（3-3），在此写死上界只会变成第二份事实源。
+    scene: int = Field(default=1, ge=1, description="场景：1-4 内置；≥101 自定义（配置台注册）")
 
 
 # ----------------------------------------------------------------------------------
@@ -900,13 +903,46 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
     )
 
 
+async def _validate_scene(scene: int) -> None:
+    """建流前校验场景可用性（排期 2-7 / 契约 §5.2）。
+
+    为什么必须在**建流前**校验：SSE 一旦开始（200 + text/event-stream），再想表达
+    “场景不存在/已停用”就只能发一个 error 帧，前端要按“半截失败”处理；而这两类问题
+    本质是**请求不合法**，应当用 HTTP 400 一次说清。
+
+    判定口径（契约 §5.2 + Lead 与 python-store 的对齐）：
+      - 1-4 内置：无配置 = 现状（代码默认，**允许**）；有配置但 `enabled=False` → 400；
+      - ≥101 自定义：必须命中**已启用** chat 配置，否则 400（不存在与停用同一句提示，
+        因为对用户而言下一步动作相同：换场景或联系管理员）；
+      - 5~100 未定义（0 已被 Pydantic 拦下）→ 400「场景不存在」。
+    """
+    if scene in BUILTIN_CHAT_SCENES:
+        snapshot = await carrier_config.load_chat_config(scene)
+        if snapshot is not None and not snapshot.enabled:
+            # 快照没有 disabled_reason 字段（契约 §5.1），只能给通用文案；
+            # 不编造原因（“不编造”优先于“文案更详细”）。
+            raise HTTPException(status_code=400, detail="该智能体已停用，请联系管理员启用后再使用")
+        return
+    if scene < CUSTOM_SCENE_BASE:
+        # 5~100 是保留空洞（1-4 历史内置、101 起配置台分配）：属于**参数形态错误**，
+        # 沿用改造前 `le=4` 的 422 语义；而“配置停用/自定义场景未启用”是业务状态问题 → 400。
+        raise HTTPException(status_code=422, detail=f"场景不存在：{scene}")
+    snapshot = await carrier_config.load_chat_config(scene)
+    if snapshot is None:
+        raise HTTPException(status_code=400, detail="场景不存在或未启用；请刷新助手场景列表后重试")
+
+
 @router.post("/chat", summary="流式对话（SSE；token 级流式 + 会话持久化 + 断点续传）")
 async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     """返回 text/event-stream。
 
+    **建流前**先校验场景（`_validate_scene`）：非法/停用时返回 JSON 400，
+    而不是开流后发 error 帧（见该函数 docstring）。
+
     响应头显式禁用缓冲：本服务与 Java 网关侧都要保证逐帧输出
     （网关为 Servlet 输出流逐块 flush；两侧缺一不可）。
     """
+    await _validate_scene(payload.scene)
     return StreamingResponse(
         _chat_stream(payload, request),
         media_type="text/event-stream",

@@ -1,4 +1,4 @@
-"""数据库访问层（任务 0-4 / 0-12）。
+"""数据库访问层（任务 0-4 / 0-12；配置化后新增只读配置表，排期 2-3）。
 
 权限模型（重要，与 AGENTS §7.3 的关系在此澄清）：
   dkd-agent 使用的 MySQL 账号 `dkd_agent` 采用**两级授权**：
@@ -7,6 +7,13 @@
        会话、留痕、计划数据，不是"业务事实"，不违反 §7.3「业务事实唯一所有者」；
        **DELETE 一律不授予**（软删除，AGENTS §7.4），DDL 不授予。
   业务数据的一切写操作仍必须走 Java REST 回调（§7.3）。
+
+  配置化（契约 §5.1）额外引入第三类：`agent_config` / `agent_config_history` 虽然也是
+  `agent_*` 前缀，但**配置是 Java 的业务事实**（RuoYi 权限 + 审计 + 乐观锁），
+  Python 侧只有 SELECT 权限（见 create_agent_db_user.sql）。因此在代码白名单里
+  单独声明 `AGENT_READ_ONLY_TABLES`：**读允许、写必须拒绝**——若混进
+  `AGENT_OWNED_TABLES`，工具层就能绕过 Java 直接改配置，权限层虽然也会拒绝，
+  但错误会在更晚、更难解释的地方（MySQL 1142）暴露。
 
 为什么读和写用同一引擎：账号是同一个，权限由 MySQL 侧控制；用两个引擎反而会掩盖
 "误把业务表当自有表写"的错误——那种情况应该在 SQL 层就被 MySQL 拒绝。
@@ -40,6 +47,15 @@ AGENT_OWNED_TABLES = frozenset(
     }
 )
 
+# 智能体**只读**表（排期 2-3）：配置只能由 Java 写（权限 + 审计 + 乐观锁），
+# Python 侧仅读取。与 AGENT_OWNED_TABLES 互斥，不得混放（见模块 docstring）。
+AGENT_READ_ONLY_TABLES = frozenset(
+    {
+        "agent_config",
+        "agent_config_history",
+    }
+)
+
 
 class TableNotAllowedError(PermissionError):
     """访问了白名单外的表——在 SQL 到达 MySQL 之前就拦掉（AGENTS §8 拒绝路径）。"""
@@ -48,16 +64,23 @@ class TableNotAllowedError(PermissionError):
 def assert_table_allowed(table: str, *, writable: bool = False) -> None:
     """表名白名单校验（工具层 SQL 必须经此校验）。
 
-    writable=True 仅允许 agent_* 自有表；业务表写操作一律拒绝并提示走 Java 回调。
+    writable=True 仅允许 agent_* 自有表；业务表与只读配置表的写操作一律拒绝并提示
+    走 Java 回调（AGENTS §7.3、契约 §5.1）。
     """
     name = table.strip().strip("`").lower()
     if writable:
+        if name in AGENT_READ_ONLY_TABLES:
+            raise TableNotAllowedError(
+                f"禁止写只读配置表 `{name}`：配置必须由 Java 配置台保存（权限+审计+乐观锁）"
+            )
         if name not in AGENT_OWNED_TABLES:
             raise TableNotAllowedError(
                 f"禁止直接写业务表 `{name}`：写操作必须回调 Java REST（AGENTS §7.3）"
             )
         return
-    if name in AGENT_OWNED_TABLES or name in get_settings().whitelist_tables:
+    if name in AGENT_OWNED_TABLES or name in AGENT_READ_ONLY_TABLES:
+        return
+    if name in get_settings().whitelist_tables:
         return
     raise TableNotAllowedError(f"表 `{name}` 不在只读白名单内，拒绝查询")
 

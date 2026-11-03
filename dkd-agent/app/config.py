@@ -154,6 +154,15 @@ class Settings(BaseSettings):
         default=4, validation_alias="DKD_AGENT_CREATE_TASK_CONCURRENCY"
     )
 
+    # --- 智能体配置化（排期 2-3，契约 §5.1）---
+    # 总开关：默认 True（配置化是本期目标），但保留“关掉即回到改造前行为”的能力——
+    # 旧环境未执行 DDL、或配置表被误改时，运维可以不等发版就把行为切回代码默认值。
+    # 关闭后 `ConfigStore` 的所有读接口直接返回 None，调用方走 agent_defaults 默认值。
+    config_from_db: bool = Field(default=True, validation_alias="DKD_AGENT_CONFIG_FROM_DB")
+    # 缓存 TTL：Java 保存后异步 reload 是主通道，TTL 只是“reload 丢了”的兜底（契约 §4.7）。
+    # 30s 是契约拍板值：既不至于让一次保存等半分钟才生效，也不会让每个请求都打配置表。
+    config_ttl_s: float = Field(default=30.0, validation_alias="DKD_AGENT_CONFIG_TTL_S")
+
     # --- 补货基线引擎参数（Phase 1 / 任务 1-4）---
     # 为什么全部做成配置而不是常量：这些是**业务参数**（服务水平/补货周期随运营策略变），
     # 排期 3-6/5-2 要按复盘结果迭代它们；硬编码会让“调参”变成“改代码+发版”。

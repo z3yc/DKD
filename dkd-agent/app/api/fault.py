@@ -26,8 +26,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.restock import require_user_id
 from app.config import get_settings
 from app.graphs.fault_confirm import ConfirmResult, confirm_fault_dispatch
-from app.graphs.fault_graph import FaultDeps, run_fault_diagnosis
+from app.graphs.fault_graph import DEFAULT_WINDOW_HOURS, FaultDeps, run_fault_diagnosis
 from app.security import require_agent_gateway
+from app.services import carrier_config
 
 router = APIRouter(
     prefix="/agent/fault", tags=["fault"], dependencies=[Depends(require_agent_gateway)]
@@ -35,16 +36,19 @@ router = APIRouter(
 
 logger = logging.getLogger("dkd.agent.api.fault")
 
-DEFAULT_WINDOW_HOURS = 24
-
 
 class StartRunRequest(BaseModel):
-    """发起诊断入参（camelCase 对外，内部 snake_case）。"""
+    """发起诊断入参（camelCase 对外，内部 snake_case）。
+
+    `windowHours` 缺省为 `None`（不再是 24）：排期 2-7 要求「未指定时取配置的
+    `params.window_hours`，配置缺失才回代码默认 24」。若这里仍默认 24，请求方就永远
+    分不清“用户显式要 24 小时”与“用户没填”——配置值会静默失效（契约 §5.2）。
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
     inner_code: str = Field(alias="innerCode", min_length=1, max_length=64)
-    window_hours: int = Field(default=DEFAULT_WINDOW_HOURS, alias="windowHours", ge=1, le=87600)
+    window_hours: int | None = Field(default=None, alias="windowHours", ge=1, le=87600)
 
 
 class ConfirmRequest(BaseModel):
@@ -78,9 +82,17 @@ async def start_run(payload: StartRunRequest, request: Request) -> dict[str, Any
     为它引入任务队列会让"谁在跑、跑到哪"多一套状态；等批量巡检（F-15）再考虑异步。
     """
     deps = _deps(request)
+    # 2-7：请求未指定窗口时取 fault 配置的 params.window_hours（缺失 → 24 = 现状）。
+    # 只在这里解析“窗口”而不把配置搬进图签名：旧调用方（脚本/测试）不受影响；
+    # 置信度阈值与 agent_run.config_version 由 run_fault_diagnosis 内部按同一份快照解析。
+    window_hours = payload.window_hours
+    if window_hours is None:
+        snapshot = await carrier_config.load_fault_config()
+        params = getattr(snapshot, "params", None) or {}
+        window_hours = int(params.get("window_hours") or DEFAULT_WINDOW_HOURS)
     try:
         state = await run_fault_diagnosis(
-            deps, inner_code=payload.inner_code, window_hours=payload.window_hours
+            deps, inner_code=payload.inner_code, window_hours=window_hours
         )
     except Exception as exc:  # noqa: BLE001 —— 上游/DB 故障统一 502，不把堆栈透给前端
         logger.warning(

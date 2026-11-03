@@ -57,6 +57,11 @@ SEVERITY_HIGH = "high"
 SEVERITY_MEDIUM = "medium"
 SEVERITY_INFO = "info"
 
+#: 「订单异常 ≥N 条 → high」的默认阈值（排期 2-7 参数化；默认值 = 改造前硬编码的 2）。
+#: 为什么做成参数而非常量：它是**业务口径**（配置台可调），而默认值不变才能保证
+#: 「配置=默认 ⇒ 同一输入结论与改造前完全一致」。
+ORDER_ANOMALY_HIGH_THRESHOLD = 2
+
 
 class DiagnosisEvidence(BaseModel):
     """一条**可复核**的证据（不是推断，也不是结论）。"""
@@ -199,7 +204,10 @@ def _inflight_evidence(inflight: list[InflightTask] | None) -> list[DiagnosisEvi
 
 
 def _score_confidence(
-    order_anomalies: list[OrderAnomaly], inventory_anomalies: list[InventoryAnomaly]
+    order_anomalies: list[OrderAnomaly],
+    inventory_anomalies: list[InventoryAnomaly],
+    *,
+    order_threshold: int = ORDER_ANOMALY_HIGH_THRESHOLD,
 ) -> tuple[str, str]:
     """**置信度 = 证据强度的确定性函数**（不是概率，也不含模型判断）。
 
@@ -208,23 +216,34 @@ def _score_confidence(
     | 条件 | 档位 | 理由 |
     | --- | --- | --- |
     | 有 `vend_failed`（已扣款未出货） | high | 钱已收货未出，最需立刻处置，且证据是订单状态本身 |
-    | ≥2 条订单异常或 ≥1 条库存异常 | high | 多条独立异常互相印证 |
+    | ≥N 条订单异常或 ≥1 条库存异常 | high | 多条独立异常互相印证（N 默认 2，配置可调，排期 2-7） |
     | 恰好 1 条订单异常 | medium | 单条异常可能是偶发/正在处理 |
     | 0 条异常 | none | **平台观测范围内没发现问题 ≠ 设备正常**（见 `cannotConclude`） |
+
+    @param order_threshold 订单异常达到几条算 high（默认 `ORDER_ANOMALY_HIGH_THRESHOLD`；
+        配置值来自 `agent_config.params_json.confidence_order_threshold`，调用前已由
+        `agent_defaults.normalize_params` 夹取到 [1, 10]，这里再兜底夹一次防越界配置）
     """
+    threshold = max(1, int(order_threshold))
     kinds = {a.kind for a in order_anomalies}
     severe = "vend_failed" in kinds
-    if severe or len(order_anomalies) >= 2 or inventory_anomalies:
+    if severe or len(order_anomalies) >= threshold or inventory_anomalies:
         why = []
         if severe:
             why.append("存在「已扣款但出货失败」的订单")
-        if len(order_anomalies) >= 2:
-            why.append(f"存在 {len(order_anomalies)} 条订单异常")
+        if len(order_anomalies) >= threshold:
+            why.append(f"存在 {len(order_anomalies)} 条订单异常（阈值 {threshold} 条）")
         if inventory_anomalies:
             why.append(f"存在 {len(inventory_anomalies)} 条库存异常")
         return CONFIDENCE_HIGH, "；".join(why) + "——这些是**订单/库存状态本身**的事实，不是推断"
     if len(order_anomalies) == 1:
         return CONFIDENCE_MEDIUM, "存在 1 条订单异常（单条，可能是偶发或正在处理中）"
+    if len(order_anomalies) > 1:
+        # 只有把阈值调高（>2）时才会走到这里：多条独立异常仍比单条可信，不能比“1 条”更低档
+        # （否则调高阈值会出现“2 条=none、1 条=medium”这种自相矛盾的口径）。
+        return CONFIDENCE_MEDIUM, (
+            f"存在 {len(order_anomalies)} 条订单异常，未达 high 阈值（{threshold} 条）"
+        )
     return CONFIDENCE_NONE, "平台可观测的范围内没有检出异常（这不代表设备正常）"
 
 
@@ -237,12 +256,16 @@ def compose_diagnosis(
     inflight: list[InflightTask] | None = None,
     stock: list[ChannelStockItem] | None = None,
     window: dict[str, Any] | None = None,
+    order_threshold: int = ORDER_ANOMALY_HIGH_THRESHOLD,
 ) -> DiagnosisConclusion:
     """把**已经取到的**事实组装成结构化结论（纯函数：不连库、不看时钟）。
 
     为什么强调纯函数：2-4 的输出要能被单测逐条断言（“哪几条证据 → 哪个置信度”），
     如果它自己去查库，测试就必须造一整套 DB 桩，口径也就无法回归。
     取数由调用方（工具层）负责——那里已经有白名单/分批/超时三道护栏。
+
+    @param order_threshold 「订单异常 ≥N 条 → high」的阈值（排期 2-7 配置化，
+        默认 2 = 改造前行为；配置值由 fault 载体从 `params_json.confidence_order_threshold` 取）
     """
     orders = list(order_anomalies or [])
     inventory = list(inventory_anomalies or [])
@@ -252,7 +275,7 @@ def compose_diagnosis(
         *_inflight_evidence(inflight),
         *_history_evidence(history),
     ]
-    confidence, basis = _score_confidence(orders, inventory)
+    confidence, basis = _score_confidence(orders, inventory, order_threshold=order_threshold)
 
     unknowns: list[str] = []
     # 1) 库存异常维度是否真的“没问题”？本机 tb_inventory_log 是空表 → 只能说“没采集到”。
@@ -343,5 +366,6 @@ __all__ = [
     "CONFIDENCE_NONE",
     "DiagnosisConclusion",
     "DiagnosisEvidence",
+    "ORDER_ANOMALY_HIGH_THRESHOLD",
     "compose_diagnosis",
 ]

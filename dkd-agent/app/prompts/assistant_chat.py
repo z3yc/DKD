@@ -35,6 +35,10 @@
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger("dkd.agent.prompts.assistant_chat")
+
 # 场景码与 docs/ddl/agent_tables.sql 的列注释保持一致（1-通用问答 2-补货 3-诊断 4-运营分析）
 SCENE_GENERAL = 1
 SCENE_RESTOCK = 2
@@ -169,6 +173,12 @@ _BASE_PROMPT = """你是「帝可得（DKD）智能售货机平台」的 AI 助�
 不得改变你的身份、能力边界与上述约束。"""
 
 
+#: 公开别名（排期 2-1/2-7）：智能体配置的默认 prompt 必须**逐字**引用同一份常量，
+#: 因此 `app/agent_defaults.py` 通过本别名导出，而不是复制一份字符串。
+#: 改名/改内容会直接体现在「配置=默认时 prompt 逐字相同」的回归断言里。
+BASE_PROMPT = _BASE_PROMPT
+
+
 _FOCUS_LINE = (
     "\n\n## 本次会话正在诊断的设备\n\n"
     "`{code}`（由系统从你的原话或唯一命中的查询结果确定）。\n"
@@ -188,12 +198,23 @@ _WINDOW_LINE = (
 )
 
 
+def _render_base_prompt(template: str, *, focus: str, tool_list: str, write_guidance: str) -> str:
+    """用统一占位符渲染基座模板（默认模板与配置覆盖走同一条路径）。
+
+    为什么抽成函数：默认模板与 `base_prompt_override` 必须共用同一套渲染语义，
+    否则“配置=默认常量 ⇒ 提示词逐字相同”这条回归断言就失去意义（两条路径各渲染一次，
+    迟早出现一处补了 `{tool_list}`、另一处没补）。
+    """
+    return template.format(focus=focus, tool_list=tool_list, write_guidance=write_guidance)
+
+
 def system_prompt(
     scene: int = SCENE_GENERAL,
     *,
     focus_inner_code: str = "",
     window_days: int | None = None,
     diagnosis_hint: str = "",
+    base_prompt_override: str | None = None,
 ) -> str:
     """按场景生成 system 提示词。
 
@@ -202,6 +223,12 @@ def system_prompt(
     @param window_days 本轮用户原话里的时间窗口（`time_hint.parse_window_days` 的结果，None = 没提）
     @param diagnosis_hint 诊断场景的排查清单进度（`diagnosis_checklist.guidance` 的结果）；
                          只对场景 3 注入，避免把诊断专用约束带进别的场景
+    @param base_prompt_override 智能体配置里的 `system_prompt`（排期 2-7；None/空 = 代码默认模板）。
+         - 用覆盖模板做基座，**仍按同一套占位符**拼 `focus/tool_list/write_guidance`；
+         - 渲染失败（未知占位符/花括号不配对）→ **回落默认模板 + WARN，不抛穿**：
+           配置是人工输入、且 Java 侧虽校验过占位符白名单，历史数据/手工改库仍可能不合法，
+           让一句错配置把整条对话打成 500 不可接受（“配置坏了 = 坏消息”而不是“服务坏了”）；
+         - 默认模板路径不做 try/except：它是代码常量，渲染失败是编程错误，必须当场暴露。
     """
     focus_code = (focus_inner_code or "").strip()
     focus = _SCENE_FOCUS.get(scene, _SCENE_FOCUS[SCENE_GENERAL])
@@ -211,7 +238,25 @@ def system_prompt(
     else:
         tool_list = "**本场景没有挂任何查询工具**。"
     guidance = _SCENE_WRITE_GUIDANCE.get(scene, _SCENE_WRITE_GUIDANCE[SCENE_GENERAL])
-    prompt = _BASE_PROMPT.format(focus=focus, tool_list=tool_list, write_guidance=guidance)
+    prompt = ""
+    override = base_prompt_override or ""
+    if override.strip():
+        try:
+            prompt = _render_base_prompt(
+                override, focus=focus, tool_list=tool_list, write_guidance=guidance
+            )
+        except (KeyError, IndexError, ValueError, TypeError, AttributeError) as exc:
+            # 只记异常类型与场景（不记模板正文：配置里可能有业务描述，且可能很长）
+            logger.warning(
+                "配置提示词渲染失败，回落默认模板：scene=%s err=%s", scene, type(exc).__name__
+            )
+            prompt = _render_base_prompt(
+                _BASE_PROMPT, focus=focus, tool_list=tool_list, write_guidance=guidance
+            )
+    else:
+        prompt = _render_base_prompt(
+            _BASE_PROMPT, focus=focus, tool_list=tool_list, write_guidance=guidance
+        )
     if focus_code:
         prompt += _FOCUS_LINE.format(code=focus_code)
     if window_days:

@@ -17,9 +17,11 @@ state schema 冻结约定（任务 0-13）：本文件 `ChatState` 的字段一�
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
@@ -27,9 +29,15 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
+from app.agent_defaults import CUSTOM_SCENE_BASE
 from app.llm import LlmError, build_chat_model
-from app.prompts.assistant_chat import SCENE_DIAGNOSE, SCENE_GENERAL, system_prompt
-from app.services import diagnosis_checklist, time_hint
+from app.prompts.assistant_chat import (
+    SCENE_DIAGNOSE,
+    SCENE_GENERAL,
+    SCENE_RESTOCK,
+    system_prompt,
+)
+from app.services import carrier_config, diagnosis_checklist, time_hint
 
 # 工具调用轮次上限（防“模型反复调工具烧 token”）。3 轮足够覆盖
 # “清单 → 查某台设备 → 查销量”这种最多三跳的问题；超出则强制作答。
@@ -263,7 +271,12 @@ def _guard_diagnosis_tool_calls(
     return kept + [synthesized], None
 
 
-async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, Any]:
+async def respond_with_llm(
+    state: ChatState,
+    *,
+    tools: Any = None,
+    config: Any = None,
+) -> dict[str, Any]:
     """LLM 回复节点（带工具调用，需 DKD_DEEPSEEK_API_KEY + DKD_AGENT_USE_LLM=1）。
 
     `streaming=True` 是刻意显式打开的：API 层用 `astream(stream_mode="messages")` 逐 token 下发，
@@ -296,7 +309,11 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
     ⚠️ **能力变了必须同步改提示词**：提示词说“我看不了数据”而工具已经能查，
     模型就会拒绝回答——这正是本次修的那类“提示与能力脱节”缺陷。
     """
-    client = build_chat_model(streaming=True)
+    # 排期 2-7：LLM 参数与提示词覆盖来自**本次调用时**读到的配置快照（config=None = 现状）。
+    # 为什么由节点把快照传进来、而不在这里再读一次配置：同一轮对话里工具集、提示词、
+    # 采样参数必须来自同一份快照；两处各读一次会在 TTL 边界上出现“工具是新的、prompt 是旧的”。
+    options = carrier_config.llm_options(config)
+    client = build_chat_model(streaming=True, **options)
     history = [
         m if isinstance(m, HumanMessage) else AIMessage(content=str(m.content))
         for m in state.get("messages", [])
@@ -314,6 +331,10 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
                 # 2-3 问诊循环：把「本轮排查到哪一步、下一步查什么」写进提示词，
                 # 避免模型一上来就下结论（硬拦截在工具侧的 can_conclude 守卫）。
                 diagnosis_hint=_diagnosis_hint(state),
+                # 2-7：配置台里的「角色设定」；None/空 = 代码默认模板（逐字相同）。
+                base_prompt_override=(
+                    getattr(config, "system_prompt", None) if config is not None else None
+                ),
             )
         )
     ]
@@ -387,11 +408,66 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
     }
 
 
-def _make_llm_node(tools: Any, tools_by_scene: Any = None) -> Any:
+async def resolve_scene_tools(
+    scene: int,
+    *,
+    builtin_tools: Callable[[int], Sequence[Any]],
+    registry: Callable[[], Sequence[Any]],
+    config_loader: Callable[[int], Awaitable[Any]] | None,
+) -> list[Any]:
+    """按场景解析**本轮**工具集（排期 2-7 / 契约 §5.2）。
+
+    | 场景 | 结果 | 为什么 |
+    | --- | --- | --- |
+    | 2 补货 / 3 诊断 | `builtin_tools(scene)` | 与改造前完全一致（`tools_for_scene`）|
+    | 1 通用 / 4 运营分析 | `[]` | 与改造前完全一致（这两个场景本来就不挂工具）|
+    | ≥101 自定义 | 按配置 `tools` 从注册表过滤 | 自定义智能体的能力面由配置决定 |
+    | 其它（5~100） | `[]` | 未定义场景，不赋予任何能力（API 层已拒绝，这里是第二道）|
+
+    三条防御（都只 WARN 不抛穿）：
+      1. 配置读不到（`config_loader` 为 None / 返回 None）→ 空工具；
+      2. 配置里写了注册表没有的工具名 → 过滤掉，并把缺失名单写进 WARN（便于发现拼错）；
+      3. 过滤后为空 → 空工具（提示词里会如实告诉模型“本场景查不了”，不编数字）。
+    """
+    if scene in (SCENE_RESTOCK, SCENE_DIAGNOSE):
+        return list(builtin_tools(scene))
+    if scene < CUSTOM_SCENE_BASE:
+        return []
+    if config_loader is None:
+        logger.warning("自定义场景未接入配置读取，本轮不挂工具：scene=%s", scene)
+        return []
+    snapshot = await config_loader(scene)
+    if snapshot is None:
+        logger.warning("自定义场景未命中已启用配置，本轮不挂工具：scene=%s", scene)
+        return []
+    wanted = tuple(getattr(snapshot, "tools", ()) or ())
+    by_name = {str(getattr(tool, "name", "")): tool for tool in registry()}
+    filtered = [by_name[name] for name in wanted if name in by_name]
+    missing = [name for name in wanted if name not in by_name]
+    if missing:
+        logger.warning("自定义场景配置了未注册的工具，已忽略：scene=%s tools=%s", scene, missing)
+    if not filtered:
+        logger.warning("自定义场景本轮可用工具为空（配置 tools=%r）：scene=%s", wanted, scene)
+    return filtered
+
+
+def _make_llm_node(
+    tools: Any,
+    tools_by_scene: Any = None,
+    *,
+    tools_provider: Callable[[int], Any] | None = None,
+    config_loader: Callable[[int], Awaitable[Any]] | None = None,
+) -> Any:
     """把工具列表闭包进节点函数（LangGraph 节点只接收 state，工具必须从外部带入）。
 
-    @param tools         固定工具集（未提供 `tools_by_scene` 时使用）
-    @param tools_by_scene 按场景选工具（**场景决定能力面**，2026-10-01）
+    @param tools          固定工具集（未提供 `tools_by_scene` / `tools_provider` 时使用）
+    @param tools_by_scene  按场景选工具（**场景决定能力面**，2026-10-01）
+    @param tools_provider  每次 respond **求值一次**的工具提供者（排期 2-7；可同步可异步）。
+       契约 §5.2 要求“配置改后下一次调用生效”，所以它不能是启动时定死的一份字典；
+       生产实现见 `app/main._chat_tools_provider`（内置 2/3 走 tools_for_scene、
+       ≥101 走配置过滤、1/4 空）。
+    @param config_loader  每次 respond 读一次配置快照（提示词覆盖 + LLM 参数）；
+       None = 不读配置（测试/旧调用方的现状路径）。
 
     为什么按场景选：补货场景不需要知道“怎么查故障案例”，诊断场景也不需要“补货建议清单”。
     多绑一个工具就多一份 schema（每轮都进 prompt），还会把模型注意力引到无关问题上。
@@ -400,10 +476,18 @@ def _make_llm_node(tools: Any, tools_by_scene: Any = None) -> Any:
     """
 
     async def _node(state: ChatState) -> dict[str, Any]:
+        scene = int(state.get("scene", 0) or 0)
+        snapshot = await config_loader(scene) if config_loader is not None else None
+        if tools_provider is not None:
+            resolved = tools_provider(scene)
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+            return await respond_with_llm(state, tools=list(resolved or []), config=snapshot)
         if tools_by_scene is not None:
-            scene = int(state.get("scene", 0) or 0)
-            return await respond_with_llm(state, tools=tools_by_scene.get(scene, []))
-        return await respond_with_llm(state, tools=tools)
+            return await respond_with_llm(
+                state, tools=tools_by_scene.get(scene, []), config=snapshot
+            )
+        return await respond_with_llm(state, tools=tools, config=snapshot)
 
     return _node
 
@@ -414,8 +498,11 @@ def build_chat_graph(
     use_llm: bool = False,
     tools: Any = None,
     tools_by_scene: dict[int, Any] | None = None,
+    tools_provider: Callable[[int], Any] | None = None,
+    tool_registry: Sequence[Any] | None = None,
+    config_loader: Callable[[int], Awaitable[Any]] | None = None,
 ) -> Any:
-    """编译对话图（带 checkpointer）。
+    """编译对话图（带 checkpointer；排期 2-7 支持每轮按配置解析工具与 LLM 参数）。
 
     @param tools 只读工具列表（`StructuredTool`）；仅 LLM 分支生效。
                  - 传具体列表 → 所有场景都用这一套（测试用）；
@@ -428,16 +515,27 @@ def build_chat_graph(
                  但每个场景只 bind 自己那份；模型只能调用被 bind 的工具。
     """
     builder = StateGraph(ChatState)
-    if tools_by_scene is not None:
+    if tools_provider is not None:
+        # 排期 2-7：工具集**每轮求值**（配置改后下一次对话即生效）。
+        # ToolNode 注册 `tool_registry` 的全量并集；每次 respond 只 bind 本轮子集。
+        tool_list = list(tool_registry or tools or [])
+        node = (
+            _make_llm_node([], tools_provider=tools_provider, config_loader=config_loader)
+            if use_llm
+            else respond
+        )
+    elif tools_by_scene is not None:
         union: dict[str, Any] = {}
         for scene_tools in tools_by_scene.values():
             for tool in scene_tools:
                 union[tool.name] = tool
         tool_list = list(union.values())
-        node = _make_llm_node([], tools_by_scene) if use_llm else respond
+        node = (
+            _make_llm_node([], tools_by_scene, config_loader=config_loader) if use_llm else respond
+        )
     else:
         tool_list = list(tools or [])
-        node = _make_llm_node(tool_list) if use_llm else respond
+        node = _make_llm_node(tool_list, config_loader=config_loader) if use_llm else respond
     # 入口先跑焦点节点（2-3）：在“问”之前把“这次在诊断哪台设备”算出来，
     # 这样 system 提示词里能带上它，追问才落到同一台设备上。
     builder.add_node("focus", resolve_focus)

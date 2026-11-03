@@ -13,7 +13,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+logger = logging.getLogger("dkd.agent.prompts.restock_calibration")
 
 # 系数上下限与代码里的夹取保持一致（app/graphs/restock_calibration.py）
 FACTOR_MIN = 0.7
@@ -52,6 +55,23 @@ def build_user_prompt(payload: dict[str, Any]) -> str:
     )
 
 
-def system_prompt(*, factor_min: float = FACTOR_MIN, factor_max: float = FACTOR_MAX) -> str:
-    """按配置渲染 system 提示词（上下限来自配置，避免提示词与代码夹取范围不一致）。"""
-    return SYSTEM_PROMPT.format(fmin=factor_min, fmax=factor_max)
+def system_prompt(
+    *,
+    factor_min: float = FACTOR_MIN,
+    factor_max: float = FACTOR_MAX,
+    template_override: str | None = None,
+) -> str:
+    """按配置渲染 system 提示词（上下限来自配置，避免提示词与代码夹取范围不一致）。
+
+    @param template_override 智能体配置里的 `system_prompt`（排期 2-7；None/空 = 模块常量）。
+        seed 里的 restock 提示词就是 `SYSTEM_PROMPT` 原文，因此**默认参数下渲染结果与
+        改造前逐字相同**（这是「配置=默认 ⇒ 行为不变」的回归锚点）。
+        override 渲染失败（未知占位符/花括号不配对）→ 回落 `SYSTEM_PROMPT` + WARN，
+        不把一条坏配置抛成 500（配置是人工输入，Java 侧虽校验白名单，历史数据仍可能不合法）。
+    """
+    template = template_override if (template_override or "").strip() else SYSTEM_PROMPT
+    try:
+        return template.format(fmin=factor_min, fmax=factor_max)
+    except (KeyError, IndexError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning("配置的补货提示词渲染失败，回落代码默认模板：err=%s", type(exc).__name__)
+        return SYSTEM_PROMPT.format(fmin=factor_min, fmax=factor_max)

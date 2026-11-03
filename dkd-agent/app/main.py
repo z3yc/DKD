@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -22,15 +23,32 @@ from app.checkpoint import (
 )
 from app.config import get_settings
 from app.db import dispose_engine
-from app.graphs.chat_graph import build_chat_graph
+from app.graphs.chat_graph import build_chat_graph, resolve_scene_tools
 from app.llm import build_chat_model
 from app.logging_conf import RequestContextMiddleware, setup_logging
 from app.obs.run_recorder import sweep_stale_runs
-from app.prompts.assistant_chat import SCENE_DIAGNOSE, SCENE_RESTOCK
+from app.services import carrier_config
 from app.services.restock_analyzer import build_default_analyzer
 from app.tools.assistant_tools import all_assistant_tools, tools_for_scene
 
 logger = logging.getLogger("dkd.agent")
+
+
+async def _chat_tools_provider(scene: int) -> list[Any]:
+    """按场景解析**本轮**工具集（排期 2-7 / 契约 §5.2）。
+
+    为什么放在装配层而不是图里：图不该知道“工具注册表与配置从哪来”，它只承诺
+    “每次 respond 前调用一次 provider”——这样配置改后**下一次对话**即生效（不必重启）。
+    解析规则见 `chat_graph.resolve_scene_tools`：
+      1/4 → 无工具；2/3 → `tools_for_scene(scene)`（**行为与改造前完全一致**）；
+      ≥101 → 按配置 `tools` 从注册表过滤（配置写坏 → 空工具 + WARN，不抛穿）。
+    """
+    return await resolve_scene_tools(
+        scene,
+        builtin_tools=tools_for_scene,
+        registry=all_assistant_tools,
+        config_loader=carrier_config.load_chat_config,
+    )
 
 
 @asynccontextmanager
@@ -80,14 +98,17 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     #   场景 1/4 = 不挂工具（提示词也如实说“本场景查不了”，不许凭印象编数）。
     # 写操作**不在这里**：建单/确认/调整一律走页面人工确认（AGENTS §7.9），
     # 工具集里没有任何写工具，且有测试断言这一点。
+    # 排期 2-7：工具集改为**每轮按场景求值**（`tools_provider`），而不是启动时把 2/3 两套
+    # 写死——否则「新增/停用自定义场景」「改工具子集」必须重启服务。ToolNode 仍注册全量并集
+    # （`tool_registry`）：模型只能 bind 到本轮子集，但工具节点必须认识所有可能被请求的工具。
+    # `config_loader` 负责提示词覆盖与 LLM 参数（温度/上限/重试/超时/模型）每轮从配置读；
+    # 配置不可读时它返回 None → 逐字回现状（契约 §5.2）。
     app.state.chat_graph = build_chat_graph(
         checkpointer=store.saver,
         use_llm=s.use_llm,
-        tools_by_scene=(
-            {scene: tools_for_scene(scene) for scene in (SCENE_RESTOCK, SCENE_DIAGNOSE)}
-            if s.use_llm
-            else None
-        ),
+        tools_provider=_chat_tools_provider if s.use_llm else None,
+        tool_registry=all_assistant_tools() if s.use_llm else None,
+        config_loader=carrier_config.load_chat_config,
     )
     # 补货工作台服务（1-7）：真实 store + 真实只读依赖；测试可用 app.state.restock_service 整体替换
     app.state.restock_service = restock.build_default_service()
@@ -152,6 +173,11 @@ def create_app() -> FastAPI:
             "checkpoint_location": checkpoint_location,
             "checkpoint_open": checkpoint_open,
             "whitelist_tables": len(s.whitelist_tables),
+            # 2-7/2-8：配置来源开关与 TTL。**只报配置值，不在这里连库**——
+            # 健康检查必须能在 DB 不可达/表未建时照常应答，而那正是它最有用的时刻。
+            # `config_from_db=False` 即「一键回落纯代码默认」，是灰度回退的判据。
+            "config_from_db": s.config_from_db,
+            "config_ttl_s": s.config_ttl_s,
         }
 
     @app.exception_handler(StarletteHTTPException)

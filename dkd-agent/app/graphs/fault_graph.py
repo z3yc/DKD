@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -35,11 +35,14 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 
 from app.config import Settings
+from app.config_store import AgentConfigSnapshot
 from app.db import get_sessionmaker
 from app.graphs.fault_state import FaultState
 from app.obs.run_recorder import finish_run, record_step, record_tool_call, start_run
+from app.services import carrier_config
 from app.services.diagnosis import (
     CONFIDENCE_NONE,
+    ORDER_ANOMALY_HIGH_THRESHOLD,
     DiagnosisConclusion,
     DiagnosisEvidence,
     compose_diagnosis,
@@ -61,7 +64,11 @@ PRIORITY_LOW = 1
 PRIORITY_MEDIUM = 2
 PRIORITY_HIGH = 3
 
+#: 诊断窗口的代码默认值（配置 `params.window_hours` 缺失时的回落；排期 2-7）
 DEFAULT_WINDOW_HOURS = 24
+
+#: 「订单异常 ≥N 条 → high」的默认阈值（= 改造前硬编码的 2；配置值见 `params_json`）
+DEFAULT_CONFIDENCE_ORDER_THRESHOLD = ORDER_ANOMALY_HIGH_THRESHOLD
 
 # 证据 kind 前缀 → 产出它的工具。回溯不到工具调用 = 证据不可复核 = 必须丢弃（F-07）
 KIND_TO_TOOL: dict[str, str] = {
@@ -595,8 +602,16 @@ def _diagnose_summary(conclusion: DiagnosisConclusion, trace: EvidenceTrace) -> 
     )
 
 
-def _make_diagnose_node(deps: FaultDeps) -> Callable[[FaultState], Any]:
-    """构造诊断官节点（闭包持有依赖，测试可注入假 deps）。"""
+def _make_diagnose_node(
+    deps: FaultDeps,
+    *,
+    confidence_threshold: int = DEFAULT_CONFIDENCE_ORDER_THRESHOLD,
+) -> Callable[[FaultState], Any]:
+    """构造诊断官节点（闭包持有依赖，测试可注入假 deps）。
+
+    @param confidence_threshold 「订单异常 ≥N 条 → high」阈值（排期 2-7 配置化；
+        默认 2 = 改造前硬编码值，配置缺失/未启用时行为逐字不变）
+    """
 
     async def diagnose(state: FaultState) -> FaultState:
         run_id = state["run_id"]
@@ -648,6 +663,7 @@ def _make_diagnose_node(deps: FaultDeps) -> Callable[[FaultState], Any]:
             inflight=facts["inflight"],
             stock=facts["stock"],
             window=facts["window"],
+            order_threshold=confidence_threshold,
         )
         trace = trace_evidence(conclusion, facts=facts, tool_calls=calls)
 
@@ -703,11 +719,20 @@ def _pass_through(state: FaultState) -> FaultState:  # noqa: ARG001 —— 节�
     return {}
 
 
-def build_fault_graph(deps: FaultDeps) -> Any:
-    """编译故障诊断图（M3：supervisor + 诊断官 + 派单官；M4 再加审核官）。"""
+def build_fault_graph(
+    deps: FaultDeps,
+    *,
+    confidence_threshold: int = DEFAULT_CONFIDENCE_ORDER_THRESHOLD,
+) -> Any:
+    """编译故障诊断图（M3：supervisor + 诊断官 + 派单官；M4 再加审核官）。
+
+    @param confidence_threshold 置信度阈值（见 `_make_diagnose_node`；配置接入点）
+    """
     builder = StateGraph(FaultState)
     builder.add_node("supervisor", _pass_through)
-    builder.add_node(ROLE_DIAGNOSTICIAN, _make_diagnose_node(deps))
+    builder.add_node(
+        ROLE_DIAGNOSTICIAN, _make_diagnose_node(deps, confidence_threshold=confidence_threshold)
+    )
     builder.add_node(ROLE_DISPATCHER, _make_dispatch_node(deps))
     builder.add_edge(START, "supervisor")
     builder.add_conditional_edges(
@@ -724,18 +749,66 @@ def build_fault_graph(deps: FaultDeps) -> Any:
     return builder.compile()
 
 
+def _config_int(
+    snapshot: AgentConfigSnapshot | None,
+    key: str,
+    default: int,
+) -> int:
+    """从配置 `params` 取整数（缺失/非数值 → 代码默认，不抛异常）。
+
+    数值合法性已由 `config_store` 调 `agent_defaults.normalize_params` 夹取过；
+    这里仍容错一次，是因为快照可能来自测试注入/未来新增的参数键——配置读坏不得让诊断 500。
+    """
+    params = getattr(snapshot, "params", None) or {}
+    value = params.get(key)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("故障配置参数非法，回落代码默认：key=%s value=%r", key, value)
+        return default
+
+
 async def run_fault_diagnosis(
     deps: FaultDeps,
     *,
     inner_code: str,
-    window_hours: int = DEFAULT_WINDOW_HOURS,
+    window_hours: int | None = None,
     trigger_type: int = 3,
+    config_version: int | None = None,
+    confidence_threshold: int | None = None,
+    config_loader: Callable[[], Awaitable[AgentConfigSnapshot | None]] | None = None,
 ) -> FaultState:
     """跑一次故障诊断（含派单提案）：建 run → 跑图 → 收尾（失败也收尾，页面不会永远转圈）。
 
     @param trigger_type 1-用户 2-定时任务 3-人工干预（首期由页面按钮触发，固定 3）
+    @param window_hours 诊断窗口（小时）；`None` → 取 fault 配置 `params.window_hours`，
+        配置缺失回落 `DEFAULT_WINDOW_HOURS`=24（排期 2-7；**未配置=现状**）
+    @param config_version 本次实际生效配置版本；`None` → 用本次读到的快照版本；
+        配置回落/DB 关闭 → 仍为 `None`（排期 2-8：**不编造版本号**）
+    @param confidence_threshold 置信度阈值；`None` → 取配置 `params.confidence_order_threshold`，
+        回落 2（= 改造前硬编码行为）
+    @param config_loader 测试注入的配置加载器（默认读 `agent_config` 的 fault 行）
     @return 最终 state（含 diagnosis / dispatch_proposal / dispatch_allowed）
     """
+    # 2-7/2-8：**运行开始时**读一次配置（TTL 缓存命中时是内存读）。
+    # 为什么不在 API 层读完全部值再传进来：旧调用方（测试/脚本）只传 window_hours，
+    # 把阈值/版本也塞进函数签名会逼所有调用方改签名；这里统一解析，API 只管请求参数。
+    snapshot = await (config_loader or carrier_config.load_fault_config)()
+    effective_window = (
+        window_hours
+        if window_hours is not None
+        else _config_int(snapshot, "window_hours", DEFAULT_WINDOW_HOURS)
+    )
+    effective_threshold = (
+        confidence_threshold
+        if confidence_threshold is not None
+        else _config_int(snapshot, "confidence_order_threshold", DEFAULT_CONFIDENCE_ORDER_THRESHOLD)
+    )
+    effective_version = (
+        config_version if config_version is not None else (snapshot.version if snapshot else None)
+    )
     run_id = f"fault-{uuid.uuid4().hex[:12]}"
     await start_run(
         deps.settings,
@@ -745,13 +818,14 @@ async def run_fault_diagnosis(
         subject_type="vm",
         subject_id=inner_code,
         trigger_type=trigger_type,
+        config_version=effective_version,
         create_by="agent",
     )
-    graph = build_fault_graph(deps)
+    graph = build_fault_graph(deps, confidence_threshold=effective_threshold)
     initial: FaultState = {
         "run_id": run_id,
         "inner_code": inner_code,
-        "window_hours": window_hours,
+        "window_hours": effective_window,
         "step_no": 1,
         "diagnosis": None,
         "dispatch_allowed": False,
@@ -787,6 +861,7 @@ async def run_fault_diagnosis(
 
 
 __all__ = [
+    "DEFAULT_CONFIDENCE_ORDER_THRESHOLD",
     "DEFAULT_WINDOW_HOURS",
     "DispatchProposal",
     "EvidenceTrace",

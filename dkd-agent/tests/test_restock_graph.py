@@ -151,12 +151,25 @@ async def _interrupt_value(result: dict[str, Any]) -> dict[str, Any]:
     return dict(interrupts[0].value)
 
 
-async def _open_graph(path: Any, deps: FakeDeps, *, model: Any | None = None) -> tuple[Any, Any]:
-    """按给定检查点文件编译图，返回 (graph, store)。每次调用等价于“一次进程启动”。"""
+async def _open_graph(
+    path: Any,
+    deps: FakeDeps,
+    *,
+    model: Any | None = None,
+    settings: Settings | None = None,
+) -> tuple[Any, Any]:
+    """按给定检查点文件编译图，返回 (graph, store)。每次调用等价于“一次进程启动”。
+
+    @param settings 可选覆盖（文件级默认关闭 LLM 校准以避免误调模型；
+        需要验「校准结果真的落库」的用例显式启用，见 F-8 用例）。
+    """
     store = CheckpointStore(path)
     saver = await store.open()
     graph = build_restock_graph(
-        deps=deps, checkpointer=saver, settings=_settings(), model=model or FakeModel()
+        deps=deps,
+        checkpointer=saver,
+        settings=settings or _settings(),
+        model=model or FakeModel(),
     )
     return graph, store
 
@@ -576,7 +589,14 @@ async def test_calibrated_quantity_is_persisted_so_ui_matches_state(tmp_path):
     model = FakeModel(
         content='{"calibrations": [{"channelCode": "1-1", "factor": 1.5, "reason": "节前客流"}]}'
     )
-    graph, store = await _open_graph(tmp_path / "f8.db", deps, model=model)
+    # 排期 2-7 起校准节点改用**图装配时的 Settings**（此前它另读 get_settings()，两套口径）：
+    # 本文件默认关闭校准以免误调 LLM，验 F-8 回写必须显式启用。
+    graph, store = await _open_graph(
+        tmp_path / "f8.db",
+        deps,
+        model=model,
+        settings=_settings(DKD_AGENT_RESTOCK_CALIBRATION_ENABLED="1"),
+    )
     try:
         result = await graph.ainvoke(
             new_restock_state(plan_date=PLAN_DATE, request_id="rid-f8"),

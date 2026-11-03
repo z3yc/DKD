@@ -14,12 +14,14 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.audit import summarize_usage
+from app.config_store import get_config_store
 from app.db import get_sessionmaker
 from app.security import verify_service_secret
 from app.services.decision_audit import resolve_request_id
@@ -92,6 +94,39 @@ async def restock_analyze(
         logger.error("定时分析失败：%s", exc)
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     return {"code": 200, "msg": "ok", "data": outcome.model_dump(mode="json", by_alias=True)}
+
+
+# ------------------------------------------------------------------------------------
+# 智能体配置缓存（排期 2-3，契约 §5.1）
+# ------------------------------------------------------------------------------------
+@router.post("/config/reload", summary="清除智能体配置缓存（Java 保存后通知，排期 2-3）")
+async def reload_config() -> dict[str, object]:
+    """清空配置缓存，下一次读取回源 MySQL。
+
+    为什么做成显式接口而不是只靠 TTL：Java 保存后希望**立即**生效，TTL 30s 只是
+    reload 丢失/失败时的兜底（契约 §4.7）。本接口不返回配置内容，避免把排障接口
+    变成第二份配置视图。Java 侧调用失败只 WARN，不阻塞保存。
+    """
+    store = await get_config_store()
+    store.invalidate()
+    logger.info("智能体配置缓存已清空（Java 保存后通知）")
+    return {"code": 200, "msg": "ok", "data": {"invalidated": True}}
+
+
+@router.get("/config/effective", summary="查看某智能体当前生效配置（只读排障，排期 2-3）")
+async def effective_config(
+    code: str = Query(..., min_length=1, max_length=64, description="智能体编码，如 restock"),
+) -> dict[str, object]:
+    """返回「当前实际生效」的配置快照，用于排障（不含任何密钥/连接信息）。
+
+    `source=db` 表示读到了启用配置；`source=default` 表示三重回落生效
+    （总开关关闭 / 表缺失 / 数据损坏），此时 `config=None`，调用方实际走代码默认值。
+    这里**不**替调用方补默认值：补了就看不出“真实来源”，排障会误以为配置已生效。
+    """
+    snapshot = await (await get_config_store()).get(code)
+    if snapshot is None:
+        return {"code": 200, "msg": "ok", "data": {"source": "default", "config": None}}
+    return {"code": 200, "msg": "ok", "data": {"source": "db", "config": asdict(snapshot)}}
 
 
 def _parse_date(text: str) -> date:
