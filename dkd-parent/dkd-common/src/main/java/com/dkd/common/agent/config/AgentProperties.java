@@ -68,6 +68,23 @@ public class AgentProperties
      */
     private long analyzeRetryBackoffMs = 5000L;
 
+    /**
+     * 配置保存后是否向 Python 侧发「配置重载」通知（排期 2-2，契约 §4.7）。
+     *
+     * <p>为什么默认开：通知只是让新配置更快生效（TTL 30s 是兜底），
+     * 关掉不会出错但会让「保存后立即对话仍是旧配置」的窗口从毫秒级扩到 30s。
+     * 本地未起 Python 服务时可临时关掉，避免每次保存刷一条 WARN。
+     */
+    private boolean configReloadEnabled = true;
+
+    /**
+     * 配置重载通知的超时（毫秒），同时作为连接与读取超时。
+     *
+     * <p>为什么取 3s 而不是复用 {@link #readTimeout}：reload 是「尽力而为」的旁路通知，
+     * 它跑在异步线程里、失败只 WARN；超时取小可以避免 Python 卡住时长期占用线程。
+     */
+    private int configReloadTimeoutMs = 3000;
+
     public boolean getEnabled()
     {
         return enabled;
@@ -146,5 +163,25 @@ public class AgentProperties
     public void setAnalyzeRetryBackoffMs(long analyzeRetryBackoffMs)
     {
         this.analyzeRetryBackoffMs = analyzeRetryBackoffMs;
+    }
+
+    public boolean getConfigReloadEnabled()
+    {
+        return configReloadEnabled;
+    }
+
+    public void setConfigReloadEnabled(boolean configReloadEnabled)
+    {
+        this.configReloadEnabled = configReloadEnabled;
+    }
+
+    public int getConfigReloadTimeoutMs()
+    {
+        return configReloadTimeoutMs;
+    }
+
+    public void setConfigReloadTimeoutMs(int configReloadTimeoutMs)
+    {
+        this.configReloadTimeoutMs = configReloadTimeoutMs;
     }
 }
