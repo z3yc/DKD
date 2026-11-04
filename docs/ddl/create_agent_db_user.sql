@@ -78,6 +78,16 @@ GRANT SELECT, INSERT ON dkd.agent_log    TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'
 GRANT SELECT ON dkd.agent_tool         TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT ON dkd.agent_llm_profile  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT ON dkd.agent_llm_probe    TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+-- 2026-11-04 追加（排期 3-6/3-7，DDL 见 agent_kb_mcp.sql）：
+--   · 知识库文档/切片/检索记录属智能体自有数据（Python ingest 写入），授 SELECT/INSERT/UPDATE；
+--   · MCP server 配置由 Java 管理（Python 只读）；MCP 工具同步与探测记录由 Python 写；
+--   · 一律不授 DELETE（保留策略/清理由 Java/运维执行，AGENTS §7.4）。
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_kb_document  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_kb_chunk     TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_kb_retrieval TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT ON dkd.agent_mcp_server                   TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_mcp_tool     TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT, INSERT ON dkd.agent_mcp_probe            TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 
 FLUSH PRIVILEGES;
 
