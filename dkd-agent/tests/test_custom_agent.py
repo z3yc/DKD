@@ -33,6 +33,7 @@ from app.prompts.assistant_chat import (
     SCENE_RESTOCK,
     system_prompt,
 )
+from app.tools.assistant_tools import tools_for_scene
 
 BUILTIN_SCENES = (SCENE_GENERAL, SCENE_RESTOCK, SCENE_DIAGNOSE, SCENE_ANALYSIS)
 
@@ -286,7 +287,12 @@ async def test_llm_node_builtin_with_default_config_keeps_prompt_identical(
     async def loader(scene: int) -> AgentConfigSnapshot | None:
         return seed_chat if scene in BUILTIN_SCENES else None
 
-    node = chat_graph._make_llm_node([], tools_provider=lambda scene: [], config_loader=loader)
+    # 用“真实内置工具集”而不是 []：3-4 起提示词工具名单以**本轮实际绑定**为准，
+    # 传空工具列表等于“本场景没挂工具”，按设计会如实告知——那不是本用例要验的
+    # “配置=默认 ⇒ 逐字不变”（默认场景 2 本来就有工具）。
+    node = chat_graph._make_llm_node(
+        [], tools_provider=lambda scene: tools_for_scene(scene), config_loader=loader
+    )
     await node(make_state(SCENE_RESTOCK))
 
     assert _system_text(model) == system_prompt(SCENE_RESTOCK)
@@ -299,7 +305,9 @@ async def test_respond_with_llm_without_config_keeps_builtin_prompt(
     model = _CapturingModel()
     _install_model(monkeypatch, model)
 
-    await chat_graph.respond_with_llm(make_state(SCENE_RESTOCK), tools=[], config=None)
+    await chat_graph.respond_with_llm(
+        make_state(SCENE_RESTOCK), tools=tools_for_scene(SCENE_RESTOCK), config=None
+    )
 
     prompt = _system_text(model)
     assert _CUSTOM_SAFETY_FOOTER not in prompt

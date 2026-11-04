@@ -325,9 +325,24 @@ async def respond_with_llm(
     # 也传进来，会把内置场景误判成自定义（追加 footer、覆盖内置工具名单），
     # 破坏「配置=默认 ⇒ 提示词逐字相同」的回归锚点（tests/test_config_carrier.py）。
     custom_scene = scene >= CUSTOM_SCENE_BASE
-    tool_names_override = (
-        tuple(getattr(config, "tools", ()) or ()) if custom_scene and config is not None else None
-    )
+    # 工具通过**闭包注入**而不是放进 state：工具实例不可 JSON 序列化，
+    # 进 state 会被 checkpointer 试图序列化并报错（而且那也不属于“会话状态”）。
+    provided_tools = list(tools or [])
+    if tools is not None:
+        # 排期 3-4：提示词里的工具名单以**本轮实际绑定**为准（内置场景=注册表启用集；
+        # 自定义场景=配置 tools ∩ 注册表启用集）。停用工具不得留在 tool_list 里，
+        # 否则模型会去调一个没绑的工具（“提示与能力脱节”，本项目已踩过两次）。
+        # 内置场景必须显式 custom_safety=False：只是换工具名单，不能因此变成自定义语义
+        # （否则会追加安全 footer、换写操作约束，破坏「配置=默认 ⇒ 提示词逐字相同」）。
+        tool_names_override = tuple(str(getattr(tool, "name", "")) for tool in provided_tools)
+        custom_safety = custom_scene
+    elif custom_scene and config is not None:
+        # 调用方没传 tools（不绑定任何工具）：回配置子集渲染能力面。
+        tool_names_override = tuple(getattr(config, "tools", ()) or ())
+        custom_safety = True
+    else:
+        tool_names_override = None
+        custom_safety = None
     scene_label = (
         str(getattr(config, "name", "") or "").strip()
         if custom_scene and config is not None
@@ -353,15 +368,17 @@ async def respond_with_llm(
                 # 3-2：自定义场景的工具子集与角色名（内置场景为 None/空，行为不变）
                 tool_names_override=tool_names_override,
                 scene_label=scene_label or None,
+                # 3-4：内置场景只是换工具名单，不能因此变成自定义语义（不追加 footer）
+                custom_safety=custom_safety,
             )
         )
     ]
     messages.extend(history)
 
     rounds_used = _tool_rounds_used(state)
-    # 工具通过**闭包注入**而不是放进 state：工具实例不可 JSON 序列化，
-    # 进 state 会被 checkpointer 试图序列化并报错（而且那也不属于“会话状态”）。
-    tool_list = list(tools or [])
+    # 工具清单已在上面算好（`provided_tools`）：提示词与本轮绑定必须用**同一份**，
+    # 否则会出现“提示词说能查 A、实际只绑了 B”的能力面漂移（排期 3-4 的验收点）。
+    tool_list = provided_tools
     if tool_list and rounds_used < MAX_TOOL_ROUNDS:
         try:
             call_model = client.bind_tools(tool_list)
@@ -426,29 +443,72 @@ async def respond_with_llm(
     }
 
 
+async def _enabled_tool_codes(tool_registry: Any) -> set[str] | None:
+    """工具注册表的「启用且只读」工具名集合；未注入/读取失败 → None（不过滤，回现状）。
+
+    为什么失败回 None 而不是空集：注册表是**开关增强层**（排期 3-4），读取失败时
+    行为应回到改造前（内置候选全给），而不是“一个工具都不给”把助手能力整体打没。
+    """
+    if tool_registry is None:
+        return None
+    try:
+        enabled = await tool_registry.list_enabled(scope="chat")
+    except Exception as exc:  # noqa: BLE001 —— 开关层是旁路，不得把对话打成 500
+        logger.warning("工具注册表读取失败，本轮不过滤工具（回落现状）：%s", type(exc).__name__)
+        return None
+    return {str(getattr(entry, "code", "")) for entry in enabled if getattr(entry, "code", "")}
+
+
 async def resolve_scene_tools(
     scene: int,
     *,
     builtin_tools: Callable[[int], Sequence[Any]],
     registry: Callable[[], Sequence[Any]],
     config_loader: Callable[[int], Awaitable[Any]] | None,
+    tool_registry: Any = None,
 ) -> list[Any]:
-    """按场景解析**本轮**工具集（排期 2-7 / 契约 §5.2）。
+    """按场景解析**本轮**工具集（排期 2-7 / 契约 §5.2；3-4 增加注册表开关过滤）。
 
     | 场景 | 结果 | 为什么 |
     | --- | --- | --- |
-    | 2 补货 / 3 诊断 | `builtin_tools(scene)` | 与改造前完全一致（`tools_for_scene`）|
+    | 2 补货 / 3 诊断 | `builtin_tools(scene)` ∩ 注册表启用 | 候选集不变，启停由 `agent_tool` 决定 |
     | 1 通用 / 4 运营分析 | `[]` | 与改造前完全一致（这两个场景本来就不挂工具）|
-    | ≥101 自定义 | 按配置 `tools` 从注册表过滤 | 自定义智能体的能力面由配置决定 |
+    | ≥101 自定义 | 配置 `tools` ∩ 代码注册表 ∩ 注册表启用 | 自定义智能体的能力面由配置决定 |
     | 其它（5~100） | `[]` | 未定义场景，不赋予任何能力（API 层已拒绝，这里是第二道）|
 
-    三条防御（都只 WARN 不抛穿）：
+    `tool_registry`（排期 3-4）为空时**不过滤**，与改造前完全一致；这正是单测/旧调用方
+    的安全默认。生产由 `main._chat_tools_provider` 注入进程单例。
+
+    四条防御（都只 WARN 不抛穿）：
       1. 配置读不到（`config_loader` 为 None / 返回 None）→ 空工具；
-      2. 配置里写了注册表没有的工具名 → 过滤掉，并把缺失名单写进 WARN（便于发现拼错）；
-      3. 过滤后为空 → 空工具（提示词里会如实告诉模型“本场景查不了”，不编数字）。
+      2. 配置里写了代码注册表没有的工具名 → 过滤掉，并把缺失名单写进 WARN（便于发现拼错）；
+      3. 配置/候选里的工具**已被注册表停用或非只读** → 过滤掉并 WARN（避免“提示与能力脱节”）；
+      4. 过滤后为空 → 空工具（提示词里会如实告诉模型“本场景查不了”，不编数字）。
     """
+    allowed = await _enabled_tool_codes(tool_registry)
+
+    def _keep(tool_list: Sequence[Any]) -> list[Any]:
+        items = list(tool_list)
+        if allowed is None:
+            return items
+        return [tool for tool in items if str(getattr(tool, "name", "")) in allowed]
+
     if scene in (SCENE_RESTOCK, SCENE_DIAGNOSE):
-        return list(builtin_tools(scene))
+        candidates = list(builtin_tools(scene))
+        kept = _keep(candidates)
+        if allowed is not None:
+            disabled = [
+                str(getattr(tool, "name", ""))
+                for tool in candidates
+                if str(getattr(tool, "name", "")) not in allowed
+            ]
+            if disabled:
+                logger.warning(
+                    "内置场景有工具被注册表停用/设为非只读，本轮不注入：scene=%s tools=%s",
+                    scene,
+                    disabled,
+                )
+        return kept
     if scene < CUSTOM_SCENE_BASE:
         return []
     if config_loader is None:
@@ -460,10 +520,21 @@ async def resolve_scene_tools(
         return []
     wanted = tuple(getattr(snapshot, "tools", ()) or ())
     by_name = {str(getattr(tool, "name", "")): tool for tool in registry()}
-    filtered = [by_name[name] for name in wanted if name in by_name]
     missing = [name for name in wanted if name not in by_name]
+    unavailable = [
+        name for name in wanted if name in by_name and allowed is not None and name not in allowed
+    ]
+    filtered = [
+        by_name[name] for name in wanted if name in by_name and (allowed is None or name in allowed)
+    ]
     if missing:
         logger.warning("自定义场景配置了未注册的工具，已忽略：scene=%s tools=%s", scene, missing)
+    if unavailable:
+        logger.warning(
+            "自定义场景配置了已被停用/非只读的工具，本轮不注入：scene=%s tools=%s",
+            scene,
+            unavailable,
+        )
     if not filtered:
         logger.warning("自定义场景本轮可用工具为空（配置 tools=%r）：scene=%s", wanted, scene)
     return filtered

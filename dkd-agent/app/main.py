@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api import agents, chat, fault, ops, restock
+from app.api import agents, chat, fault, llm_probe, ops, restock
 from app.checkpoint import (
     ensure_windows_event_loop_policy,
     get_checkpoint_store,
@@ -30,6 +30,7 @@ from app.obs.log_handler import db_log_stats, install_db_log_handler, shutdown_d
 from app.obs.run_recorder import sweep_stale_runs
 from app.services import carrier_config
 from app.services.restock_analyzer import build_default_analyzer
+from app.services.tool_registry import get_tool_registry, tool_registry_stats
 from app.tools.assistant_tools import all_assistant_tools, tools_for_scene
 
 logger = logging.getLogger("dkd.agent")
@@ -41,14 +42,18 @@ async def _chat_tools_provider(scene: int) -> list[Any]:
     为什么放在装配层而不是图里：图不该知道“工具注册表与配置从哪来”，它只承诺
     “每次 respond 前调用一次 provider”——这样配置改后**下一次对话**即生效（不必重启）。
     解析规则见 `chat_graph.resolve_scene_tools`：
-      1/4 → 无工具；2/3 → `tools_for_scene(scene)`（**行为与改造前完全一致**）；
-      ≥101 → 按配置 `tools` 从注册表过滤（配置写坏 → 空工具 + WARN，不抛穿）。
+      1/4 → 无工具；2/3 → `tools_for_scene(scene)` ∩ `agent_tool` 启用集（效果与改造前一致，
+            因为默认/旧环境全部启用）；≥101 → 配置 `tools` ∩ 代码注册表 ∩ 注册表启用
+            （配置写坏 → 空工具 + WARN，不抛穿）。
+    `tool_registry` 是排期 3-4 的开关层：停用/写工具在这里被摘掉，**不会注入模型**。
+    读取失败时它回落代码默认（`ToolRegistry.list_enabled` 内部兜底），不会把工具全摘掉。
     """
     return await resolve_scene_tools(
         scene,
         builtin_tools=tools_for_scene,
         registry=all_assistant_tools,
         config_loader=carrier_config.load_chat_config,
+        tool_registry=get_tool_registry(),
     )
 
 
@@ -98,6 +103,14 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     # 为什么失败也不阻断启动：agent_log 是排障旁路，表未建/DB 抖动只 WARN 一次
     # （见 app/obs/log_handler.py 纪律 4），不能因此让服务起不来。
     install_db_log_handler(s)
+    # 工具注册表（排期 3-4）：在 checkpointer/config 之后、编译图之前初始化并做**启动校验**。
+    # 为什么在启动期校验：某行 code 映射不到代码工具 = 配置错误（运营以为启用了、实际不存在），
+    # 必须启动即拒绝（RuntimeError）；表不存在/DB 不可达只是“旧环境”，回落代码默认 + WARN，
+    # 绝不因此拒绝启动（见 app/services/tool_registry.py 纪律 1/2）。
+    # `_chat_tools_provider` 通过 `get_tool_registry()` 读同一份单例，配置改后 ≤TTL(30s) 生效。
+    registry = get_tool_registry()
+    await registry.validate_startup()
+    app.state.tool_registry = registry
     # 给 LLM 分支挂上**只读工具**（2026-10-01 补齐智能功能；同日升级为**按场景**挂）：
     #   场景 2（补货）= 补货清单/设备库存/在途工单/近期销量；
     #   场景 3（诊断）= 设备消歧/异常检测/历史维修单 + 库存/在途；
@@ -144,6 +157,7 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestContextMiddleware)
     app.include_router(chat.router)
     app.include_router(agents.router)  # 排期 3-3：GET /agent/agents（场景下发）
+    app.include_router(llm_probe.router)  # 排期 3-5：POST /agents/llm/ping（模型连通性探测）
     app.include_router(ops.router)
     app.include_router(restock.router)
     app.include_router(fault.router)
@@ -173,6 +187,8 @@ def create_app() -> FastAPI:
             pass
         # 执行日志采集（2-4）的装配状态：只读计数器，**不触发 flush/不连库**。
         log_db = db_log_stats()
+        # 工具注册表（3-4）：只读缓存快照，**不触发加载/不连库**（health 必须能应答 DB 故障）。
+        tools = tool_registry_stats()
         return {
             "status": "ok",
             "env": s.app_env,
@@ -197,6 +213,14 @@ def create_app() -> FastAPI:
             "log_db_queue_size": log_db["queue_size"],
             "log_db_dropped": log_db["dropped"],
             "log_db_write_errors": log_db["write_errors"],
+            # 3-4：工具注册表。`tool_registry_degraded=true` 表示当前用的是代码默认
+            # （DB 关闭/表未建/查询失败），此时“停用某工具”的运营动作不生效——
+            # 这是排障时必须先看的一格，否则会误以为配置没保存。
+            "tool_registry_installed": tools["installed"],
+            "tool_registry_degraded": tools["degraded"],
+            "tool_registry_enabled": tools["enabled"],
+            "tool_registry_source": tools["source"],
+            "tool_registry_unknown": tools["unknown"],
         }
 
     @app.exception_handler(StarletteHTTPException)

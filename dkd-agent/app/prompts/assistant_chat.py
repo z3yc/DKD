@@ -263,6 +263,7 @@ def system_prompt(
     base_prompt_override: str | None = None,
     tool_names_override: tuple[str, ...] | None = None,
     scene_label: str | None = None,
+    custom_safety: bool | None = None,
 ) -> str:
     """按场景生成 system 提示词。
 
@@ -282,11 +283,19 @@ def system_prompt(
         表示“配置故意没挂工具”（提示词会如实说明）。
     @param scene_label 自定义智能体的名称（配置 `agent_config.name`），用于 focus 文案；
         None/空 = 现状（内置场景固定文案 / 自定义场景中性文案）。
+    @param custom_safety 是否按“自定义智能体”处理（追加安全 footer / 用自定义写操作约束）。
+        None = 自动判断（scene≥101 或传了 `tool_names_override`）；
+        False = 强制按内置场景处理——排期 3-4 的“内置工具被停用后提示词工具名单要同步”
+        需要用 `tool_names_override` 改列表，但**不能**因此把内置场景变成自定义语义
+        （否则内置 prompt 逐字回归与写操作约束都会变）。
     @return 完整 system 提示词。自定义场景（scene≥101，或传入了 `tool_names_override`）
         末尾**无条件**追加 `_CUSTOM_SAFETY_FOOTER`；内置 1-4 不追加（逐字不变）。
     """
     focus_code = (focus_inner_code or "").strip()
-    custom = _is_custom_scene(scene) or tool_names_override is not None
+    if custom_safety is None:
+        custom = _is_custom_scene(scene) or tool_names_override is not None
+    else:
+        custom = bool(custom_safety)
     label = (scene_label or "").strip()
     if label:
         focus = _CUSTOM_FOCUS_TEMPLATE.format(name=label)
