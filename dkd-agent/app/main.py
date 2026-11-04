@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api import chat, fault, ops, restock
+from app.api import agents, chat, fault, ops, restock
 from app.checkpoint import (
     ensure_windows_event_loop_policy,
     get_checkpoint_store,
@@ -143,6 +143,7 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(RequestContextMiddleware)
     app.include_router(chat.router)
+    app.include_router(agents.router)  # 排期 3-3：GET /agent/agents（场景下发）
     app.include_router(ops.router)
     app.include_router(restock.router)
     app.include_router(fault.router)

@@ -318,11 +318,26 @@ async def respond_with_llm(
         m if isinstance(m, HumanMessage) else AIMessage(content=str(m.content))
         for m in state.get("messages", [])
     ]
+    scene = int(state.get("scene", SCENE_GENERAL))
+    # 排期 3-2（自定义 chat 智能体）：scene≥101 时，提示词里的工具子集与角色名必须来自
+    # **同一份配置快照**（与工具绑定同源，避免“提示词说能查 A、实际绑的是 B”）。
+    # ⚠️ 内置 1-4 一律传 None：`chat` 行在 seed 里就带着 system_prompt，若把配置 tools
+    # 也传进来，会把内置场景误判成自定义（追加 footer、覆盖内置工具名单），
+    # 破坏「配置=默认 ⇒ 提示词逐字相同」的回归锚点（tests/test_config_carrier.py）。
+    custom_scene = scene >= CUSTOM_SCENE_BASE
+    tool_names_override = (
+        tuple(getattr(config, "tools", ()) or ()) if custom_scene and config is not None else None
+    )
+    scene_label = (
+        str(getattr(config, "name", "") or "").strip()
+        if custom_scene and config is not None
+        else ""
+    )
     # system 必须在最前面（放在历史之后会变成“事后补充说明”，模型容易忽略）
     messages: list[AnyMessage] = [
         SystemMessage(
             content=system_prompt(
-                int(state.get("scene", SCENE_GENERAL)),
+                scene,
                 focus_inner_code=str(state.get("focus_inner_code") or ""),
                 # 本轮窗口来自用户原话（FIX-28）。为什么从 contextvar 读而不是进 state：
                 # 它**不是会话状态**（下一轮不该沿用上一轮的窗口，见 time_hint 模块注释），
@@ -335,6 +350,9 @@ async def respond_with_llm(
                 base_prompt_override=(
                     getattr(config, "system_prompt", None) if config is not None else None
                 ),
+                # 3-2：自定义场景的工具子集与角色名（内置场景为 None/空，行为不变）
+                tool_names_override=tool_names_override,
+                scene_label=scene_label or None,
             )
         )
     ]
