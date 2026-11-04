@@ -1,0 +1,100 @@
+{
+  "generatedAt": "2026-11-04T13:30:54+08:00",
+  "repository": {
+    "trackedOnly": true,
+    "filesScanned": 1188,
+    "findings": [
+      {
+        "type": "deepseek_key",
+        "severity": "low(test-fixture)",
+        "file": "dkd-parent/dkd-admin/src/test/java/com/dkd/manage/service/AgentLlmProfileServiceTest.java",
+        "line": 296,
+        "evidence": "secretValue.setApiKeyEnv(\"sk-abcdefghijklmnopqrstuvwxyz0123456789\");"
+      },
+      {
+        "type": "deepseek_key",
+        "severity": "low(test-fixture)",
+        "file": "dkd-parent/dkd-admin/src/test/java/com/dkd/manage/service/AgentMcpServerServiceTest.java",
+        "line": 278,
+        "evidence": "secretMap.put(\"Authorization\", \"sk-abcdefghijklmnopqrstuvwxyz0123456789\");"
+      }
+    ]
+  },
+  "database": {
+    "llmProfileColumns": [
+      "id",
+      "code",
+      "name",
+      "provider",
+      "base_url",
+      "model",
+      "api_key_env",
+      "timeout_s",
+      "max_retries",
+      "enabled",
+      "is_default",
+      "description",
+      "create_by",
+      "create_time",
+      "update_by",
+      "update_time",
+      "del_flag"
+    ],
+    "llmProfileHasSecretColumn": false,
+    "secretLeaksInLogs": {
+      "agent_log": 0,
+      "agent_message": 0,
+      "agent_decision_log": 0
+    },
+    "agentGrants": [
+      "GRANT USAGE ON *.* TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`agent_config_history` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`agent_config` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_conversation` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_decision_log` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_kb_chunk` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_kb_document` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_kb_retrieval` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`agent_llm_probe` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`agent_llm_profile` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT ON `dkd`.`agent_log` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT ON `dkd`.`agent_mcp_probe` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, UPDATE ON `dkd`.`agent_mcp_server` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_mcp_tool` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_message` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_restock_pause` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_restock_plan` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_run` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_step` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_tool_call` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT, INSERT, UPDATE ON `dkd`.`agent_tool` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_channel` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_emp` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_inventory_log` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_inventory` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_job` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_node` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_order` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_partner` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_policy` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_region` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_sku_class` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_sku` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_task_details` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_task_type` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_task` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_vending_machine` TO `dkd_agent`@`localhost`",
+      "GRANT SELECT ON `dkd`.`tb_vm_type` TO `dkd_agent`@`localhost`"
+    ],
+    "agentHasDelete": false,
+    "agentBusinessWrite": false,
+    "mcpServers": 0,
+    "mcpFindings": []
+  },
+  "envGitignored": true,
+  "verdict": "PASS",
+  "notes": [
+    "测试夹具假 key 2 处（低危，不阻断，已标注）",
+    "仓库无明文密钥命中、日志无 sk- 泄漏、dkd_agent 无 DELETE、MCP 只存 env 名"
+  ]
+}

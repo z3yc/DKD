@@ -217,6 +217,11 @@ async def main() -> int:
         default="",
         help="把对比报告（含 n/口径/限制说明）写入该 .json 路径；供驾驶舱对比卡持续化消费",
     )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="把报告写入 agent_compare_report（供 6-1 驾驶舱读取；需 DKD_CLEANUP_* 管理库账号）",
+    )
     args = parser.parse_args()
     plan_date = date.fromisoformat(args.date)
 
@@ -254,6 +259,38 @@ async def main() -> int:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"compare report written: {out_path} (n={result['n']})")
+
+    if args.persist:
+        try:
+            import pymysql
+
+            conn = pymysql.connect(
+                host=os.environ.get("DKD_CLEANUP_HOST", "127.0.0.1"),
+                port=int(os.environ.get("DKD_CLEANUP_PORT", "3306")),
+                user=os.environ.get("DKD_CLEANUP_USER", "root"),
+                password=os.environ.get("DKD_CLEANUP_PASSWORD", ""),
+                database=os.environ.get("DKD_CLEANUP_DB", "dkd"),
+                charset="utf8mb4",
+                autocommit=True,
+            )
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO agent_compare_report"
+                        " (plan_date, generated_at, n, rule_total, baseline_total,"
+                        "  mean_delta_pct, median_delta_pct, report_json, create_by)"
+                        " VALUES (%s, NOW(3), %s, %s, %s, %s, %s, %s, 'compare-script')",
+                        (
+                            plan_date, result["n"], result["ruleTotal"], result["baselineTotal"],
+                            result.get("meanDeltaPct"), result.get("medianDeltaPct"),
+                            json.dumps(result, ensure_ascii=False),
+                        ),
+                    )
+                print("compare report persisted: agent_compare_report")
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 —— 落库失败不丢报告，明确提示
+            print(f"WARN: 对比报告落库失败（{type(exc).__name__}），已保留 --out 文件")
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False))
