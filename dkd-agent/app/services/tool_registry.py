@@ -354,7 +354,10 @@ class ToolRegistry:
             entry = _entry_from_row(row)
             if entry is None:
                 continue
-            if entry.code not in code_names:
+            if entry.code not in code_names and entry.source != "mcp":
+                # 3-7：MCP 工具（source=mcp）是**运行期同步进来的动态工具**，代码里没有同名实现；
+                # 它们由 mcp_client 在启动探测时校验/同步（只读闸 + inputSchema），这里不能按
+                # “代码工具白名单”拒绝，否则一接 MCP 就启动失败。本地工具仍严格校验。
                 unknown.append(entry.code)
             if entry.code in entries:
                 # UK(code) 保证真实库不会重复；假 loader/历史脏数据下先到先得

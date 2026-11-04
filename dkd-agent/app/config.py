@@ -196,6 +196,16 @@ class Settings(BaseSettings):
     kb_chunk_size: int = Field(default=500, validation_alias="DKD_AGENT_KB_CHUNK_SIZE")
     kb_chunk_overlap: int = Field(default=50, validation_alias="DKD_AGENT_KB_CHUNK_OVERLAP")
 
+    # --- MCP 外部工具接入（排期 3-7）---
+    # 总开关：默认 True（功能可用），但保留“一键关掉外部工具”的能力——
+    # MCP 会出网访问第三方 server，安全复核/灰度期需要能立刻停掉而不发版。
+    mcp_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_MCP_ENABLED")
+    # 超时硬上限（毫秒）：契约固定 ≤5000；DB 里的 server.timeout_ms 只能往小调，不能放宽。
+    # 外部 server 卡住会占住工具轮次，宁可快速失败让模型如实说“查不了”。
+    mcp_max_timeout_ms: int = Field(default=5000, validation_alias="DKD_AGENT_MCP_MAX_TIMEOUT_MS")
+    # 返回行数硬上限：契约固定 ≤200；超出的工具返回必须截断并显式标注（不得静默截断）。
+    mcp_max_row_limit: int = Field(default=200, validation_alias="DKD_AGENT_MCP_MAX_ROW_LIMIT")
+
     # --- 补货基线引擎参数（Phase 1 / 任务 1-4）---
     # 为什么全部做成配置而不是常量：这些是**业务参数**（服务水平/补货周期随运营策略变），
     # 排期 3-6/5-2 要按复盘结果迭代它们；硬编码会让“调参”变成“改代码+发版”。
