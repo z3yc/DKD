@@ -72,20 +72,29 @@ GRANT SELECT ON dkd.agent_config_history TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'
 -- 不授 UPDATE/DELETE —— 保留期清理属排期 4-4，由 Java/运维执行（Python 无删除权限）。
 GRANT SELECT, INSERT ON dkd.agent_log    TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 -- 2026-11-04 追加（排期 3-4/3-5，DDL 见 agent_tool_llm_profile.sql）：工具注册表与模型档案
--- 同样是 **Java 的业务事实**（工具中心/模型档案页写操作经 RuoYi 权限 + @Log），Python 只读：
--- agent_tool 用于启动/运行期工具开关过滤；agent_llm_profile 用于读取连接信息（密钥只存 env 变量名）。
--- agent_llm_probe 由 Java 写探测记录，Python 不读写。
-GRANT SELECT ON dkd.agent_tool         TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+-- 同样是 **Java 的业务事实**（工具中心/模型档案页写操作经 RuoYi 权限 + @Log）。
+-- 2026-11-04 二次修订（排期 3-7 MCP 同步）：`agent_tool` 追加 INSERT/UPDATE ——
+--   Python 在启动探测/手动同步时要把 MCP 只读工具 upsert 成 source='mcp' 的行
+--   （本地 source='local' 行仍只由 Java seed/工具中心维护；代码里只 upsert mcp.* 前缀）。
+--   风险声明：MySQL 无行级授权，Python 技术上能改本地工具行；code 层已固定为 mcp 同步路径，
+--   若要彻底收口应改为 Java 回调写入（评审项）。
+-- agent_llm_profile 只读（密钥只存 env 变量名）；agent_llm_probe 由 Java 写，Python 只读。
+GRANT SELECT, INSERT, UPDATE ON dkd.agent_tool TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT ON dkd.agent_llm_profile  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT ON dkd.agent_llm_probe    TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 -- 2026-11-04 追加（排期 3-6/3-7，DDL 见 agent_kb_mcp.sql）：
 --   · 知识库文档/切片/检索记录属智能体自有数据（Python ingest 写入），授 SELECT/INSERT/UPDATE；
---   · MCP server 配置由 Java 管理（Python 只读）；MCP 工具同步与探测记录由 Python 写；
+--   · MCP server 配置列（endpoint/env_keys_json 等）由 Java 管理；但 Python 探测后要回写
+--     `status / last_probe_time / last_probe_msg` 三个运行态列，故授 **SELECT, UPDATE**。
+--     风险声明：MySQL 无列级授权，Python 技术上能改整行；代码只更新上述三列
+--     （`app/services/mcp_client.py` 的 UPDATE 语句固定列），若将来要彻底收口，
+--     应把运行态拆到独立表或改为 Java 写回。
+--   · MCP 工具同步（agent_mcp_tool/agent_tool）与探测记录（agent_mcp_probe）由 Python 写；
 --   · 一律不授 DELETE（保留策略/清理由 Java/运维执行，AGENTS §7.4）。
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_kb_document  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_kb_chunk     TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_kb_retrieval TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
-GRANT SELECT ON dkd.agent_mcp_server                   TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT, UPDATE ON dkd.agent_mcp_server           TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT, INSERT, UPDATE ON dkd.agent_mcp_tool     TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 GRANT SELECT, INSERT ON dkd.agent_mcp_probe            TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 
