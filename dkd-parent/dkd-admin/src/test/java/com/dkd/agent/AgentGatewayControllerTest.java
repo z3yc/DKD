@@ -188,11 +188,14 @@ class AgentGatewayControllerTest
         when(upstreamClient.pingHealth()).thenReturn(false);
         AgentGatewayController controller = controller(true);
 
-        AjaxResult result = controller.status();
+        AjaxResult result = controller.status(new MockHttpServletRequest("GET", "/agent/status"));
 
         Map<?, ?> data = (Map<?, ?>) result.get("data");
         assertThat(data.get("enabled")).isEqualTo(Boolean.TRUE);
         assertThat(data.get("upstream")).isEqualTo("down");
+        // 探活失败时不再问场景：agents 必须是空数组（前端据此回落硬编码 3 项），而不是 null/缺字段
+        assertThat((java.util.List<?>) data.get("agents")).isEmpty();
+        verify(upstreamClient, never()).forward(anyString(), anyString(), any(), any(), any());
     }
 
     @Test
@@ -200,12 +203,14 @@ class AgentGatewayControllerTest
     {
         AgentGatewayController controller = controller(false);
 
-        AjaxResult result = controller.status();
+        AjaxResult result = controller.status(new MockHttpServletRequest("GET", "/agent/status"));
 
         Map<?, ?> data = (Map<?, ?>) result.get("data");
         assertThat(data.get("enabled")).isEqualTo(Boolean.FALSE);
         assertThat(data.get("upstream")).isEqualTo("down");
+        assertThat((java.util.List<?>) data.get("agents")).isEmpty();
         verify(upstreamClient, never()).pingHealth();
+        verify(upstreamClient, never()).forward(anyString(), anyString(), any(), any(), any());
     }
 
     /**

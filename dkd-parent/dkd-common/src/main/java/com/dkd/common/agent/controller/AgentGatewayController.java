@@ -3,9 +3,11 @@ package com.dkd.common.agent.controller;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -26,6 +28,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONArray;
+import com.alibaba.fastjson2.JSONObject;
 import com.dkd.common.agent.config.AgentProperties;
 import com.dkd.common.agent.domain.AgentHeaders;
 import com.dkd.common.agent.domain.AgentUpstreamResult;
@@ -89,6 +93,16 @@ public class AgentGatewayController
      * 上游对话路径（Python app/api/chat.py 的 router 前缀 + 路由）
      */
     private static final String CHAT_PATH = "/agent/chat";
+
+    /**
+     * 上游「已启用场景清单」路径（Python {@code GET /agent/agents}，排期 3-3）。
+     *
+     * <p><b>为什么不加进下面的白名单 {@link #proxy}</b>：它只由 {@code /agent/status} 内部调用，
+     * 是"入口是否可用 + 有哪些场景"的一部分，不是前端可直接调用的业务接口。
+     * 留在白名单外意味着前端直连 {@code /agent/agents} 仍会 404（fail-closed 不变），
+     * 这样场景清单的实现细节不会因为一次 status 扩展而暴露成一个新的对外路由。
+     */
+    private static final String AGENTS_PATH = "/agent/agents";
 
     /**
      * 补货读接口（GET）：需要 {@code manage:task:list}
@@ -169,17 +183,110 @@ public class AgentGatewayController
     /**
      * 入口可用性探测：前端据此决定是否隐藏/禁用对话入口（降级时**不伪造**会话能力，方案 §3.3）。
      *
-     * @return {@code data.enabled} 开关状态；{@code data.upstream} 为 up/down
+     * <p>排期 3-3 扩展：{@code data.agents} 返回**已启用的 chat 智能体清单**（后端下发场景），
+     * 前端助手抽屉优先用它渲染场景，拿不到时回落硬编码 3 项（灰度友好）。
+     *
+     * <p><b>为什么场景清单拉取失败时 status 仍必须是 200 + {@code agents=[]}，而不是 500/503：</b>
+     * <ul>
+     *   <li>status 是前端的**入口可用性探测**：它自己失败会让前端连 {@code enabled}/{@code upstream}
+     *       都拿不到，抽屉整体不可用——一个"增强项"（场景清单）不能把"基础可用性"一起拖垮；</li>
+     *   <li>3-3 的灰度策略就是"下发失败 → 前端用硬编码 3 项"，空数组是**约定好的回落信号**，
+     *       不是错误。把回落信号换成 500 会让灰度期出现"新接口一抖，老功能也不能用"；</li>
+     *   <li>场景清单是运营配置，不是业务事实；查不到最多是场景少几个，入口还能正常聊天。</li>
+     * </ul>
+     *
+     * @param request 当前请求（复用其 requestId 串联全链路；不读取/不转发任何用户头）
+     * @return {@code data.enabled} 开关状态；{@code data.upstream} 为 up/down；
+     *         {@code data.agents} 为已启用场景数组（失败时为空数组，永不为 null）
      */
     @GetMapping("/status")
-    public AjaxResult status()
+    public AjaxResult status(HttpServletRequest request)
     {
         boolean enabled = properties.getEnabled();
         Map<String, Object> data = new HashMap<String, Object>();
         data.put("enabled", enabled);
         // 开关关掉时不必再探活：既省一次跨进程调用，也避免“开关关了还显示 up”的误导
-        data.put("upstream", enabled && upstreamClient.pingHealth() ? "up" : "down");
+        boolean upstreamUp = enabled && upstreamClient.pingHealth();
+        data.put("upstream", upstreamUp ? "up" : "down");
+        // 上游都没起来时不必再问场景：省一次跨进程调用（失败语义与拉取失败一致：空数组 + WARN 由前端回落）
+        data.put("agents", upstreamUp ? loadAgentScenes(request) : Collections.emptyList());
         return AjaxResult.success(data);
+    }
+
+    /**
+     * 拉取「已启用 chat 智能体清单」，任何失败都回落空数组（不抛穿）。
+     *
+     * <p>请求头只带 {@code X-Agent-Secret} 与 {@code X-Request-Id}，**不带 X-Agent-User 等身份头**：
+     * 场景清单是全局配置（"平台上有哪些启用的智能体"），契约里没有"按用户过滤"的语义；
+     * 带上用户头会让 Python 侧误以为要按用户鉴权/过滤，等于凭空造一个不存在的契约。
+     *
+     * <p>日志只记状态码/异常类型，不记响应体（可能含配置细节，AGENTS §6.1）。
+     *
+     * @param request 当前请求（取 requestId）
+     * @return 场景数组；上游不可达/非 2xx/解析失败时为空列表
+     */
+    private List<Object> loadAgentScenes(HttpServletRequest request)
+    {
+        String requestId = resolveRequestId(request);
+        Map<String, String> headers = new LinkedHashMap<String, String>();
+        headers.put(AgentHeaders.REQUEST_ID, requestId);
+        if (StringUtils.hasText(properties.getSecret()))
+        {
+            headers.put(AgentHeaders.SECRET, properties.getSecret());
+        }
+        try
+        {
+            AgentUpstreamResult result = upstreamClient.forward(HttpMethod.GET.name(), AGENTS_PATH, null, headers,
+                    new byte[0]);
+            if (!result.isSuccessful())
+            {
+                log.warn("场景清单拉取失败，回落空数组 requestId={} upstreamStatus={}", requestId, result.getStatus());
+                return Collections.emptyList();
+            }
+            return extractAgents(result.getBody(), requestId);
+        }
+        catch (AgentUpstreamException e)
+        {
+            // 上游不可达/超时：只 WARN 并回落空数组，绝不能因此让 status 500（见 status 注释）
+            log.warn("场景清单拉取异常，回落空数组 requestId={} err={}", requestId, e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * 从上游信封 {@code {code,msg,data:{agents:[...]}}} 中取 {@code data.agents}。
+     *
+     * <p>为什么严格按 {@code data.agents} 解析而不用"是数组就收"：信封结构是跨语言契约，
+     * 宽松解析会把上游某次错误响应里的其它数组误当成场景清单，前端最终渲染出无法解释的项。
+     * 结构不符时按"解析失败"处理（空数组 + WARN），与网络失败走同一条回落路径。
+     *
+     * @param body 上游响应体（UTF-8 JSON）
+     * @param requestId 全链路追踪 ID（日志用）
+     * @return 场景数组；结构不符/JSON 损坏时为空列表
+     */
+    private List<Object> extractAgents(byte[] body, String requestId)
+    {
+        try
+        {
+            JSONObject root = JSON.parseObject(new String(body, StandardCharsets.UTF_8));
+            JSONObject data = root == null ? null : root.getJSONObject("data");
+            JSONArray agents = data == null ? null : data.getJSONArray("agents");
+            if (agents == null)
+            {
+                log.warn("场景清单响应缺少 data.agents，回落空数组 requestId={} bodyLength={}", requestId,
+                        body == null ? 0 : body.length);
+                return Collections.emptyList();
+            }
+            return new ArrayList<Object>(agents);
+        }
+        catch (RuntimeException e)
+        {
+            // fastjson2 解析失败抛 JSONException（RuntimeException）：同样按"拉取失败"回落。
+            // 只记异常类型与响应体长度，不记响应体内容（AGENTS §6.1）
+            log.warn("场景清单响应解析失败，回落空数组 requestId={} err={} bodyLength={}", requestId,
+                    e.getClass().getSimpleName(), body == null ? 0 : body.length);
+            return Collections.emptyList();
+        }
     }
 
     /**
