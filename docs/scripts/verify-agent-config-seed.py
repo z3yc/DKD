@@ -140,9 +140,20 @@ async def main() -> int:
         ok, why = _params_equal(expected, row["params_json"])
         if not ok:
             failures.append(f"[{code}] {why}")
-        for field in ("runtime", "scene", "builtin", "enabled", "version"):
+        if str(row["runtime"]) != str(expected["runtime"]):
+            failures.append(
+                f"[{code}] runtime 不一致：db={row['runtime']!r} 期望={expected['runtime']!r}"
+            )
+        for field in ("scene", "builtin", "enabled"):
             if int(row[field] or 0) != int(expected.get(field, 0) or 0):
                 failures.append(f"[{code}] {field} 不一致：db={row[field]!r} 期望={expected.get(field)!r}")
+        # seed 只写 v1（builtin_defaults 不含 version 字段），因此这里断言库内版本恰为 1；
+        # 已被人改过（version>1）的环境说明 seed 不再是初始状态，应走回读报告人工确认而不是当 FAIL。
+        if int(row["version"] or 0) != 1:
+            failures.append(
+                f"[{code}] version={row['version']!r}（期望 seed 初始 v1；若已人工修改过，"
+                "本脚本的逐字比对不再适用，请人工确认）"
+            )
         if history.get(code, 0) < 1:
             failures.append(f"[{code}] agent_config_history 缺少 v1 快照")
 
