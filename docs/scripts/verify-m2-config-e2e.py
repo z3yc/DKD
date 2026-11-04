@@ -136,7 +136,7 @@ def main() -> int:  # noqa: PLR0915 —— 验收脚本按步骤线性展开，�
         return blocked(".env 缺少 DKD_AGENT_SERVICE_SECRET")
 
     try:
-        with httpx.Client(base_url=JAVA_BASE, timeout=20) as client:
+        with httpx.Client(base_url=JAVA_BASE, timeout=20, trust_env=False) as client:
             login = client.post("/login", json={"username": "admin", "password": "admin123"})
             if login.status_code != 200 or login.json().get("token") is None:
                 return blocked(f"Java 登录失败（{login.status_code}）——后端未就绪或口令不同")
@@ -145,7 +145,7 @@ def main() -> int:  # noqa: PLR0915 —— 验收脚本按步骤线性展开，�
         return blocked(f"Java 后端不可达：{type(exc).__name__}")
 
     try:
-        with httpx.Client(base_url=PY_BASE, timeout=20) as py:
+        with httpx.Client(base_url=PY_BASE, timeout=20, trust_env=False) as py:
             health = py.get("/health")
             if health.status_code != 200 or not health.json().get("config_from_db"):
                 return blocked("Python 服务未就绪或未开启 DKD_AGENT_CONFIG_FROM_DB")
@@ -173,7 +173,7 @@ def main() -> int:  # noqa: PLR0915 —— 验收脚本按步骤线性展开，�
             if not ok:
                 failures.append(name + (f"（{detail}）" if detail else ""))
 
-        with httpx.Client(base_url=JAVA_BASE, headers=headers, timeout=20) as client:
+        with httpx.Client(base_url=JAVA_BASE, headers=headers, timeout=20, trust_env=False) as client:
             listing = client.get("/manage/agent/config/list", params={"pageNum": 1, "pageSize": 20})
             rows = listing.json().get("rows", []) if listing.status_code == 200 else []
             check("列表返回 3 行内置配置", listing.status_code == 200 and len(rows) == 3)
@@ -236,7 +236,7 @@ def main() -> int:  # noqa: PLR0915 —— 验收脚本按步骤线性展开，�
             )
 
             # 3) 预热 Python 配置缓存，再经 Java 保存，立即读 effective 验证 reload 生效
-            with httpx.Client(base_url=PY_BASE, headers={"X-Agent-Secret": secret}, timeout=20) as py:
+            with httpx.Client(base_url=PY_BASE, headers={"X-Agent-Secret": secret}, timeout=20, trust_env=False) as py:
                 before = py.get("/agents/config/effective", params={"code": CODE})
                 before_ver = int((before.json().get("data") or {}).get("config", {}).get("version", -1))
             check("保存前 Python effective=v1", before_ver == 1, f"version={before_ver}")
@@ -250,7 +250,7 @@ def main() -> int:  # noqa: PLR0915 —— 验收脚本按步骤线性展开，�
             check("保存成功且 version=2", saved.status_code == 200 and saved_version == 2, f"version={saved_version}")
 
             # 立即读（远小于 TTL 30s）：若 Java 未通知 Python，这里仍是 1
-            with httpx.Client(base_url=PY_BASE, headers={"X-Agent-Secret": secret}, timeout=20) as py:
+            with httpx.Client(base_url=PY_BASE, headers={"X-Agent-Secret": secret}, timeout=20, trust_env=False) as py:
                 after = py.get("/agents/config/effective", params={"code": CODE})
                 after_cfg = (after.json().get("data") or {}).get("config") or {}
                 after_ver = int(after_cfg.get("version", -1))
@@ -283,7 +283,7 @@ def main() -> int:  # noqa: PLR0915 —— 验收脚本按步骤线性展开，�
             print("已恢复：restock 行回到备份 v1，并删除本次 e2e 产生的历史版本（直接 SQL 清理）")
         else:
             print("未检测到本次写入痕迹，跳过恢复")
-        with httpx.Client(base_url=PY_BASE, headers={"X-Agent-Secret": secret}, timeout=20) as py:
+        with httpx.Client(base_url=PY_BASE, headers={"X-Agent-Secret": secret}, timeout=20, trust_env=False) as py:
             py.post("/agents/config/reload")
 
         final = read_row(conn)
