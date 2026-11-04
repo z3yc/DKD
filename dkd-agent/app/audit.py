@@ -19,7 +19,18 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import CHAR, JSON, BigInteger, DateTime, Integer, Numeric, String, func, select
+from sqlalchemy import (
+    CHAR,
+    JSON,
+    BigInteger,
+    DateTime,
+    Integer,
+    Numeric,
+    String,
+    func,
+    select,
+    text,
+)
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -108,10 +119,42 @@ class Message(Base):
     content: Mapped[str | None] = mapped_column(String(65535))
     tool_calls: Mapped[Any | None] = mapped_column(_JSON)
     model: Mapped[str | None] = mapped_column(String(64))
+    # 生成本条消息时实际生效的智能体配置版本（4-2）；NULL = 历史数据/配置不可用
+    # （**不伪造版本号**：回落后写 NULL，页面显示“未标注”而不是一个假版本）。
+    config_version: Mapped[int | None] = mapped_column(BigInteger)
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     request_id: Mapped[str | None] = mapped_column(String(64))
+    create_by: Mapped[str | None] = mapped_column(String(64))
+    create_time: Mapped[datetime | None] = mapped_column(DateTime)
+    update_by: Mapped[str | None] = mapped_column(String(64))
+    update_time: Mapped[datetime | None] = mapped_column(DateTime)
+    del_flag: Mapped[str] = mapped_column(CHAR(1), default="0")
+
+
+class Conversation(Base):
+    """会话头（`agent_conversation`，排期 4-1）。
+
+    为什么只用 ORM 定义而不在本模块做会话查询：列表/详情由 Java 只读接口直接读表
+    （排期 2-5/S13）；Python 侧只负责**写入**会话头与消息（事实记录）。
+    写入用参数化 SQL（`touch_conversation`）而不是 ORM upsert：MySQL 的
+    `ON DUPLICATE KEY UPDATE` 需要方言对象，而假会话单测按 SQL 断言更直观。
+    """
+
+    __tablename__ = "agent_conversation"
+
+    id: Mapped[int] = mapped_column(_BIGINT_PK, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(String(64))
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    user_name: Mapped[str | None] = mapped_column(String(64))
+    region_id: Mapped[int | None] = mapped_column(BigInteger)
+    scene: Mapped[int] = mapped_column(Integer, default=1)
+    # 首次创建时的配置版本（4-2）；NULL = 历史/取不到（不伪造）
+    config_version: Mapped[int | None] = mapped_column(BigInteger)
+    title: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[int] = mapped_column(Integer, default=1)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
     create_by: Mapped[str | None] = mapped_column(String(64))
     create_time: Mapped[datetime | None] = mapped_column(DateTime)
     update_by: Mapped[str | None] = mapped_column(String(64))
@@ -202,6 +245,7 @@ async def record_message(
     user_id: int | None = None,
     content: str | None = None,
     model: str | None = None,
+    config_version: int | None = None,
     tokens_in: int = 0,
     tokens_out: int = 0,
     latency_ms: int = 0,
@@ -219,6 +263,7 @@ async def record_message(
             content=mask_sensitive(content),
             tool_calls=mask_deep(tool_calls),
             model=model,
+            config_version=config_version,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             latency_ms=latency_ms,
@@ -235,6 +280,87 @@ async def record_message(
         await session.rollback()
         logger.warning(
             "消息投影写入失败 conversation_id=%s err=%s",
+            conversation_id,
+            type(exc).__name__,
+            exc_info=True,
+        )
+
+
+#: 会话标题上限（DDL 是 VARCHAR(200)，但列表展示用 60 更合适；首条消息截断即可）
+CONVERSATION_TITLE_CHARS = 60
+
+_TOUCH_CONVERSATION_SQL = """
+INSERT INTO agent_conversation
+    (conversation_id, user_id, user_name, scene, config_version, title, status,
+     message_count, create_by, create_time, update_by, update_time, del_flag)
+VALUES
+    (:conversation_id, :user_id, :user_name, :scene, :config_version, :title, 1,
+     :delta, :operator, NOW(), :operator, NOW(), '0')
+ON DUPLICATE KEY UPDATE
+    message_count = message_count + :delta,
+    update_by = :operator,
+    update_time = NOW(),
+    status = 1
+"""
+
+
+def conversation_title(text: str | None) -> str:
+    """会话标题 = 首条用户消息截断 60；空消息回落「新会话」。"""
+    value = (text or "").strip()
+    if not value:
+        return "新会话"
+    if len(value) <= CONVERSATION_TITLE_CHARS:
+        return value
+    return value[:CONVERSATION_TITLE_CHARS] + "…"
+
+
+async def touch_conversation(
+    session: AsyncSession,
+    *,
+    conversation_id: str,
+    user_id: int | None,
+    user_name: str | None,
+    scene: int,
+    title: str | None,
+    config_version: int | None,
+    delta: int = 2,
+    operator: str = "agent",
+) -> None:
+    """会话头 upsert：首插写全局字段，重复只累加 `message_count` 并刷新时间。
+
+    为什么用 upsert 而非先查后写：一轮对话至少 2 条消息（user+assistant），
+    并发的两条 SSE 不会共享会话，但定时任务/重试可能出现同一 conversation_id 的
+    连续写入；`INSERT ... ON DUPLICATE KEY UPDATE` 在一条语句里完成“创建或累加”，
+    不会出现“查完到插入之间被别人插了”的竞态。
+
+    纪律：
+    - `scene/user/title/config_version` **只在首插写入**（后续消息不覆盖会话元数据，
+      否则标题会变成最后一句用户消息，历史列表就没法读了）；
+    - `delta` 默认 2（user + assistant 各一条）；
+    - 失败只 WARN 不抛穿（审计是旁路，AGENTS §6.1）。
+    """
+    if user_id is None:
+        # DDL 里 user_id 是 NOT NULL：没有用户身份时不写会话头（也不拿 0 冒充某个用户），
+        # 消息投影仍会落库（user_id 允许 NULL），不会因此丢这一轮事实记录。
+        logger.warning("缺少用户身份，跳过会话头写入：conversation_id=%s", conversation_id)
+        return
+    params = {
+        "conversation_id": conversation_id,
+        "user_id": int(user_id),
+        "user_name": (str(user_name).strip()[:64] or None) if user_name else None,
+        "scene": int(scene),
+        "config_version": int(config_version) if config_version is not None else None,
+        "title": conversation_title(title),
+        "delta": max(int(delta), 1),
+        "operator": operator,
+    }
+    try:
+        await session.execute(text(_TOUCH_CONVERSATION_SQL), params)
+        await session.commit()
+    except SQLAlchemyError as exc:
+        await session.rollback()
+        logger.warning(
+            "会话头写入失败（消息投影不受影响）conversation_id=%s err=%s",
             conversation_id,
             type(exc).__name__,
             exc_info=True,

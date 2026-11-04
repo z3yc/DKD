@@ -30,6 +30,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from app.agent_defaults import CUSTOM_SCENE_BASE
+from app.config import get_settings
 from app.llm import LlmError, build_chat_model
 from app.prompts.assistant_chat import (
     SCENE_DIAGNOSE,
@@ -37,7 +38,7 @@ from app.prompts.assistant_chat import (
     SCENE_RESTOCK,
     system_prompt,
 )
-from app.services import carrier_config, diagnosis_checklist, kb_citation, time_hint
+from app.services import carrier_config, diagnosis_checklist, kb_citation, time_hint, tool_timing
 
 # 工具调用轮次上限（防“模型反复调工具烧 token”）。3 轮足够覆盖
 # “清单 → 查某台设备 → 查销量”这种最多三跳的问题；超出则强制作答。
@@ -271,6 +272,120 @@ def _guard_diagnosis_tool_calls(
     return kept + [synthesized], None
 
 
+# ------------------------------------------------------------------------------------
+# 4-5 上下文窗口治理：预算估算 + 长会话裁剪
+# ------------------------------------------------------------------------------------
+def _message_text(message: Any) -> str:
+    """取消息正文（content 可能是 str 或多模态列表，统一成可估算/可截断的文本）。"""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _estimate_tokens(text_value: str) -> int:
+    """粗略 token 估算（不引入 tokenizer 依赖）：CJK 字符 ≈1 token，其余 ≈4 字符/token。
+
+    为什么够用：预算只用于“该不该裁剪”的粗判断，误差方向也偏保守（宁可早裁一点）。
+    """
+    if not text_value:
+        return 0
+    cjk = sum(
+        1 for char in text_value if "\u3400" <= char <= "\u9dff" or "\uf900" <= char <= "\ufaff"
+    )
+    return cjk + (len(text_value) - cjk + 3) // 4
+
+
+def _estimate_messages_tokens(messages: Sequence[Any]) -> int:
+    return sum(_estimate_tokens(_message_text(message)) for message in messages)
+
+
+def _summarize_tool_message(message: Any, limit: int) -> Any:
+    """把历史工具消息正文摘要化（截断 + 显式标注），保留消息类型/元数据。"""
+    text_value = _message_text(message)
+    head = text_value[:limit] if limit > 0 else ""
+    summary = (
+        f"{head}…（历史工具结果已摘要，原文 {len(text_value)} 字符）"
+        if head != text_value
+        else f"{text_value}（历史工具结果已摘要）"
+    )
+    model_copy = getattr(message, "model_copy", None)
+    if callable(model_copy):
+        try:
+            return model_copy(update={"content": summary})
+        except (TypeError, ValueError):  # pragma: no cover —— 消息实现不支持复制时兜底
+            return AIMessage(content=summary)
+    return AIMessage(content=summary)
+
+
+def trim_history(
+    history: Sequence[Any],
+    *,
+    budget_tokens: int = 8000,
+    keep_recent: int = 12,
+    tool_result_chars: int = 600,
+) -> tuple[list[Any], int]:
+    """按预算裁剪会话历史（返回 `(trimmed, dropped_count)`）。
+
+    规则（按顺序）：
+    1. **开头的 system 消息原样保留、不参与裁剪**（它是角色设定，丢了行为直接漂移）；
+    2. 未超预算 → 原样返回（**短会话/现有提示词逐字不变**）；
+    3. 超预算 → 最近 `keep_recent` 条保留原文，更早的**工具消息正文摘要化**
+       （截断到 `tool_result_chars` 并标注「历史工具结果已摘要」）；
+    4. 仍然超预算 → 从最旧的正文消息开始丢（system 与最近 keep_recent 不丢），
+       超预算即记一条 WARNING（含 budget/dropped，便于线上确认“何时开始截断”）。
+
+    @param history 会话消息（可含 system 前缀）
+    @param budget_tokens 预算（≤0 = 不裁剪；配置为 0 常被用作临时关闭）
+    @param keep_recent 原样保留的最近消息数（不含 system）
+    @param tool_result_chars 历史工具结果摘要保留的字符数
+    @return (裁剪后的消息列表, 被丢弃的消息数)
+    """
+    messages = list(history or [])
+    if not messages:
+        return [], 0
+    budget = int(budget_tokens)
+    if budget <= 0:
+        return messages, 0
+    keep_recent = max(int(keep_recent), 0)
+    tool_chars = max(int(tool_result_chars), 0)
+
+    system_prefix: list[Any] = []
+    body_start = 0
+    while body_start < len(messages) and isinstance(messages[body_start], SystemMessage):
+        system_prefix.append(messages[body_start])
+        body_start += 1
+    body = messages[body_start:]
+
+    if _estimate_messages_tokens(messages) <= budget:
+        return messages, 0  # 短会话：一个字节都不改
+
+    recent_start = max(len(body) - keep_recent, 0)
+    trimmed = list(body)
+    for index in range(recent_start):
+        if isinstance(trimmed[index], ToolMessage):
+            trimmed[index] = _summarize_tool_message(trimmed[index], tool_chars)
+
+    dropped = 0
+    while (
+        _estimate_messages_tokens(system_prefix + trimmed) > budget and len(trimmed) > keep_recent
+    ):
+        trimmed.pop(0)
+        dropped += 1
+
+    logger.warning(
+        "会话上下文截断：budget=%s keep_recent=%s dropped=%s final_tokens=%s",
+        budget,
+        keep_recent,
+        dropped,
+        _estimate_messages_tokens(system_prefix + trimmed),
+    )
+    return system_prefix + trimmed, dropped
+
+
 async def respond_with_llm(
     state: ChatState,
     *,
@@ -314,9 +429,20 @@ async def respond_with_llm(
     # 采样参数必须来自同一份快照；两处各读一次会在 TTL 边界上出现“工具是新的、prompt 是旧的”。
     options = carrier_config.llm_options(config)
     client = build_chat_model(streaming=True, **options)
+    # 4-5 上下文预算：在转成 prompt 消息**之前**裁剪原始历史（保留 ToolMessage 角色，
+    # 这样“更早的工具结果摘要化”才有类型依据）。短会话/未超预算时逐字不变。
+    settings = get_settings()
+    trimmed_history, dropped = trim_history(
+        state.get("messages", []),
+        budget_tokens=settings.history_token_budget,
+        keep_recent=settings.history_keep_recent_messages,
+        tool_result_chars=settings.history_tool_result_chars,
+    )
+    if dropped:
+        logger.info("本轮上下文裁剪：dropped=%s（预算内不打断回答）", dropped)
     history = [
         m if isinstance(m, HumanMessage) else AIMessage(content=str(m.content))
-        for m in state.get("messages", [])
+        for m in trimmed_history
     ]
     scene = int(state.get("scene", SCENE_GENERAL))
     # 排期 3-2（自定义 chat 智能体）：scene≥101 时，提示词里的工具子集与角色名必须来自
@@ -646,7 +772,12 @@ def build_chat_graph(
         # handle_tool_errors 显式传**自定义处理器**而不是默认值/True：
         # 实测默认只处理参数校验类异常，工具体内的异常会抛穿整个图（把对话打成 502）；
         # 而传 True 会把原始异常文本喂给模型与留痕，可能带上连接串（见 _handle_tool_error）。
-        builder.add_node("tools", ToolNode(tool_list, handle_tool_errors=_handle_tool_error))
+        #
+        # 4-1：ToolNode 执行的是**轻量包装后**的工具（只加耗时/返回规模采样，
+        # 保留 name/description/args_schema 与异常语义）；bind_tools 仍用上面的原始工具对象，
+        # 因此模型看到的 schema 与执行行为都不变。
+        timed_tools = tool_timing.wrap_tools(tool_list)
+        builder.add_node("tools", ToolNode(timed_tools, handle_tool_errors=_handle_tool_error))
         builder.add_conditional_edges("respond", _should_call_tools, {"tools": "tools", END: END})
         builder.add_edge("tools", "respond")
     else:

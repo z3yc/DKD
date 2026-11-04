@@ -34,6 +34,7 @@ from app.audit import (
     enforce_daily_quota,
     record_decision,
     record_message,
+    touch_conversation,
 )
 from app.config import Settings, get_settings
 from app.config_store import BUILTIN_CHAT_SCENES
@@ -41,7 +42,7 @@ from app.db import get_sessionmaker
 from app.llm import LlmError
 from app.logging_conf import current_request_id
 from app.security import HEADER_REQUEST_ID, parse_user_context, require_agent_gateway
-from app.services import carrier_config, grounding, time_hint
+from app.services import carrier_config, grounding, time_hint, tool_timing
 
 router = APIRouter(prefix="/agent", tags=["chat"], dependencies=[Depends(require_agent_gateway)])
 logger = logging.getLogger("dkd.agent.chat")
@@ -427,6 +428,8 @@ class _TurnOutcome:
         "calibers",
         "grounding",
         "focus_inner_code",
+        # 4-2：本轮实际生效的配置版本（None = 取不到/未启用配置 → 落库 NULL，不伪造）
+        "config_version",
     )
 
     def __init__(self) -> None:
@@ -446,6 +449,9 @@ class _TurnOutcome:
         self.grounding: dict[str, Any] = {}
         # 本轮结束时的诊断焦点（多轮问诊对用户可见，2-3）
         self.focus_inner_code = ""
+        # 本轮实际生效的智能体配置版本（4-2）：写 agent_message/agent_conversation
+        # 只能取“本轮真实用到的”快照版本；取不到就是 None（不编造版本号）。
+        self.config_version: int | None = None
 
 
 def _chunk_text(token: object) -> str:
@@ -679,13 +685,30 @@ async def _record_turn(
     settings: Settings,
     payload: ChatRequest,
     ctx_user_id: int | None,
+    ctx_user_name: str | None,
     rid: str,
     thread_id: str,
     outcome: _TurnOutcome,
 ) -> None:
-    """写决策留痕与消息投影（基础设施故障降级放行，不打断对话，AGENTS §6.1/§6.3）。"""
+    """写决策留痕、会话头与消息投影（基础设施故障降级放行，不打断对话，AGENTS §6.1/§6.3）。
+
+    一轮写两条消息（排期 4-1 补齐用户侧）：
+    - user：`msg_role=1`，`seq=history_len-1`（本轮用户消息在状态里的位置）；
+    - assistant：`msg_role=2`，`seq=history_len`（状态最后一条的位置）。
+    两条都带本轮 `config_version`（取不到为 NULL，不伪造）。
+
+    续传路径（`_resume_stream`）**不调用本函数**：checkpoint 里已有本轮，重复写会双写。
+    """
     if not settings.audit_enabled:
         return
+    if outcome.config_version is None:
+        # 配置不可读（总开关关闭/表缺失/回落）时如实写 NULL：编一个版本号会让
+        # “这条回复是哪版配置生成的”永远查不对（排期 4-2 的核心诉求）。
+        logger.warning(
+            "本轮未取到智能体配置版本，消息 config_version 写 NULL（不伪造）：thread_id=%s rid=%s",
+            thread_id,
+            rid,
+        )
     try:
         async with get_sessionmaker()() as session:
             await record_decision(
@@ -697,7 +720,7 @@ async def _record_turn(
                 input_context={
                     "message": payload.message,
                     "thread_id": thread_id,
-                    # 本轮调用过哪些工具（名称+截断后的参数）：审计要能回答
+                    # 本轮调用过哪些工具（名称+截断后的参数+耗时/结果规模）：审计要能回答
                     # “这个回答是基于哪几次查询得出的”，而不是只知道“它回答了”
                     "toolCalls": outcome.tool_calls,
                     "toolCallCount": len(outcome.tool_calls),
@@ -714,18 +737,43 @@ async def _record_turn(
                 cost_tokens=outcome.tokens_in + outcome.tokens_out,
                 confidence=None,
             )
+            # 4-1：先写用户消息，再写助手消息（同 session；各自 commit，失败互不阻塞）
+            user_seq = max(outcome.history_len - 1, 1)
+            await record_message(
+                session,
+                conversation_id=thread_id,
+                user_id=ctx_user_id,
+                seq=user_seq,
+                msg_role=1,
+                content=payload.message,
+                config_version=outcome.config_version,
+                request_id=rid,
+            )
             await record_message(
                 session,
                 conversation_id=thread_id,
                 user_id=ctx_user_id,
                 # seq = 助手消息在会话中的真实位置（首轮为 2：用户1、助手2）
-                seq=outcome.history_len,
+                seq=max(outcome.history_len, user_seq + 1),
                 msg_role=2,
                 content=outcome.reply,
                 model=outcome.model,
+                config_version=outcome.config_version,
                 tokens_in=outcome.tokens_in,
                 tokens_out=outcome.tokens_out,
                 request_id=rid,
+                tool_calls=outcome.tool_calls,
+            )
+            # 4-1：会话头 upsert（message_count 每轮 +2）；失败只 WARN，不影响消息投影
+            await touch_conversation(
+                session,
+                conversation_id=thread_id,
+                user_id=ctx_user_id,
+                user_name=ctx_user_name,
+                scene=payload.scene,
+                title=payload.message,
+                config_version=outcome.config_version,
+                delta=2,
             )
     except SQLAlchemyError as exc:
         logger.warning(
@@ -733,7 +781,9 @@ async def _record_turn(
         )
 
 
-async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[str]:
+async def _chat_stream(
+    payload: ChatRequest, request: Request, snapshot: Any | None = None
+) -> AsyncIterator[str]:
     """SSE 主流程：限额 → `meta` 帧 → 逐 token `delta` 帧 → `done` 帧（含留痕/计量）。
 
     因为要“边生成边下发”，`meta` 只能携带**开始时已知**的信息（会话/身份/mode/续传标记）；
@@ -795,7 +845,13 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
     )
 
     outcome = _TurnOutcome()
+    # 4-2：本轮实际生效的配置版本来自建流前解析到的快照（`_validate_scene` 的返回值）。
+    # 取不到 → None（落库 NULL + WARN），绝不拿“当前最新版本”冒充本轮版本。
+    outcome.config_version = int(snapshot.version) if snapshot is not None else None
     frames = 0
+    # 4-1：本轮工具执行采样（ToolNode 包装层写入；结束时合并进 outcome.tool_calls）
+    timing_token = tool_timing.begin_turn()
+    timing_records: list[dict[str, Any]] = []
     # FIX-28：把**用户原话**里的时间窗口注入本轮上下文（工具层与提示词层读同一个值，
     # 避免“提示词一个口径、工具另一个口径”）。解析不出或有两个窗口时是 None（不猜）。
     window_token = time_hint.set_window_hint_days(time_hint.parse_window_days(payload.message))
@@ -869,12 +925,19 @@ async def _chat_stream(payload: ChatRequest, request: Request) -> AsyncIterator[
     finally:
         # 上下文必须复位：不复位会把本轮窗口泄漏给同一进程里后续请求（尤其异常路径）
         time_hint.reset_window_hint_days(window_token)
+        # 先取走采样记录再复位 contextvar（顺序反了会拿到空列表）
+        timing_records = tool_timing.current_records()
+        tool_timing.end_turn(timing_token)
+
+    # 4-1：把工具耗时/返回规模合并进 tool_calls（匹配不上以 LangGraph 的记录为准）
+    outcome.tool_calls = tool_timing.merge_tool_calls(outcome.tool_calls, timing_records)
 
     # 3) 留痕与计量（旁路能力，失败降级放行）
     await _record_turn(
         settings=settings,
         payload=payload,
         ctx_user_id=ctx.user_id,
+        ctx_user_name=ctx.user_name,
         rid=rid,
         thread_id=thread_id,
         outcome=outcome,
@@ -915,6 +978,10 @@ async def _validate_scene(scene: int) -> None:
       - ≥101 自定义：必须命中**已启用** chat 配置，否则 400（不存在与停用同一句提示，
         因为对用户而言下一步动作相同：换场景或联系管理员）；
       - 5~100 未定义（0 已被 Pydantic 拦下）→ 400「场景不存在」。
+
+    @return 本轮实际生效的配置快照；None = 内置场景无配置（回落代码默认）。
+        返回值供 4-2 写 `config_version` 用——与其在收尾时再读一次配置（可能已被改），
+        不如用建流前这份“本轮真正判定生效”的快照。
     """
     if scene in BUILTIN_CHAT_SCENES:
         snapshot = await carrier_config.load_chat_config(scene)
@@ -922,7 +989,7 @@ async def _validate_scene(scene: int) -> None:
             # 快照没有 disabled_reason 字段（契约 §5.1），只能给通用文案；
             # 不编造原因（“不编造”优先于“文案更详细”）。
             raise HTTPException(status_code=400, detail="该智能体已停用，请联系管理员启用后再使用")
-        return
+        return snapshot
     if scene < CUSTOM_SCENE_BASE:
         # 5~100 是保留空洞（1-4 历史内置、101 起配置台分配）：属于**参数形态错误**，
         # 沿用改造前 `le=4` 的 422 语义；而“配置停用/自定义场景未启用”是业务状态问题 → 400。
@@ -930,6 +997,7 @@ async def _validate_scene(scene: int) -> None:
     snapshot = await carrier_config.load_chat_config(scene)
     if snapshot is None:
         raise HTTPException(status_code=400, detail="场景不存在或未启用；请刷新助手场景列表后重试")
+    return snapshot
 
 
 @router.post("/chat", summary="流式对话（SSE；token 级流式 + 会话持久化 + 断点续传）")
@@ -942,9 +1010,9 @@ async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     响应头显式禁用缓冲：本服务与 Java 网关侧都要保证逐帧输出
     （网关为 Servlet 输出流逐块 flush；两侧缺一不可）。
     """
-    await _validate_scene(payload.scene)
+    snapshot = await _validate_scene(payload.scene)
     return StreamingResponse(
-        _chat_stream(payload, request),
+        _chat_stream(payload, request, snapshot),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",

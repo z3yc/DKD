@@ -206,6 +206,20 @@ class Settings(BaseSettings):
     # 返回行数硬上限：契约固定 ≤200；超出的工具返回必须截断并显式标注（不得静默截断）。
     mcp_max_row_limit: int = Field(default=200, validation_alias="DKD_AGENT_MCP_MAX_ROW_LIMIT")
 
+    # --- 会话上下文预算（排期 4-5）---
+    # 长会话不治理的后果很具体：第 50 轮时历史消息把 prompt 撑爆（模型报 context length）
+    # 或成本线性上涨，而用户真正关心的通常只是最近几轮。三条参数分别控制
+    # “总预算 / 原样保留的最近条数 / 更早工具结果摘要化的字符上限”。
+    history_token_budget: int = Field(
+        default=8000, validation_alias="DKD_AGENT_HISTORY_TOKEN_BUDGET"
+    )
+    history_keep_recent_messages: int = Field(
+        default=12, validation_alias="DKD_AGENT_HISTORY_KEEP_RECENT_MESSAGES"
+    )
+    history_tool_result_chars: int = Field(
+        default=600, validation_alias="DKD_AGENT_HISTORY_TOOL_RESULT_CHARS"
+    )
+
     # --- 补货基线引擎参数（Phase 1 / 任务 1-4）---
     # 为什么全部做成配置而不是常量：这些是**业务参数**（服务水平/补货周期随运营策略变），
     # 排期 3-6/5-2 要按复盘结果迭代它们；硬编码会让“调参”变成“改代码+发版”。
