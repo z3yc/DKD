@@ -88,6 +88,8 @@ function withDate(url, planDate) {
  *   plans[i] 字段（camelCase，见 `restock_decisions.summarize_plan`）：
  *   `{ id, vmId, innerCode, status, skuCount, totalQuantity, assigneeId, assigneeName, items[] }`
  *   之外还有 `taskId / taskCode / adjustReason / adjustedBy / adjustedTime`。
+ *   5-6 起新增 `llmCalibrated`（true=LLM 校准生效 / false=退化为纯统计基线（未校准）/
+ *   null=历史数据或本轮未记录）——页面据此显示「未校准」徽标与顶部计数，**null 不得当成已校准**。
  *   ⚠️ **没有点位名/设备地址字段**（契约未提供），页面只如实展示 innerCode，不拼假地址。
  */
 export function listRestockPlans(planDate, signal) {
