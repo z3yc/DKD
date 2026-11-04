@@ -112,6 +112,14 @@
             <el-tag size="small" :type="statusTag(row.status)">{{ statusLabel(row.status) }}</el-tag>
           </template>
         </el-table-column>
+        <!-- 4-2：本会话由哪个配置版本生成（回滚只影响新会话，不回写历史） -->
+        <el-table-column label="配置版本" width="130" align="center">
+          <template #default="{ row }">
+            <el-tooltip :content="CONFIG_VERSION_TIP" placement="top">
+              <span>{{ configVersionLabel(row.configVersion) }}</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column label="消息数" width="100" align="center">
           <template #default="{ row }">
             <!--
@@ -205,6 +213,11 @@
               {{ detail.conversation.title || '（无标题）' }}
             </el-descriptions-item>
             <el-descriptions-item label="场景">{{ sceneLabel(detail.conversation.scene) }}</el-descriptions-item>
+            <el-descriptions-item label="配置版本">
+              <el-tooltip :content="CONFIG_VERSION_TIP" placement="top">
+                <span>{{ configVersionLabel(detail.conversation.configVersion) }}</span>
+              </el-tooltip>
+            </el-descriptions-item>
             <el-descriptions-item label="用户">
               {{ detail.conversation.userName || '—' }}
               <span class="dim">#{{ detail.conversation.userId ?? '—' }}</span>
@@ -267,6 +280,14 @@
                   <span class="dim">token 入 {{ msg.tokensIn ?? 0 }} / 出 {{ msg.tokensOut ?? 0 }}</span>
                   <span class="dim">耗时 {{ formatMs(msg.latencyMs) }}</span>
                   <!--
+                    4-2：消息级 configVersion（生成本条消息时的配置版本）。
+                    null = 加列前的历史消息：按 java-log 口径「null 不展示」——
+                    会话级已标「—（历史数据）」，逐气泡重复一遍只会变成噪声。
+                  -->
+                  <el-tooltip v-if="msgHasConfigVersion(msg)" :content="CONFIG_VERSION_TIP" placement="top">
+                    <el-tag size="small" type="info" class="msg-version">配置 v{{ msg.configVersion }}</el-tag>
+                  </el-tooltip>
+                  <!--
                     互跳入口：每条消息的 request_id 都能跳到执行日志页。
                     用 hasPermi 判断而不是 v-hasPermi：这里控制的是 v-if，交给 computed 更直观。
                   -->
@@ -301,7 +322,45 @@
 
                 <el-collapse v-if="hasToolCalls(msg)" class="msg-tools">
                   <el-collapse-item :title="'工具调用（' + toolCallsCount(msg) + '）'" :name="String(msg.seq)">
-                    <pre class="msg-json">{{ prettyToolCalls(msg) }}</pre>
+                    <!--
+                      4-2：tool_calls 由 Python 富化为对象数组（name/args/resultRows/resultChars/
+                      durationMs/status）。结构化表格比一坨 JSON 更适合排障——能快速对比哪次调用
+                      行数/耗时异常、哪次失败。缺字段显示「—」而不是 0：0 行是事实（查无结果），
+                      “没记录”不是 0，两者混起来会改错优化方向。
+                      非对象数组（解析失败/历史格式）退回 <pre> 原文，不吞内容。
+                    -->
+                    <template v-if="structuredToolCalls(msg).length > 0">
+                      <el-table :data="structuredToolCalls(msg)" border size="small" class="tool-call-table">
+                        <el-table-column label="工具名" min-width="150">
+                          <template #default="{ row }">
+                            <span class="mono">{{ toolName(row) }}</span>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="参数摘要" min-width="220" show-overflow-tooltip>
+                          <template #default="{ row }">{{ toolArgsText(row.args) }}</template>
+                        </el-table-column>
+                        <el-table-column label="结果行数" width="100" align="center">
+                          <template #default="{ row }">
+                            <el-tooltip
+                              :disabled="!toolCharsText(row)"
+                              placement="top"
+                              :content="'结果字符数 ' + toolCharsText(row)"
+                            >
+                              <span>{{ toolCountText(toolRowsValue(row)) }}</span>
+                            </el-tooltip>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="耗时（ms）" width="110" align="center">
+                          <template #default="{ row }">{{ toolDurationText(row.durationMs) }}</template>
+                        </el-table-column>
+                        <el-table-column label="状态" width="100" align="center">
+                          <template #default="{ row }">
+                            <el-tag size="small" :type="toolStatusTag(row.status)">{{ toolStatusLabel(row.status) }}</el-tag>
+                          </template>
+                        </el-table-column>
+                      </el-table>
+                    </template>
+                    <pre v-else class="msg-json">{{ prettyToolCalls(msg) }}</pre>
                   </el-collapse-item>
                 </el-collapse>
               </div>
@@ -576,6 +635,111 @@ function prettyToolCalls(msg) {
   } catch (error) {
     return String(resolved)
   }
+}
+
+/**
+ * 4-2：本会话/本条消息由哪个配置版本生成。
+ *
+ * 语义（计划表 4-2）：会话开始后**不会半途换 prompt**——后续轮次继续用当时的配置；
+ * 配置回滚只影响新会话，不回写历史。历史数据（功能上线前写入）没有版本号，显示「—（历史数据）」
+ * 而不是 0/v0（0 会被误读成“版本 0”）。
+ */
+const CONFIG_VERSION_TIP = '本会话由该配置版本生成：后续轮次使用当时配置；配置回滚不会回写历史会话'
+
+function configVersionLabel(value) {
+  if (value === null || value === undefined || value === '') return '—（历史数据）'
+  return 'v' + value
+}
+
+/** 消息级配置版本：null=历史消息（加列前写入）；按 java-log 口径 null 不展示徽标 */
+function msgHasConfigVersion(msg) {
+  if (!msg) return false
+  return msg.configVersion !== null && msg.configVersion !== undefined && msg.configVersion !== ''
+}
+
+/** 结构化工具调用：只有“对象数组”才渲染成表格（字符串/整体对象原样走 JSON 兜底） */
+function structuredToolCalls(msg) {
+  const resolved = resolveToolCalls(msg)
+  if (!Array.isArray(resolved)) return []
+  return resolved.filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+}
+
+/** 缺字段显示「—」（不要把“没记录”显示成 0；0 行/0ms 是真实事实，两者语义不同） */
+function toolText(value) {
+  if (value === null || value === undefined || value === '') return '—'
+  return String(value)
+}
+
+function toolCountText(value) {
+  if (value === null || value === undefined || value === '') return '—'
+  return String(value)
+}
+
+/** 参数摘要：对象压成单行 JSON 并截断（表格里要能扫读，不铺满整屏） */
+function toolArgsText(args) {
+  if (args === null || args === undefined || args === '') return '—'
+  let text
+  if (typeof args === 'string') {
+    text = args
+  } else {
+    try {
+      text = JSON.stringify(args)
+    } catch (error) {
+      text = String(args)
+    }
+  }
+  return text.length > 300 ? text.slice(0, 300) + '…' : text
+}
+
+/** 工具名：新富化口径是 name；兼容旧数据里的 toolCode/code（字段缺失才显示「—」） */
+function toolName(row) {
+  if (!row) return '—'
+  return toolText(row.name || row.toolCode || row.code)
+}
+
+/** 结果行数：新口径 resultRows；兼容旧数据的 rowCount/rows，都没有才是「—」 */
+function toolRowsValue(row) {
+  if (!row) return null
+  const keys = ['resultRows', 'rowCount', 'rows']
+  for (let i = 0; i < keys.length; i += 1) {
+    const value = row[keys[i]]
+    if (value !== null && value !== undefined && value !== '') return value
+  }
+  return null
+}
+
+/** 结果字符数：有值才给 tooltip（缺失不给，避免显示“字符数 undefined”） */
+function toolCharsText(row) {
+  if (!row || row.resultChars === null || row.resultChars === undefined || row.resultChars === '') return ''
+  return String(row.resultChars)
+}
+
+/** 耗时：缺失显示「—」；0ms 是有效值照实显示（本地小工具可能不足 1ms 被记为 0） */
+function toolDurationText(value) {
+  if (value === null || value === undefined || value === '') return '—'
+  const ms = Number(value)
+  if (Number.isNaN(ms)) return String(value)
+  return ms + ' ms'
+}
+
+/** 工具调用状态（与 Python 富化口径一致；未登记的值原样显示，不兜底成“成功”） */
+const TOOL_CALL_STATUS = {
+  ok: { label: '成功', tag: 'success' },
+  error: { label: '失败', tag: 'danger' },
+  timeout: { label: '超时', tag: 'warning' },
+  truncated: { label: '截断', tag: 'info' },
+  skipped: { label: '跳过', tag: 'info' }
+}
+
+function toolStatusLabel(value) {
+  if (value === null || value === undefined || value === '') return '—'
+  const hit = TOOL_CALL_STATUS[value]
+  return hit ? hit.label : String(value)
+}
+
+function toolStatusTag(value) {
+  const hit = TOOL_CALL_STATUS[value]
+  return hit ? hit.tag : 'info'
 }
 
 /** 截断说明：带上原始长度与已展示长度，避免读者把截断内容当成全文 */
@@ -873,6 +1037,16 @@ onActivated(() => {
 
 .msg-tools {
   margin-top: 8px;
+}
+
+/* 消息级配置版本徽标：只在有版本时渲染（null 不展示），紧凑显示不抢正文视觉 */
+.msg-version {
+  font-size: 11px;
+}
+
+/* 结构化工具调用表：与下方 JSON 兜底同属折叠区，间距保持一致 */
+.tool-call-table {
+  margin-top: 4px;
 }
 
 .msg-json {
