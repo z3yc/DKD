@@ -365,6 +365,10 @@ public class AgentConfigServiceImpl implements IAgentConfigService
         config.setRuntime(current.getRuntime());
         config.setBuiltin(current.getBuiltin());
         config.setScene(current.getScene());
+        // 主键必须带上：编辑走的是「全列覆盖 + WHERE id AND version」的 CAS UPDATE，
+        // 漏掉 id 会让 WHERE id IS NULL 恒不命中 → 每次保存都被误报成 409「已被他人更新」。
+        // （2026-11-04 真库 e2e 撞出：单测只断言了 version，没断言 id，所以一直是假绿。）
+        config.setId(dto.getId());
     }
 
     /**

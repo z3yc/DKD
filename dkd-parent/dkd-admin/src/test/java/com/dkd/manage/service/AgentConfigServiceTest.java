@@ -128,6 +128,9 @@ class AgentConfigServiceTest
         verify(agentConfigMapper).updateAgentConfig(updateCaptor.capture());
         // WHERE version = 提交版本（不是新版本）——写错乐观锁就失效了
         assertThat(updateCaptor.getValue().getVersion()).isEqualTo(3L);
+        // 主键必须一起带上：CAS UPDATE 的 WHERE 是 id AND version，缺 id 会恒不命中 →
+        // 每次保存都被误报成 409（2026-11-04 真库 e2e 撞出的回归，此前只断言 version 漏了 id）
+        assertThat(updateCaptor.getValue().getId()).isEqualTo(5L);
         assertThat(updateCaptor.getValue().getUpdateBy()).isEqualTo(OPERATOR);
 
         ArgumentCaptor<AgentConfigHistory> historyCaptor = ArgumentCaptor.forClass(AgentConfigHistory.class);
