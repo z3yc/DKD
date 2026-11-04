@@ -10,6 +10,7 @@ import org.apache.ibatis.session.Configuration;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import com.dkd.manage.domain.AgentEvalReport;
 import com.dkd.manage.domain.AgentLlmProbe;
 import com.dkd.manage.domain.AgentLlmProfile;
 import com.dkd.manage.domain.AgentLog;
@@ -18,7 +19,8 @@ import com.dkd.manage.domain.AgentMessage;
 import com.dkd.manage.domain.AgentTool;
 
 /**
- * 新增 Mapper XML 的**可加载性**测试（Batch A · 2-4/2-5，Batch B2 · 3-4/3-5，Batch C2 · 3-7）。
+ * 新增 Mapper XML 的**可加载性**测试（Batch A · 2-4/2-5，Batch B2 · 3-4/3-5，
+ * Batch C2 · 3-7，Batch E1 · 5-1）。
  *
  * <p>为什么要有这一层：本项目的 Java 门禁是**纯单测**（不启 Spring 容器、不连 MySQL），
  * 而 MyBatis 的 Mapper XML 只在应用启动时才被解析。也就是说：XML 写错标签、
@@ -47,6 +49,7 @@ class AgentMapperXmlBuildTest
         configuration.getTypeAliasRegistry().registerAlias("AgentLlmProfile", AgentLlmProfile.class);
         configuration.getTypeAliasRegistry().registerAlias("AgentLlmProbe", AgentLlmProbe.class);
         configuration.getTypeAliasRegistry().registerAlias("AgentMcpServer", AgentMcpServer.class);
+        configuration.getTypeAliasRegistry().registerAlias("AgentEvalReport", AgentEvalReport.class);
 
         parse(configuration, "mapper/manage/AgentLogMapper.xml");
         parse(configuration, "mapper/manage/AgentConversationMapper.xml");
@@ -54,6 +57,7 @@ class AgentMapperXmlBuildTest
         parse(configuration, "mapper/manage/AgentLlmProfileMapper.xml");
         parse(configuration, "mapper/manage/AgentLlmProbeMapper.xml");
         parse(configuration, "mapper/manage/AgentMcpServerMapper.xml");
+        parse(configuration, "mapper/manage/AgentEvalReportMapper.xml");
 
         assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentLogMapper.selectAgentLogList")).isTrue();
         assertThat(configuration
@@ -85,6 +89,12 @@ class AgentMapperXmlBuildTest
                 .isTrue();
         assertThat(configuration
                 .hasStatement("com.dkd.manage.mapper.AgentMcpServerMapper.updateAgentMcpServerEnabled")).isTrue();
+
+        // Batch E1：评测报告（只增）
+        assertThat(configuration
+                .hasStatement("com.dkd.manage.mapper.AgentEvalReportMapper.insertAgentEvalReport")).isTrue();
+        assertThat(configuration
+                .hasStatement("com.dkd.manage.mapper.AgentEvalReportMapper.selectLatestForVersion")).isTrue();
     }
 
     /**

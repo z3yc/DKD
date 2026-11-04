@@ -24,6 +24,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.dkd.common.agent.config.AgentProperties;
 import com.dkd.common.exception.ServiceException;
 import com.dkd.common.utils.DateUtils;
 import com.dkd.common.utils.StringUtils;
@@ -31,6 +32,8 @@ import com.dkd.manage.agent.AgentConfigConflictException;
 import com.dkd.manage.agent.AgentConfigDefaults;
 import com.dkd.manage.agent.AgentConfigReloadNotifier;
 import com.dkd.manage.agent.AgentConfigValidationException;
+import com.dkd.manage.agent.AgentEvalGateException;
+import com.dkd.manage.agent.AgentEvalGateResult;
 import com.dkd.manage.domain.AgentConfig;
 import com.dkd.manage.domain.AgentConfigHistory;
 import com.dkd.manage.domain.dto.AgentConfigDto;
@@ -39,6 +42,7 @@ import com.dkd.manage.domain.dto.AgentConfigRollbackDto;
 import com.dkd.manage.domain.vo.AgentConfigVo;
 import com.dkd.manage.mapper.AgentConfigMapper;
 import com.dkd.manage.service.IAgentConfigService;
+import com.dkd.manage.service.IAgentEvalReportService;
 
 /**
  * 智能体配置 Service 实现（排期 2-2，契约 §4）。
@@ -108,11 +112,38 @@ public class AgentConfigServiceImpl implements IAgentConfigService
 
     private static final String CHANGE_NOTE_ON_EDIT = "编辑保存";
 
+    /** 强制跳过评测的原因最短长度（太短的原因等于没有原因） */
+    private static final int FORCE_REASON_MIN_LENGTH = 10;
+
+    /** 强制跳过评测的原因最长长度（change_note 总长 200，需要给基础说明留空间） */
+    private static final int FORCE_REASON_MAX_LENGTH = 100;
+
+    /**
+     * 强制跳过评测时追加到 change_note 的标记（版本历史里可检索）。
+     */
+    private static final String FORCE_NOTE_PREFIX = "[强制跳过评测] ";
+
     @Autowired
     private AgentConfigMapper agentConfigMapper;
 
     @Autowired
     private AgentConfigReloadNotifier reloadNotifier;
+
+    /**
+     * 评测护栏开关（排期 5-1）。
+     *
+     * <p>为什么 {@code required = false}：本类既有的 @InjectMocks 单测没有注入该依赖，
+     * 若强制注入会在单测里 NPE；把"未注入"视为"护栏关闭"可保持改造前行为完全一致
+     * （生产环境由 Spring 正常注入，不受影响）。
+     */
+    @Autowired(required = false)
+    private AgentProperties agentProperties;
+
+    /**
+     * 评测报告 Service（排期 5-1；同上：单测未注入时视为护栏关闭）。
+     */
+    @Autowired(required = false)
+    private IAgentEvalReportService agentEvalReportService;
 
     @Override
     public List<AgentConfigVo> selectAgentConfigList(AgentConfig query)
@@ -202,12 +233,20 @@ public class AgentConfigServiceImpl implements IAgentConfigService
         }
         AgentConfig current = loadOrThrow(dto.getId());
         AgentConfig config = validateAndBuild(dto, current, false, operator);
+        // 评测护栏（排期 5-1）：只在"编辑保存"时拦（新增不拦，否则新智能体没法创建）。
+        // 放在 validateAndBuild 之后：表单本身不合法时先报字段错误，不该先弹"去跑评测"。
+        String evalForceNote = evalGateForcedNote(dto, current);
         int rows = agentConfigMapper.updateAgentConfig(config);
         if (rows == 0)
         {
             throw conflictAfterFailedCas(dto.getId(), dto.getVersion());
         }
         String changeNote = changeNoteOrDefault(config.getChangeNote(), CHANGE_NOTE_ON_EDIT);
+        if (evalForceNote != null)
+        {
+            // 强制跳过的原因写进版本历史：事后复盘"这版改了什么、为什么没评测"有据可查
+            changeNote = appendEvalForceNote(changeNote, evalForceNote);
+        }
         return finishSave(config, dto.getVersion(), changeNote, operator);
     }
 
@@ -1108,6 +1147,91 @@ public class AgentConfigServiceImpl implements IAgentConfigService
             }
         }
         return tokens;
+    }
+
+    // ------------------------------------------------------------------------------------
+    // 评测护栏（排期 5-1）
+    // ------------------------------------------------------------------------------------
+
+    /**
+     * 评测护栏判定：开启且不达标时拒绝保存，除非调用方显式 force + 原因。
+     *
+     * <p>为什么用**当前库内版本**（{@code current.version}）而不是提交的 version：
+     * 评测是"改前先跑"——报告证明的是"当前这版配置跑评测集的结果"，保存则要把它改成新的一版。
+     * 用提交版本会去查"还不存在的版本"，等于把护栏关掉。
+     *
+     * <p>为什么关闭时直接 return null 而不查库：关闭=现状，连一次多余查询都不该有
+     * （既有 300+ 测试与线上行为都必须逐字不变）。
+     *
+     * @param dto     入参（force/forceReason）
+     * @param current 库内当前行
+     * @return 需要追加到 change_note 的强制说明；null = 未触发强制（或未开启护栏）
+     * @throws AgentEvalGateException 护栏拒绝且未强制跳过
+     * @throws AgentConfigValidationException force 但原因不合格
+     */
+    private String evalGateForcedNote(AgentConfigDto dto, AgentConfig current)
+    {
+        if (agentProperties == null || !agentProperties.getEvalGateEnabled())
+        {
+            return null;
+        }
+        if (agentEvalReportService == null)
+        {
+            // 生产不会发生（Spring 注入）；单测未注入时按"护栏关闭"处理，保证既有用例不回归
+            log.warn("评测护栏已开启但 AgentEvalReportService 未注入，按关闭处理（仅可能出现在单测环境）");
+            return null;
+        }
+        AgentEvalGateResult gate = agentEvalReportService.checkGate(current.getCode(), current.getVersion());
+        if (gate.isPassed())
+        {
+            return null;
+        }
+        if (!Boolean.TRUE.equals(dto.getForce()))
+        {
+            throw new AgentEvalGateException(gate.getReason(), gate.getLatest());
+        }
+        String forceReason = trimToNull(dto.getForceReason());
+        if (forceReason == null || forceReason.length() < FORCE_REASON_MIN_LENGTH)
+        {
+            // force 了但原因太短：这是字段错误（表单能标红），不是护栏拒绝
+            throw field("forceReason", "强制跳过评测需填写至少 " + FORCE_REASON_MIN_LENGTH + " 字原因（当前 "
+                    + (forceReason == null ? 0 : forceReason.length()) + " 字）");
+        }
+        if (forceReason.length() > FORCE_REASON_MAX_LENGTH)
+        {
+            throw field("forceReason", "强制跳过原因最长 " + FORCE_REASON_MAX_LENGTH + " 字");
+        }
+        // 单行化：原因会写进 change_note 并展示在版本历史里，换行会破坏表格/日志行
+        String oneLineReason = forceReason.replaceAll("\\s+", " ");
+        log.warn("评测护栏被强制跳过 code={} version={} forceReason={}", current.getCode(), current.getVersion(),
+                oneLineReason);
+        return FORCE_NOTE_PREFIX + oneLineReason;
+    }
+
+    /**
+     * 把强制说明追加到 change_note（总长 ≤200）。
+     *
+     * <p>超长时**截断基础说明**而不是截断强制说明：强制原因必须完整可读，
+     * 否则"留痕"就变成了"留了个被截断的标记"。
+     *
+     * @param baseNote      原始变更说明
+     * @param forceSuffix   强制说明（含前缀）
+     * @return 追加后的说明
+     */
+    private String appendEvalForceNote(String baseNote, String forceSuffix)
+    {
+        int room = CHANGE_NOTE_MAX_LENGTH - forceSuffix.length() - 1;
+        if (room < 0)
+        {
+            // 理论不可达（forceReason ≤100）；兜底保证不超列宽
+            return forceSuffix.substring(0, Math.min(forceSuffix.length(), CHANGE_NOTE_MAX_LENGTH));
+        }
+        String base = baseNote == null ? "" : baseNote;
+        if (base.length() > room)
+        {
+            base = base.substring(0, room);
+        }
+        return base.isEmpty() ? forceSuffix : base + " " + forceSuffix;
     }
 
     private String changeNoteOrDefault(String changeNote, String defaultNote)

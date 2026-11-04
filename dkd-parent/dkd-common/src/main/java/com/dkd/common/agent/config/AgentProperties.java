@@ -95,6 +95,20 @@ public class AgentProperties
      */
     private int llmProbeTimeoutMs = 30000;
 
+    /**
+     * 配置保存前的**评测护栏**开关（排期 5-1，env {@code AGENT_EVAL_GATE_ENABLED}）。
+     *
+     * <p>为什么默认 false（关闭）：
+     * <ul>
+     *   <li>评测流水线是**渐进上线**的：先能把报告落库、能在页面查，再要求"每次保存必须跑评测"。
+     *       默认开启会让所有还没接评测的配置保存立刻被拦死（连改个错别字都不行）；</li>
+     *   <li>关闭时行为必须与改造前**完全一致**（不新增任何拒绝路径），这是回归安全的前提。</li>
+     * </ul>
+     * 开启后：编辑保存需有当前版本的最新 scored 报告且准确率不低于基线，否则拒绝
+     * （可用 force+forceReason≥10 字强制跳过，变更说明里会留痕）。
+     */
+    private boolean evalGateEnabled = false;
+
     public boolean getEnabled()
     {
         return enabled;
@@ -203,5 +217,15 @@ public class AgentProperties
     public void setLlmProbeTimeoutMs(int llmProbeTimeoutMs)
     {
         this.llmProbeTimeoutMs = llmProbeTimeoutMs;
+    }
+
+    public boolean getEvalGateEnabled()
+    {
+        return evalGateEnabled;
+    }
+
+    public void setEvalGateEnabled(boolean evalGateEnabled)
+    {
+        this.evalGateEnabled = evalGateEnabled;
     }
 }

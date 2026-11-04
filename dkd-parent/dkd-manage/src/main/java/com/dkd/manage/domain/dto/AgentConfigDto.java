@@ -75,6 +75,18 @@ public class AgentConfigDto
     /** 本次变更说明（写进 history，可选 ≤200 字） */
     private String changeNote;
 
+    /**
+     * 是否强制跳过评测护栏（排期 5-1；仅当 agent.evalGateEnabled=true 且被拒时生效）。
+     *
+     * <p>为什么留这个口子：评测本身可能因基础设施问题跑不动（CI 挂了/配额用尽），
+     * 完全堵死会让线上配置改错字都做不到；强制跳过必须**填写原因并留痕**，
+     * 让"为什么在没通过评测的情况下改了配置"可追溯。
+     */
+    private Boolean force;
+
+    /** 强制跳过评测的原因（force=true 且被拒时必填，≥10 字；会写进 change_note） */
+    private String forceReason;
+
     public Long getId()
     {
         return id;
@@ -263,5 +275,25 @@ public class AgentConfigDto
     public void setChangeNote(String changeNote)
     {
         this.changeNote = changeNote;
+    }
+
+    public Boolean getForce()
+    {
+        return force;
+    }
+
+    public void setForce(Boolean force)
+    {
+        this.force = force;
+    }
+
+    public String getForceReason()
+    {
+        return forceReason;
+    }
+
+    public void setForceReason(String forceReason)
+    {
+        this.forceReason = forceReason;
     }
 }

@@ -24,6 +24,7 @@ import com.dkd.common.core.page.TableDataInfo;
 import com.dkd.common.enums.BusinessType;
 import com.dkd.manage.agent.AgentConfigConflictException;
 import com.dkd.manage.agent.AgentConfigValidationException;
+import com.dkd.manage.agent.AgentEvalGateException;
 import com.dkd.manage.domain.AgentConfig;
 import com.dkd.manage.domain.dto.AgentConfigDto;
 import com.dkd.manage.domain.dto.AgentConfigEnabledDto;
@@ -209,5 +210,25 @@ public class AgentConfigController extends BaseController
         data.put("version", "当前版本 " + e.getCurrentVersion() + "，提交版本 " + e.getSubmittedVersion());
         AjaxResult body = new AjaxResult(HttpStatus.CONFLICT, "配置已被他人更新，请刷新后重试", data);
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    /**
+     * 评测护栏拒绝 → **HTTP 200 + code 409 + data{field:"evalGate", reason, latest}**（排期 5-1）。
+     *
+     * <p>为什么是 HTTP 200 而不是 409：这是业务规则拒绝（"没通过评测"），前端要拿到
+     * reason 与 latest 显示"去跑评测 / 强制跳过"的专用提示；用 HTTP 409 会与乐观锁冲突
+     * （那个要刷新重试）混在一起，页面只能二选一处理。契约 §4.2 的"字段错误走 200"同一思路。
+     *
+     * @param e 评测护栏异常
+     * @return 200 响应（body code=409）
+     */
+    @ExceptionHandler(AgentEvalGateException.class)
+    public AjaxResult handleEvalGateException(AgentEvalGateException e)
+    {
+        Map<String, Object> data = new LinkedHashMap<String, Object>();
+        data.put("field", "evalGate");
+        data.put("reason", e.getReason());
+        data.put("latest", e.getLatest());
+        return new AjaxResult(HttpStatus.CONFLICT, "未通过评测护栏：" + e.getReason(), data);
     }
 }
