@@ -147,6 +147,19 @@ CREATE TABLE IF NOT EXISTS `agent_log` (
 
 
 -- ============================================================================
+-- 执行记录
+-- ----------------------------------------------------------------------------
+-- 2026-11-04：**已在本机 dkd 库执行**（MySQL 8.0.40，root@127.0.0.1）：
+--   `mysql --default-character-set=utf8mb4 ... dkd --execute="source F:/DKD/docs/ddl/agent_config.sql"`
+--   随后执行 agent_config_seed.sql（3 行 config + 3 行 v1 history）与
+--   create_agent_db_user.sql 的 2026-11-03 追加授权段（agent_config / history 仅 SELECT、
+--   agent_log SELECT+INSERT）。回读结果见 docs/scripts/verify-agent-config-seed.py：
+--   **PASS（3 行配置与 agent_defaults.py 逐字一致、均有 v1 快照）**。
+--   只读账号拒绝写验证：INSERT agent_config / DELETE agent_log 均返回 ERROR 1142。
+--   生产执行仍需 DBA 评审（见文件头）。
+
+
+-- ============================================================================
 -- 变更记录
 -- ----------------------------------------------------------------------------
 -- 2026-11-03（排期 2-1/2-4）：初版。三张新表。

@@ -74,6 +74,12 @@ GRANT SELECT, INSERT ON dkd.agent_log    TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'
 
 FLUSH PRIVILEGES;
 
+-- 2026-11-04 本机验证（排期 2-1）：上述 2026-11-03 追加段已在 dkd 库执行并实测：
+--   允许：dkd_agent SELECT agent_config / agent_config_history（verify 脚本 PASS）；
+--   拒绝：INSERT agent_config、DELETE agent_log 均返回 ERROR 1142（两级授权口径生效）。
+-- 注意：生产执行本文件会先 REVOKE ALL，须把 `<AGENT_DB_PASSWORD>` 换成真实口令并确认
+-- 与 .env 的 DKD_AGENT_DB_PASSWORD 一致，否则 Python 服务会在重启后连不上库。
+
 -- ----------------------------------------------------------------------------
 -- 验证矩阵（执行后必须逐条核对，AGENTS §8 要求覆盖拒绝路径）
 -- 期望：1/2 成功，3~7 全部被拒绝
