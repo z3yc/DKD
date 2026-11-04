@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentConversationMapper">
+
+    <!--
+      智能体会话/消息的只读查询（Batch A · 排期 2-5，DDL 见 docs/ddl/agent_tables.sql）。
+
+      ## 四条刻意的取舍
+
+      1. **会话列表不 join 聚合子查询**
+         若 `left join (select ... from agent_message group by conversation_id)`，
+         每次翻页都会把整张 agent_message 聚合一遍。本机/生产是单主库（AGENTS §1 约束 5），
+         agent_message 随对话持续增长，这条 SQL 会越来越慢。
+         改为"先分页 ≤200 个会话，再 where conversation_id in (...) 聚合"：
+         代价与页大小成正比、与消息总量无关，仍然是一条 SQL（不是 N+1）。
+
+      2. **时间窗条件无条件、范围比较**
+         护栏（默认近 24h / 最大 30 天）在 Java 侧做，SQL 不接受"没有窗口"的查询；
+         不用 date_format() 包裹 create_time（AGENTS §10 禁止，会让
+         idx_agent_conversation_user_time / idx_agent_conversation_scene_time 失效）。
+         上界是闭区间：Java 侧已把日期串补齐到 23:59:59.999。
+
+      3. **消息时间线必须 LIMIT**
+         长会话可能上千条消息，详情接口无界返回既压主库也压抽屉渲染
+         （AGENTS §10：禁止无 LIMIT 的全表扫描）。被截断由 Service 标记
+         messagesTruncated，页面能看见"只显示了前 N 条"。
+
+      4. **聚合口径用 count(1) 而不是 message_count 冗余列**
+         message_count 是 Python 侧维护的冗余值，可能滞后。列表同时返回
+         表内值与实测值，让"计数漂移"可见，而不是拿冗余值冒充事实。
+    -->
+
+    <!-- 会话头结果映射；聚合查询复用同一个 resultMap（用不到的列 MyBatis 会自动跳过） -->
+    <resultMap type="com.dkd.manage.domain.vo.AgentConversationVo" id="AgentConversationVoResult">
+        <id     property="id"                 column="id"                   />
+        <result property="conversationId"     column="conversation_id"      />
+        <result property="userId"             column="user_id"              />
+        <result property="userName"           column="user_name"            />
+        <result property="regionId"           column="region_id"            />
+        <result property="scene"              column="scene"                />
+        <result property="title"              column="title"                />
+        <result property="status"             column="status"               />
+        <result property="messageCount"       column="message_count"        />
+        <result property="createTime"         column="create_time"          />
+        <result property="updateTime"         column="update_time"          />
+        <!-- 以下仅聚合查询有，会话头查询里不存在对应列（MyBatis 跳过） -->
+        <result property="actualMessageCount" column="actual_message_count" />
+        <result property="toolCallsCount"     column="tool_calls_count"     />
+        <result property="tokensIn"           column="tokens_in_total"      />
+        <result property="tokensOut"          column="tokens_out_total"     />
+        <result property="lastMessageTime"    column="last_message_time"    />
+    </resultMap>
+
+    <resultMap type="AgentMessage" id="AgentMessageResult">
+        <id     property="id"             column="id"              />
+        <result property="conversationId" column="conversation_id" />
+        <result property="userId"         column="user_id"         />
+        <result property="seq"            column="seq"             />
+        <result property="msgRole"        column="msg_role"        />
+        <result property="content"        column="content"         />
+        <!--
+          tool_calls 是 MySQL JSON 列，JDBC 返回文本；实体里保持 String 原样，
+          解析成对象 + 容错放在 Service（见 AgentConversationServiceImpl#fillToolCalls）。
+        -->
+        <result property="toolCalls"      column="tool_calls"      />
+        <result property="model"          column="model"           />
+        <result property="tokensIn"       column="tokens_in"       />
+        <result property="tokensOut"      column="tokens_out"      />
+        <result property="latencyMs"      column="latency_ms"      />
+        <result property="requestId"      column="request_id"      />
+        <result property="createBy"       column="create_by"       />
+        <result property="createTime"     column="create_time"     />
+        <result property="delFlag"        column="del_flag"        />
+    </resultMap>
+
+    <sql id="selectAgentConversationVo">
+        select id, conversation_id, user_id, user_name, region_id, scene, title, status,
+               message_count, create_time, update_time
+        from agent_conversation
+    </sql>
+
+    <sql id="agentConversationWhere">
+        <where>
+            <!-- 查询默认过滤已删除（AGENTS §7.4） -->
+            del_flag = '0'
+            <!-- 强制时间窗（无 <if>，见文件头取舍 2）；范围比较保护 create_time 索引 -->
+            AND create_time &gt;= #{window.beginTime}
+            AND create_time &lt;= #{window.endTime}
+            <if test="query.scene != null">
+                AND scene = #{query.scene}
+            </if>
+            <if test="query.status != null">
+                AND status = #{query.status}
+            </if>
+            <if test="query.userId != null">
+                AND user_id = #{query.userId}
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAgentConversationList" resultMap="AgentConversationVoResult">
+        <include refid="selectAgentConversationVo"/>
+        <include refid="agentConversationWhere"/>
+        <!-- 倒序：先看最近的会话；id 作为同一时刻的稳定次序 -->
+        order by create_time desc, id desc
+    </select>
+
+    <select id="selectAgentConversationByConversationId" resultMap="AgentConversationVoResult">
+        <include refid="selectAgentConversationVo"/>
+        where conversation_id = #{conversationId} and del_flag = '0'
+        limit 1
+    </select>
+
+    <!--
+      按当前页的会话ID批量聚合（见文件头取舍 1/4）。
+      tool_calls_count 的口径是"tool_calls 非空的消息条数"：列表只关心
+      "这条会话有没有实际查过数据"，逐条解析 JSON 会把列表变成 N 次解析。
+    -->
+    <select id="selectAgentMessageAggregates" resultMap="AgentConversationVoResult">
+        select conversation_id,
+               count(1) as actual_message_count,
+               sum(case when tool_calls is not null then 1 else 0 end) as tool_calls_count,
+               coalesce(sum(tokens_in), 0) as tokens_in_total,
+               coalesce(sum(tokens_out), 0) as tokens_out_total,
+               max(create_time) as last_message_time
+        from agent_message
+        where del_flag = '0'
+          and conversation_id in
+          <foreach collection="conversationIds" item="cid" open="(" separator="," close=")">
+              #{cid}
+          </foreach>
+        group by conversation_id
+    </select>
+
+    <select id="selectAgentMessagesByConversationId" resultMap="AgentMessageResult">
+        select id, conversation_id, user_id, seq, msg_role, content, tool_calls, model,
+               tokens_in, tokens_out, latency_ms, request_id, create_by, create_time, del_flag
+        from agent_message
+        where conversation_id = #{conversationId} and del_flag = '0'
+        <!-- 时间线按会话内序号升序；id 兜底同一 seq 的脏数据（UK 已保证同会话 seq 唯一） -->
+        order by seq asc, id asc
+        limit #{limit}
+    </select>
+
+</mapper>
