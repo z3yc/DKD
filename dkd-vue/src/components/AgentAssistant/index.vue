@@ -24,13 +24,17 @@
         </el-button>
       </div>
 
-      <!-- 场景切换：scene 参数与 Python 侧契约一致（1-通用 2-补货 3-诊断 4-运营分析） -->
+      <!--
+        场景切换：scene 参数与 Python 侧契约一致（1-通用 2-补货 3-诊断 4-运营分析，自定义场景>=101）。
+        列表来自 `probeStatus` 合并后的动态 scenes（默认硬编码 2/3/4 作回落，见 script 里 mergeScenes 注释）。
+      -->
       <div class="agent-tabs">
         <span
-          v-for="item in SCENES"
+          v-for="item in scenes"
           :key="item.value"
           class="tab"
           :class="{ on: scene === item.value }"
+          :title="item.custom ? '自定义智能体（管理员在配置台下发的场景）' : ''"
           @click="switchScene(item.value)"
         >{{ item.label }}</span>
       </div>
@@ -225,10 +229,79 @@ import useAgentStore from '@/store/modules/agent'
 // marked 配置与 views/manage/report/index.vue 保持一致（v18 用 use 取代 setOptions）
 marked.use({ breaks: true, gfm: true })
 
-const SCENES = [
-  { value: 2, label: '补货 Agent' },
-  { value: 3, label: '诊断 Agent' },
-  { value: 4, label: '分析 Copilot' }
+/** 内置场景的固定中文名（与改造前逐字一致，保证“后端没下发”时行为不变） */
+const BUILTIN_SCENE_LABELS = {
+  2: '补货 Agent',
+  3: '诊断 Agent',
+  4: '分析 Copilot'
+}
+
+/**
+ * 场景列表（3-3 起为动态列表）：默认 3 项。
+ *
+ * 为什么默认仍是硬编码的 2/3/4（灰度友好）：`status.data.agents` 是 3-3 新增的下发字段，
+ * 在下列情况下都会缺失或为空——老版本 Java 没扩展 status、上游 Python 不可达、
+ * agent_config 表为空/DB 开关关闭、以及回滚到旧版本时。
+ * 这些场景下抽屉必须与改造前**完全一致**：不能因为“场景清单取不到”就少 tab 或不可用，
+ * 否则一次后端灰度/回滚就会让所有人失去对话入口。
+ */
+const scenes = ref(defaultScenes())
+
+function defaultScenes() {
+  return [2, 3, 4].map((value) => ({ value, label: BUILTIN_SCENE_LABELS[value], custom: false }))
+}
+
+/**
+ * 用后端下发的 agents 合并出可见场景列表。
+ *
+ * 契约（3-3）：`data.agents = [{code,name,scene,runtime,builtin,tools,version}]`，
+ * 包含已启用的 chat 载体配置（内置 chat 行 scene=1 + 自定义智能体 scene>=101）。
+ * 合并规则与理由：
+ *  1. agents 不是非空数组 → 直接返回默认 3 项（**回落**，见上）；
+ *  2. scene=1 的内置 chat 行不变成 tab：抽屉从来没有“通用问答”tab（改造前就是 2/3/4），
+ *     多一个通用 tab 等于偷偷新增一个能力入口；
+ *  3. 内置 2/3/4 沿用固定中文名（配置台允许改名，入口名跟着变会让运营找不到）；
+ *     后端 name 仅在内置映射缺失时兜底；
+ *  4. 自定义场景（非内置，契约是 scene>=101）追加为 tab，label 用后端 name；
+ *  5. 默认 3 项**始终保留**：即使后端某次只下发了自定义行（内置 chat 行被停用等），
+ *     也不能让既有 tab 忽然消失——抽屉可用性由 `/agent/status` 的 enabled 决定，不由 tab 决定；
+ *  6. 按 scene 升序：tab 顺序必须稳定，否则每次打开抽屉 tab 位置都可能变（点错的来源）。
+ */
+function mergeScenes(agents) {
+  const list = Array.isArray(agents) ? agents : []
+  if (list.length === 0) return defaultScenes()
+  const byScene = new Map()
+  list.forEach((agent) => {
+    if (!agent) return
+    const raw = agent.scene
+    if (raw === null || raw === undefined || raw === '') return
+    const value = Number(raw)
+    // 缺 scene / 非数字 / scene<1 的下发行无法路由到 Python 侧图，不能成为 tab
+    if (!Number.isFinite(value) || value < 1) return
+    // scene=1 是内置 chat 载体的配置行，不是抽屉里的一个 tab（理由见上）
+    if (value === 1) return
+    const builtin = agent.builtin === 1 || agent.builtin === true || [2, 3, 4].indexOf(value) >= 0
+    const label = (builtin && BUILTIN_SCENE_LABELS[value]) || agent.name || '场景 ' + value
+    byScene.set(value, { value, label, custom: !builtin, builtin })
+  })
+  ;[2, 3, 4].forEach((value) => {
+    if (!byScene.has(value)) {
+      byScene.set(value, { value, label: BUILTIN_SCENE_LABELS[value], custom: false, builtin: true })
+    }
+  })
+  return Array.from(byScene.values()).sort((a, b) => a.value - b.value)
+}
+
+/**
+ * 自定义场景的通用快捷问题。
+ *
+ * 为什么不给自定义场景写专属问题：它们的工具子集/提示词由管理员在配置台按场景下发，
+ * 前端无从知道“这个智能体到底能查什么”。写死具体问题=把做不到的事摆在快捷入口
+ * （2026-10-01 已修过一次同类问题：提示与能力脱节比答错更耗信任）。
+ */
+const CUSTOM_QUICK_QUESTIONS = [
+  { text: '这个场景你能做什么？' },
+  { text: '你能查哪些数据？' }
 ]
 
 // 快捷问题与原型 V2 抽屉一致，按场景各给一组。
@@ -299,8 +372,34 @@ let messageSeq = 0
 // 状态探测只做一次（失败后由"重试"按钮显式触发，避免每次打开都打扰）
 let probed = false
 
-const quickQuestions = computed(() => QUICK_QUESTIONS[scene.value] || QUICK_QUESTIONS[2])
-const greeting = computed(() => GREETINGS[scene.value] || GREETINGS[2])
+/**
+ * 当前场景项（在**动态** scenes 里查；找不到返回 null，文案回落内置 2，不抛错）。
+ * 放在快捷问题/欢迎语之前：两者都依赖它判断“是否自定义场景”。
+ */
+const currentScene = computed(() => {
+  return scenes.value.filter((item) => item.value === scene.value)[0] || null
+})
+
+const quickQuestions = computed(() => {
+  // 自定义场景用通用兜底（见 CUSTOM_QUICK_QUESTIONS）；模板固定读 [0]/[1]，故兜底必须有 2 项
+  if (currentScene.value && currentScene.value.custom) return CUSTOM_QUICK_QUESTIONS
+  return QUICK_QUESTIONS[scene.value] || QUICK_QUESTIONS[2]
+})
+
+/**
+ * 欢迎语：自定义智能体只承诺“工具由管理员配置、以实际查询为准、不能改业务数据”，
+ * 不复用内置场景的专属承诺（补货依据/设备诊断/分析口径都不该套到自定义场景上）。
+ */
+const greeting = computed(() => {
+  if (currentScene.value && currentScene.value.custom) {
+    return (
+      '你好，我是自定义智能体「' + currentScene.value.label + '」。' +
+      '我的可用工具由管理员在配置台按场景下发，能力以实际查询结果为准；' +
+      '我不能修改任何业务数据（建单/调整/停用请到对应业务页面人工操作）。'
+    )
+  }
+  return GREETINGS[scene.value] || GREETINGS[2]
+})
 
 function close() {
   agentStore.close()
@@ -395,13 +494,33 @@ function resetConversation() {
   draft.value = ''
 }
 
+/**
+ * 应用后端下发的场景列表（3-3）。
+ *
+ * 当前 scene 不在新列表时回落到 2（补货）：否则 tab 一个都不高亮，后续请求还会带着
+ * 后端已不再接受的 scene（该自定义智能体已被停用/删除）。旧 thread 属于那个已不存在的
+ * 场景，继续复用会把两种图路由混进同一条会话，所以一并开启新会话。
+ * 只有确实存在旧会话时才提示，避免“一打开抽屉就弹一条通知”。
+ */
+function applyScenes(agents) {
+  const next = mergeScenes(agents)
+  scenes.value = next
+  if (next.some((item) => item.value === scene.value)) return
+  const hadConversation = !!conversationId.value
+  scene.value = 2
+  resetConversation()
+  if (hadConversation) ElMessage.info('当前智能体已不可用，已回落到「补货 Agent」并开启新会话')
+}
+
 function switchScene(value) {
   if (value === scene.value) return
   scene.value = value
   // 为什么切场景要新开会话：scene 决定 Python 侧的路由图（Phase 1 起），
   // 跨场景复用同一 thread 会让上下文语义混乱，因此明确重置并提示。
   resetConversation()
-  ElMessage.info('已切换到「' + SCENES.filter((s) => s.value === value)[0].label + '」，已开启新会话')
+  // label 从**动态列表**取（自定义场景不在原硬编码表里，查不到就退回 scene 编号，不抛错）
+  const hit = scenes.value.filter((s) => s.value === value)[0]
+  ElMessage.info('已切换到「' + (hit ? hit.label : '场景 ' + value) + '」，已开启新会话')
 }
 
 /**
@@ -412,6 +531,10 @@ async function probeStatus(force) {
   if (probed && !force) return
   probed = true
   const status = await probeAgentStatus()
+  // 3-3：场景清单与启用状态**互不影响**。agents 缺失/为空（老后端、上游不可达、配置表为空）
+  // 一律回落硬编码 3 项；这里只更新列表，不参与 degraded 判定——场景清单取不到不该让抽屉不可用。
+  // 重试（force=true）会重新走这里，因此恢复后能刷新出新下发的自定义场景。
+  applyScenes(status && status.agents)
   if (status.unauthorized) {
     agentStore.setDegraded(true, '登录状态已过期，请重新登录后再使用 AI 助手')
   } else if (!status.enabled) {
@@ -616,6 +739,8 @@ onBeforeUnmount(stop)
 
 .agent-tabs {
   display: flex;
+  /* 自定义智能体数量不固定，tab 必须能换行——否则下发第 4、5 个场景后会横向溢出被裁掉 */
+  flex-wrap: wrap;
   gap: 6px;
   padding: 10px 16px;
   border-bottom: 1px solid #ebeef5;

@@ -90,7 +90,10 @@ export function probeAgentStatus() {
       return {
         enabled: data.enabled !== false,
         upstream: data.upstream === 'up' ? 'up' : 'down',
-        unauthorized: false
+        unauthorized: false,
+        // 3-3：场景下发。非数组/缺失一律给空数组，组件据此回落硬编码 2/3/4（灰度友好：
+        // 老版本 Java 不返回该字段、上游 Python 不可达、DB 关闭时都走这条回落，抽屉仍可用）
+        agents: Array.isArray(data.agents) ? data.agents : []
       }
     })
     .catch(() => ({ enabled: false, upstream: 'down', unauthorized: false }))
