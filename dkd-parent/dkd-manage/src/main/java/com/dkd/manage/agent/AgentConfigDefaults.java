@@ -193,7 +193,10 @@ public final class AgentConfigDefaults
                 "list_device_anomalies",
                 "list_inflight_work_orders",
                 "list_restock_suggestions",
-                "search_device_history")));
+                "search_device_history",
+                // 排期 3-6：知识库 L2 检索工具（Python TOOL_NAMES_BY_SCENE[SCENE_DIAGNOSE] 同步新增）。
+                // 不加进白名单的话，配置台选不到它，运营就只能改代码——而「工具可配」正是 3-4 的目标。
+                "search_knowledge_base")));
         whitelist.put(RUNTIME_RESTOCK, Collections.<String>emptyList());
         whitelist.put(RUNTIME_FAULT, Collections.<String>emptyList());
         return Collections.unmodifiableMap(whitelist);
