@@ -58,6 +58,7 @@ class AgentMapperXmlBuildTest
         parse(configuration, "mapper/manage/AgentLlmProbeMapper.xml");
         parse(configuration, "mapper/manage/AgentMcpServerMapper.xml");
         parse(configuration, "mapper/manage/AgentEvalReportMapper.xml");
+        parse(configuration, "mapper/manage/AgentDashboardMapper.xml");
 
         assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentLogMapper.selectAgentLogList")).isTrue();
         assertThat(configuration
@@ -95,6 +96,12 @@ class AgentMapperXmlBuildTest
                 .hasStatement("com.dkd.manage.mapper.AgentEvalReportMapper.insertAgentEvalReport")).isTrue();
         assertThat(configuration
                 .hasStatement("com.dkd.manage.mapper.AgentEvalReportMapper.selectLatestForVersion")).isTrue();
+
+        // Batch F1：驾驶舱聚合（全部带窗口的单条聚合 SQL）
+        assertThat(configuration
+                .hasStatement("com.dkd.manage.mapper.AgentDashboardMapper.selectAdoptionAggregate")).isTrue();
+        assertThat(configuration
+                .hasStatement("com.dkd.manage.mapper.AgentDashboardMapper.selectLatestCompareReport")).isTrue();
     }
 
     /**

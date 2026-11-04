@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentDashboardMapper">
+
+    <!--
+      智能体驾驶舱聚合查询（排期 6-1，原型 S7）。
+
+      ## 四条硬约束（改之前先读 docs/agent-metrics-dictionary.md V1）
+
+      1. **每条聚合都带时间窗口**
+         整个驾驶舱默认近 7 天、最大 30 天；本机/生产是单主库无只读从库（AGENTS §1 约束 5），
+         无窗口的 count/sum 会随数据增长变成全表扫描。窗口参数由 Service 计算后传入，
+         SQL 里时间条件**无条件**（没有 <if> 口子）。
+
+      2. **时间过滤用范围比较，不包 date_format**
+         `create_time >= #{windowStart} AND create_time <= #{windowEnd}` 能走索引；
+         `date_format(create_time, ...)` 会让索引失效（AGENTS §10 明确禁止）。
+         （SELECT/GROUP BY 里的 date_format 只用于按日分组，不作用于过滤条件，可以接受。）
+
+      3. **采纳/调整口径以 agent_decision_log 为准，不用 adjust_reason**
+         指标字典 §2.1 的实测坑：`save_decision()` 在确认建单时会把之前的 adjust_reason 覆盖为 NULL，
+         按 plan 表算"调整过"会漏掉"先调整后建单"的计划。因此用 append-only 的决策日志判断。
+
+      4. **比率不在 SQL 里算**
+         分母为 0 时 SQL 会返回 NULL 或 0，两种都不够明确；统一由 Service 用"null = 无样本"计算，
+         避免"0% 失败率"与"还没运行过"混为一谈（除零显式定义）。
+    -->
+
+    <!-- 采纳卡（M1/M2）：决策时点归属窗口；cohort = 窗口内被成功决策且已终结（status 3/4/5）的计划 -->
+    <select id="selectAdoptionAggregate" resultType="java.util.LinkedHashMap">
+        select count(1) as totalPlans,
+               coalesce(sum(case when f.status in (4, 5) and d.has_adjust = 0 then 1 else 0 end), 0) as orderedPlans,
+               coalesce(sum(case when f.status in (4, 5) and d.has_adjust = 1 then 1 else 0 end), 0) as adjustedPlans
+        from (
+            select l.target_id as plan_id,
+                   max(case when l.action = 'restock.adjust' then 1 else 0 end) as has_adjust
+            from agent_decision_log l
+            where l.del_flag = '0'
+              and l.target_type = 'plan'
+              and l.action in ('restock.confirm', 'restock.adjust', 'restock.skip')
+              and l.result = 1
+              and l.create_time &gt;= #{windowStart}
+              and l.create_time &lt;= #{windowEnd}
+            group by l.target_id
+        ) d
+        join agent_restock_plan f on f.id = cast(d.plan_id as unsigned)
+        where f.del_flag = '0'
+          and f.status in (3, 4, 5)
+    </select>
+
+    <!-- 降级卡（M5/M6）：llm_calibrated=0 计未校准，NULL 单列 unknown 不进分母（字典 §2.2） -->
+    <select id="selectDegradationAggregate" resultType="java.util.LinkedHashMap">
+        select count(1) as totalPlans,
+               coalesce(sum(case when llm_calibrated is null then 1 else 0 end), 0) as unknownPlans,
+               coalesce(sum(case when llm_calibrated = 0 then 1 else 0 end), 0) as uncalibratedPlans
+        from agent_restock_plan
+        where del_flag = '0'
+          <!-- plan_date 是 DATE 列：对**参数**取 DATE() 再比较，避免 'YYYY-MM-DD' 与带时分秒的参数字符串比较失配 -->
+          and plan_date &gt;= DATE(#{windowStart})
+          and plan_date &lt;= DATE(#{windowEnd})
+    </select>
+
+    <!-- 成本卡（M8 chat 侧）：agent_message 一行 = 一次 LLM 调用投影 -->
+    <select id="selectCostAggregate" resultType="java.util.LinkedHashMap">
+        select count(1) as calls,
+               coalesce(sum(tokens_in), 0) as tokensIn,
+               coalesce(sum(tokens_out), 0) as tokensOut,
+               coalesce(sum(tokens_in), 0) + coalesce(sum(tokens_out), 0) as tokensTotal,
+               case when count(1) = 0 then null else round(avg(latency_ms), 0) end as avgLatencyMs
+        from agent_message
+        where del_flag = '0'
+          and create_time &gt;= #{windowStart}
+          and create_time &lt;= #{windowEnd}
+    </select>
+
+    <!-- 成本卡按日趋势：date_format 只用于 SELECT/GROUP BY（过滤仍是 create_time 范围） -->
+    <select id="selectDailyCost" resultType="java.util.LinkedHashMap">
+        select date_format(create_time, '%Y-%m-%d') as statDate,
+               count(1) as calls,
+               coalesce(sum(tokens_in), 0) + coalesce(sum(tokens_out), 0) as tokensTotal
+        from agent_message
+        where del_flag = '0'
+          and create_time &gt;= #{windowStart}
+          and create_time &lt;= #{windowEnd}
+        group by date_format(create_time, '%Y-%m-%d')
+        order by statDate asc
+    </select>
+
+    <!-- 失败卡（M9）：分母=终态运行（done/failed/interrupted）；running/waiting_confirm 不进分母 -->
+    <select id="selectFailureAggregate" resultType="java.util.LinkedHashMap">
+        select count(1) as runs,
+               coalesce(sum(case when status in ('failed', 'interrupted') then 1 else 0 end), 0) as failedRuns
+        from agent_run
+        where del_flag = '0'
+          and status in ('done', 'failed', 'interrupted')
+          and started_at &gt;= #{windowStart}
+          and started_at &lt;= #{windowEnd}
+    </select>
+
+    <!-- 失败卡：ERROR 日志条数（agent_log 只增，无 del_flag） -->
+    <select id="selectErrorLogCount" resultType="java.util.LinkedHashMap">
+        select count(1) as errorLogs
+        from agent_log
+        where level = 'ERROR'
+          and create_time &gt;= #{windowStart}
+          and create_time &lt;= #{windowEnd}
+    </select>
+
+    <!-- 待我处理：窗口内 status 1建议/2已调整/6待指派；超时按"最近变更（无则创建）至今"计算 -->
+    <select id="selectPendingAggregate" resultType="java.util.LinkedHashMap">
+        <!-- count 是函数名，别名加 pending 前缀避免解析歧义；Service 再映射成 JSON 的 count -->
+        select count(1) as pendingCount,
+               coalesce(sum(case when timestampdiff(minute, coalesce(update_time, create_time), now())
+                    &gt;= #{thresholdMinutes} then 1 else 0 end), 0) as overThreshold,
+               coalesce(max(timestampdiff(minute, coalesce(update_time, create_time), now())), 0) as oldestWaitMinutes
+        from agent_restock_plan
+        where del_flag = '0'
+          and status in (1, 2, 6)
+          and plan_date &gt;= DATE(#{windowStart})
+          and plan_date &lt;= DATE(#{windowEnd})
+    </select>
+
+    <!-- 对比卡（5-4/6-1）：只读最新一行；n=0 时由 Service 判 available=false，不画结论 -->
+    <select id="selectLatestCompareReport" resultType="java.util.LinkedHashMap">
+        select n as n,
+               mean_delta_pct as meanDeltaPct,
+               median_delta_pct as medianDeltaPct,
+               plan_date as planDate,
+               generated_at as generatedAt
+        from agent_compare_report
+        <!-- 只增的证据表；没有 del_flag，按生成时间倒序取最新一行 -->
+        order by generated_at desc, id desc
+        limit 1
+    </select>
+
+</mapper>
