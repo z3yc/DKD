@@ -60,6 +60,13 @@ public class AgentMessageVo
     /** 模型标识 */
     private String model;
 
+    /**
+     * 生成本条消息时使用的智能体配置版本（排期 4-2；NULL = 历史/旧数据）。
+     *
+     * <p>只做标注、不回写历史内容：配置回滚后旧消息仍显示生成时的那一版。
+     */
+    private Long configVersion;
+
     /** 输入 token 数 */
     private Integer tokensIn;
 
@@ -184,6 +191,16 @@ public class AgentMessageVo
     public void setModel(String model)
     {
         this.model = model;
+    }
+
+    public Long getConfigVersion()
+    {
+        return configVersion;
+    }
+
+    public void setConfigVersion(Long configVersion)
+    {
+        this.configVersion = configVersion;
     }
 
     public Integer getTokensIn()

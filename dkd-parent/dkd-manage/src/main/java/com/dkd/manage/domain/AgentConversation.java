@@ -39,6 +39,14 @@ public class AgentConversation extends AgentTimeRangeQuery
     /** 场景：1-通用问答 2-补货 3-诊断 4-运营分析（≥101 为自定义） */
     private Integer scene;
 
+    /**
+     * 本会话首次创建时使用的智能体配置版本（排期 4-2，可空）。
+     *
+     * <p>NULL = 历史/旧数据（DDL 加列前的行）：**不能编造一个版本号**，
+     * 否则页面会把"不知道"显示成"v1 生成的"，排障时直接误导。
+     */
+    private Long configVersion;
+
     /** 会话标题（首条用户消息摘要） */
     private String title;
 
@@ -113,6 +121,16 @@ public class AgentConversation extends AgentTimeRangeQuery
         this.scene = scene;
     }
 
+    public Long getConfigVersion()
+    {
+        return configVersion;
+    }
+
+    public void setConfigVersion(Long configVersion)
+    {
+        this.configVersion = configVersion;
+    }
+
     public String getTitle()
     {
         return title;
@@ -163,6 +181,7 @@ public class AgentConversation extends AgentTimeRangeQuery
                 .append("userName", getUserName())
                 .append("regionId", getRegionId())
                 .append("scene", getScene())
+                .append("configVersion", getConfigVersion())
                 .append("title", getTitle())
                 .append("status", getStatus())
                 .append("messageCount", getMessageCount())

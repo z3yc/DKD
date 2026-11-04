@@ -78,6 +78,8 @@ class AgentConversationServiceTest
         vo.setUserName("运营小王");
         vo.setRegionId(Long.valueOf(3L));
         vo.setScene(Integer.valueOf(1));
+        // 排期 4-2：会话头带配置版本（历史行为 null，由用例显式清空验证"不编造"）
+        vo.setConfigVersion(Long.valueOf(3L));
         vo.setTitle("库存查询");
         vo.setStatus(Integer.valueOf(1));
         vo.setMessageCount(Integer.valueOf(messageCount));
@@ -105,6 +107,8 @@ class AgentConversationServiceTest
         message.setMsgRole(Integer.valueOf(msgRole));
         message.setContent(content);
         message.setModel("deepseek-chat");
+        // 排期 4-2：消息级配置版本（历史消息为 null，由用例显式清空验证）
+        message.setConfigVersion(Long.valueOf(4L));
         message.setTokensIn(Integer.valueOf(100));
         message.setTokensOut(Integer.valueOf(50));
         message.setLatencyMs(Integer.valueOf(800));
@@ -118,6 +122,7 @@ class AgentConversationServiceTest
     {
         AgentConversationVo headA = head("conv-a", 12);
         AgentConversationVo headB = head("conv-b", 3);
+        headB.setConfigVersion(null);
         when(agentConversationMapper.selectAgentConversationList(any(AgentConversation.class), any(AgentQueryWindow.class)))
                 .thenReturn(new ArrayList<AgentConversationVo>(Arrays.asList(headA, headB)));
         when(agentConversationMapper.selectAgentMessageAggregates(anyList()))
@@ -134,6 +139,9 @@ class AgentConversationServiceTest
         assertThat(list.get(0).getTokensIn()).isEqualTo(1300L);
         assertThat(list.get(0).getTokensOut()).isEqualTo(700L);
         assertThat(list.get(0).getLastMessageTime()).isEqualTo(date("2026-11-04 10:30:00"));
+        // 排期 4-1/4-2：列表带会话头配置版本；历史行（未记录版本）保持 null，不编造
+        assertThat(list.get(0).getConfigVersion()).isEqualTo(3L);
+        assertThat(list.get(1).getConfigVersion()).isNull();
         // conv-b 没有任何消息：给确定的 0/null，前端不必到处判空
         assertThat(list.get(1).getActualMessageCount()).isEqualTo(0);
         assertThat(list.get(1).getToolCallsCount()).isEqualTo(0);
@@ -229,6 +237,10 @@ class AgentConversationServiceTest
         assertThat(longMessage.getContent()).hasSize(AgentConversationServiceImpl.MAX_CONTENT_LENGTH);
         // 未超上限 → 不标记截断
         assertThat(detail.getMessagesTruncated()).isFalse();
+        // 排期 4-2：会话头与消息都带配置版本（消息版本是"生成本条消息时"的版本）
+        assertThat(detail.getConversation().getConfigVersion()).isEqualTo(3L);
+        assertThat(shortMessage.getConfigVersion()).isEqualTo(4L);
+        assertThat(longMessage.getConfigVersion()).isEqualTo(4L);
     }
 
     @Test
@@ -281,12 +293,14 @@ class AgentConversationServiceTest
     }
 
     @Test
-    @DisplayName("详情：tool_calls 合法 JSON 解析为对象并计数")
+    @DisplayName("详情：tool_calls 合法 JSON 解析为对象并计数（富字段 resultRows/resultChars/durationMs/status 原样透传）")
     void 详情工具调用JSON解析()
     {
         AgentMessage message = message(1, 2, "已查询");
-        message.setToolCalls("[{\"name\":\"get_machine_inventory\",\"args\":{\"innerCode\":\"A1000001\"}},"
-                + "{\"name\":\"list_order_anomalies\",\"args\":{}}]");
+        // Python 侧 4-1 会写入的富字段：Java 不做二次解析/裁剪，整段 JSON 原样给前端
+        message.setToolCalls("[{\"name\":\"get_machine_inventory\",\"args\":{\"innerCode\":\"A1000001\"},"
+                + "\"resultRows\":12,\"resultChars\":345,\"durationMs\":67,\"status\":\"ok\"},"
+                + "{\"name\":\"list_order_anomalies\",\"args\":{},\"resultRows\":0,\"status\":\"empty\"}]");
         stubDetail(message, 1);
 
         AgentConversationDetailVo detail = agentConversationService.selectConversationDetail(CONVERSATION_ID);
@@ -297,6 +311,34 @@ class AgentConversationServiceTest
         assertThat(vo.getToolCallCount()).isEqualTo(2);
         assertThat(vo.getToolCallsRaw()).isNull();
         assertThat(vo.getToolCallsParseError()).isNull();
+        assertThat(vo.getConfigVersion()).isEqualTo(4L);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> firstCall = (Map<String, Object>) ((List<?>) vo.getToolCalls()).get(0);
+        assertThat(firstCall).containsEntry("resultRows", Integer.valueOf(12))
+                .containsEntry("resultChars", Integer.valueOf(345))
+                .containsEntry("durationMs", Integer.valueOf(67))
+                .containsEntry("status", "ok");
+    }
+
+    @Test
+    @DisplayName("详情：历史行（config_version 为 NULL）保持 NULL，不编造版本号")
+    void 详情历史行配置版本保持NULL()
+    {
+        AgentConversationVo historicalHead = head(CONVERSATION_ID, 1);
+        historicalHead.setConfigVersion(null);
+        AgentMessage historicalMessage = message(1, 2, "旧回复");
+        historicalMessage.setConfigVersion(null);
+        when(agentConversationMapper.selectAgentConversationByConversationId(CONVERSATION_ID))
+                .thenReturn(historicalHead);
+        when(agentConversationMapper.selectAgentMessageAggregates(anyList()))
+                .thenReturn(new ArrayList<AgentConversationVo>());
+        when(agentConversationMapper.selectAgentMessagesByConversationId(anyString(), anyInt()))
+                .thenReturn(new ArrayList<AgentMessage>(Collections.singletonList(historicalMessage)));
+
+        AgentConversationDetailVo detail = agentConversationService.selectConversationDetail(CONVERSATION_ID);
+
+        assertThat(detail.getConversation().getConfigVersion()).isNull();
+        assertThat(detail.getMessages().get(0).getConfigVersion()).isNull();
     }
 
     @Test

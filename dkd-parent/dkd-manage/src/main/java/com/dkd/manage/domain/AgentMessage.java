@@ -47,6 +47,13 @@ public class AgentMessage extends BaseEntity
     /** 模型标识（如 deepseek-chat） */
     private String model;
 
+    /**
+     * 生成本条消息时使用的智能体配置版本（排期 4-2，可空）。
+     *
+     * <p>NULL = 历史/旧数据（DDL 加列前的行），出参保持 null；**不编造版本号**。
+     */
+    private Long configVersion;
+
     /** 输入 token 数 */
     private Integer tokensIn;
 
@@ -142,6 +149,16 @@ public class AgentMessage extends BaseEntity
     public void setModel(String model)
     {
         this.model = model;
+    }
+
+    public Long getConfigVersion()
+    {
+        return configVersion;
+    }
+
+    public void setConfigVersion(Long configVersion)
+    {
+        this.configVersion = configVersion;
     }
 
     public Integer getTokensIn()

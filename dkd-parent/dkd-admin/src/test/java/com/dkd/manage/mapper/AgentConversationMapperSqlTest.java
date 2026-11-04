@@ -154,6 +154,45 @@ class AgentConversationMapperSqlTest
     }
 
     @Test
+    @DisplayName("排期 4-1/4-2：会话头与消息查询都带 config_version（只读标注，允许 NULL）")
+    void configVersionColumnsAreSelected() throws Exception
+    {
+        String conversationVo = textOf("sql", "selectAgentConversationVo");
+        assertTrue(conversationVo.contains("config_version"),
+                "会话头查询（列表与详情共用）必须带 config_version\nSQL=" + conversationVo);
+
+        String messages = textOf("select", "selectAgentMessagesByConversationId");
+        assertTrue(messages.contains("config_version"), "消息时间线查询必须带 config_version\nSQL=" + messages);
+
+        // 两个 resultMap 都要有映射，否则列查出来了也不会进 VO（页面看到 null 却以为"历史数据"）。
+        // 注意把连续空白归一化后再断言：XML 里属性是对齐排版的（多空格）
+        String normalizedRaw = rawXml().replaceAll("\\s+", " ");
+        int mappings = countOccurrences(normalizedRaw,
+                "property=\"configVersion\" column=\"config_version\"");
+        assertTrue(mappings >= 2,
+                "resultMap 缺少 configVersion 映射（会话头或消息都至少要有）。实际=" + mappings);
+    }
+
+    /**
+     * 统计子串出现次数（用于断言 resultMap 个数）。
+     *
+     * @param text   目标文本
+     * @param needle 子串
+     * @return 次数
+     */
+    private static int countOccurrences(String text, String needle)
+    {
+        int count = 0;
+        int index = text.indexOf(needle);
+        while (index >= 0)
+        {
+            count++;
+            index = text.indexOf(needle, index + needle.length());
+        }
+        return count;
+    }
+
+    @Test
     @DisplayName("会话详情按 conversation_id 查询且过滤 del_flag、只取一条")
     void detailQueryIsExactAndBounded()
     {

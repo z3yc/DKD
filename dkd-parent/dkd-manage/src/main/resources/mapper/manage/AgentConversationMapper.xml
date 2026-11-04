@@ -30,6 +30,12 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
       4. **聚合口径用 count(1) 而不是 message_count 冗余列**
          message_count 是 Python 侧维护的冗余值，可能滞后。列表同时返回
          表内值与实测值，让"计数漂移"可见，而不是拿冗余值冒充事实。
+
+      5. **config_version 是只读标注、允许 NULL（排期 4-1/4-2，DDL 见
+         docs/ddl/agent_conversation_version.sql）**
+         会话头与每条消息各带一个配置版本，用于回答"这条回复是哪一版智能体配置生成的"。
+         加列前的历史行是 NULL，**保持 NULL**（不编造版本号）；它只做标注，不回写历史内容——
+         配置回滚后旧消息仍显示生成时的那一版。
     -->
 
     <!-- 会话头结果映射；聚合查询复用同一个 resultMap（用不到的列 MyBatis 会自动跳过） -->
@@ -40,6 +46,7 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         <result property="userName"           column="user_name"            />
         <result property="regionId"           column="region_id"            />
         <result property="scene"              column="scene"                />
+        <result property="configVersion"      column="config_version"       />
         <result property="title"              column="title"                />
         <result property="status"             column="status"               />
         <result property="messageCount"       column="message_count"        />
@@ -66,6 +73,7 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         -->
         <result property="toolCalls"      column="tool_calls"      />
         <result property="model"          column="model"           />
+        <result property="configVersion"  column="config_version"  />
         <result property="tokensIn"       column="tokens_in"       />
         <result property="tokensOut"      column="tokens_out"      />
         <result property="latencyMs"      column="latency_ms"      />
@@ -76,7 +84,7 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
     </resultMap>
 
     <sql id="selectAgentConversationVo">
-        select id, conversation_id, user_id, user_name, region_id, scene, title, status,
+        select id, conversation_id, user_id, user_name, region_id, scene, config_version, title, status,
                message_count, create_time, update_time
         from agent_conversation
     </sql>
@@ -135,7 +143,7 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
     </select>
 
     <select id="selectAgentMessagesByConversationId" resultMap="AgentMessageResult">
-        select id, conversation_id, user_id, seq, msg_role, content, tool_calls, model,
+        select id, conversation_id, user_id, seq, msg_role, content, tool_calls, model, config_version,
                tokens_in, tokens_out, latency_ms, request_id, create_by, create_time, del_flag
         from agent_message
         where conversation_id = #{conversationId} and del_flag = '0'

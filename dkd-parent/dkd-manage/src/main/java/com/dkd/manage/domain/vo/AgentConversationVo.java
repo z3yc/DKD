@@ -41,6 +41,14 @@ public class AgentConversationVo
     /** 场景：1-通用问答 2-补货 3-诊断 4-运营分析（≥101 自定义） */
     private Integer scene;
 
+    /**
+     * 本会话首次创建时使用的智能体配置版本（排期 4-2；NULL = 历史/旧数据）。
+     *
+     * <p>为什么列表/详情都要带：配置回滚后，页面要能回答"这段对话是哪一版配置生成的"；
+     * 历史行没有版本号时保持 null（不编造），前端显示"—"即可。
+     */
+    private Long configVersion;
+
     /** 会话标题 */
     private String title;
 
@@ -132,6 +140,16 @@ public class AgentConversationVo
     public void setScene(Integer scene)
     {
         this.scene = scene;
+    }
+
+    public Long getConfigVersion()
+    {
+        return configVersion;
+    }
+
+    public void setConfigVersion(Long configVersion)
+    {
+        this.configVersion = configVersion;
     }
 
     public String getTitle()

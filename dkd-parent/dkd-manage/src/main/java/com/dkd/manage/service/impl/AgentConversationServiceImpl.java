@@ -182,6 +182,8 @@ public class AgentConversationServiceImpl implements IAgentConversationService
         vo.setSeq(message.getSeq());
         vo.setMsgRole(message.getMsgRole());
         vo.setModel(message.getModel());
+        // 排期 4-2：消息级配置版本（历史行为 null，保持 null——不编造"v1"）
+        vo.setConfigVersion(message.getConfigVersion());
         vo.setTokensIn(message.getTokensIn());
         vo.setTokensOut(message.getTokensOut());
         vo.setLatencyMs(message.getLatencyMs());
