@@ -39,8 +39,9 @@ from app.db import get_sessionmaker
 from app.graphs.restock_decisions import summarize_plan
 from app.graphs.restock_plan_store import SqlPauseStore, SqlPlanStore, plan_from_row
 from app.graphs.restock_state import status_label
-from app.prompts.assistant_chat import tool_names_for_scene
-from app.services import time_hint
+from app.logging_conf import current_request_id
+from app.prompts.assistant_chat import SCENE_DIAGNOSE, tool_names_for_scene
+from app.services import kb_store, time_hint
 from app.services.diagnosis import compose_diagnosis
 from app.tools import read_tools
 from app.tools.read_tools import ToolError, default_sales_window
@@ -646,6 +647,66 @@ async def _search_device_history(inner_code: str, days: int = DEFAULT_CASE_WINDO
     return _json(payload)
 
 
+class _KbSearchArgs(BaseModel):
+    query: str = Field(
+        min_length=1, max_length=200, description="知识库检索问题/关键词（故障码、现象、操作步骤）"
+    )
+    top_k: int = Field(default=5, ge=1, le=10, description="返回片段数，默认 5")
+
+
+async def _search_knowledge_base(query: str, top_k: int = 5) -> str:
+    """知识库 L2 检索（3-6）：只返回文档语料片段 + 相似度，不返回“模型结论”。
+
+    为什么它必须存在：诊断/运营回答里最危险的错误是“听起来专业但没依据”。
+    这个工具把「有没有依据」变成可核验的检索结果（docCode/score/excerpt/fallbackReason），
+    再由 `app/services/kb_citation.py` 在回答层做引用强制校验（没标注 [KB:...] 就回退为仅列证据）。
+    """
+    try:
+        async with get_sessionmaker()() as session:
+            result = await kb_store.search(
+                session,
+                query=query,
+                top_k=top_k,
+                scene=SCENE_DIAGNOSE,
+                request_id=current_request_id(),
+            )
+    except Exception as exc:  # noqa: BLE001 —— 检索失败是业务结果，不抛穿编排层
+        logger.warning("知识库检索失败：%s", type(exc).__name__)
+        return json.dumps(
+            {
+                "error": "知识库检索失败（查询异常）。请如实告知用户无法检索，"
+                "不要编造依据、来源或处置步骤。"
+            },
+            ensure_ascii=False,
+        )
+
+    hits = [
+        {
+            "docCode": hit.get("docCode"),
+            "title": hit.get("title"),
+            "score": round(float(hit.get("score", 0.0)), 4),
+            "excerpt": _clip(hit.get("excerpt"), 300),
+        }
+        for hit in (result.get("hits") or [])[:top_k]
+    ]
+    fallback = result.get("fallbackReason")
+    payload = {
+        "hits": hits,
+        "citations": [f"[KB:{hit['docCode']}]" for hit in hits if hit.get("docCode")],
+        "fallbackReason": fallback,
+        "guidance": (
+            "回答必须用 [KB:<docCode>] 标注来源，且只能引用上面返回的片段；"
+            "没有命中时必须如实说“知识库未覆盖”，不得编造依据。"
+            if hits
+            else (
+                f"知识库未检索到可用依据（{fallback or 'no_hit'}）。"
+                "只能如实说明未覆盖，不得给出结论。"
+            )
+        ),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 class _DiagnosisArgs(BaseModel):
     inner_code: str = Field(description="售货机编码；未确认时先用 find_devices 定位")
     days: int = Field(
@@ -780,6 +841,16 @@ def build_diagnosis_tools() -> list[StructuredTool]:
                 "并明确标注描述**能不能当故障现象用**。问“以前有没有遇到过/历史怎么处理的”时用它。"
             ),
             args_schema=_HistoryArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_search_knowledge_base,
+            name="search_knowledge_base",
+            description=(
+                "检索平台知识库 L2 文档语料（厂商手册/故障码表/运营 SOP），返回片段、相似度、"
+                "文档编码（docCode）与回退原因。问“这个故障码是什么意思/标准处置步骤/厂商怎么说”时用它。"
+                "没有命中时必须如实说知识库未覆盖，不要编造依据。"
+            ),
+            args_schema=_KbSearchArgs,
         ),
     ]
 

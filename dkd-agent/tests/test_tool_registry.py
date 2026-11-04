@@ -29,7 +29,7 @@ from app.services.tool_registry import (
     tool_registry_stats,
 )
 
-# 与 agent_tool seed（docs/ddl/agent_tool_llm_profile.sql）一致的 8 个本地工具
+# 与 agent_tool seed（agent_tool_llm_profile.sql + agent_kb_tool_seed.sql）一致的 9 个本地工具
 ALL_TOOLS = frozenset(
     {
         "build_device_diagnosis",
@@ -40,6 +40,7 @@ ALL_TOOLS = frozenset(
         "list_inflight_work_orders",
         "list_restock_suggestions",
         "search_device_history",
+        "search_knowledge_base",
     }
 )
 RESTOCK_TOOLS = (

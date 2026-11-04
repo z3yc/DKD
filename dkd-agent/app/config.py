@@ -185,6 +185,17 @@ class Settings(BaseSettings):
     # 30s 是契约拍板值：既不至于让一次保存等半分钟才生效，也不会让每个请求都打配置表。
     config_ttl_s: float = Field(default=30.0, validation_alias="DKD_AGENT_CONFIG_TTL_S")
 
+    # --- 知识库 L2（排期 3-6）---
+    # 检索阈值：命中分数低于它 → 认为“不可引用”，返回 fallbackReason=low_score 而不是硬凑答案
+    # （AGENTS §7.6：引用必须可追溯；凑出来的引用比“没有引用”危险得多）。
+    # 0.15 是哈希向量的保守初值：先保证“同主题能命中、无关内容不命中”，5-3 再按回退率调优。
+    kb_min_score: float = Field(default=0.15, validation_alias="DKD_AGENT_KB_MIN_SCORE")
+    # 默认召回数：未显式传 topK 时用；上限 20 与前端滑杆一致（避免一次把整库塞进 prompt）。
+    kb_top_k: int = Field(default=5, validation_alias="DKD_AGENT_KB_TOP_K")
+    # 切片参数：500/50 是 task-16 的拍板值。改这里等于改“检索粒度”，需同步评估命中率（5-3）。
+    kb_chunk_size: int = Field(default=500, validation_alias="DKD_AGENT_KB_CHUNK_SIZE")
+    kb_chunk_overlap: int = Field(default=50, validation_alias="DKD_AGENT_KB_CHUNK_OVERLAP")
+
     # --- 补货基线引擎参数（Phase 1 / 任务 1-4）---
     # 为什么全部做成配置而不是常量：这些是**业务参数**（服务水平/补货周期随运营策略变），
     # 排期 3-6/5-2 要按复盘结果迭代它们；硬编码会让“调参”变成“改代码+发版”。

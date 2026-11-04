@@ -44,6 +44,15 @@ AGENT_OWNED_TABLES = frozenset(
         "agent_restock_plan",
         # 1-7 新增：补货自动分析的暂停开关（单行表，DDL 见 docs/ddl/agent_restock_pause.sql）
         "agent_restock_pause",
+        # 3-6 新增：知识库 L2 文档/切片/检索记录（Python ingest 写入；DDL 见 agent_kb_mcp.sql）。
+        # 为什么不放 AGENT_READ_ONLY_TABLES：这三张属智能体自有数据（语料/检索归因），
+        # 由 Python 维护（只授 SELECT/INSERT/UPDATE，无 DELETE），不是业务事实。
+        "agent_kb_document",
+        "agent_kb_chunk",
+        "agent_kb_retrieval",
+        # 3-7 新增：MCP 工具同步与探测记录（server 配置由 Java 管，仅 SELECT）。
+        "agent_mcp_tool",
+        "agent_mcp_probe",
     }
 )
 

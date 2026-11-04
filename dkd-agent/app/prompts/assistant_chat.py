@@ -69,6 +69,8 @@ TOOL_NAMES_BY_SCENE: dict[int, tuple[str, ...]] = {
         "build_device_diagnosis",
         "get_machine_inventory",
         "list_inflight_work_orders",
+        # 3-6：知识库 L2 检索（只读；命中才允许引用，未命中必须如实说“未覆盖”）
+        "search_knowledge_base",
     ),
 }
 

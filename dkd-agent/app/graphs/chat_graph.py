@@ -37,7 +37,7 @@ from app.prompts.assistant_chat import (
     SCENE_RESTOCK,
     system_prompt,
 )
-from app.services import carrier_config, diagnosis_checklist, time_hint
+from app.services import carrier_config, diagnosis_checklist, kb_citation, time_hint
 
 # 工具调用轮次上限（防“模型反复调工具烧 token”）。3 轮足够覆盖
 # “清单 → 查某台设备 → 查销量”这种最多三跳的问题；超出则强制作答。
@@ -424,6 +424,9 @@ async def respond_with_llm(
             f"我连续查询了 {MAX_TOOL_ROUNDS} 轮仍未能得出结论。"
             "请把问题说得更具体一些（例如指定设备编码或日期），我再查一次。"
         )
+        fallback, forced = kb_citation.enforce_citation(fallback, state.get("messages", []))
+        if forced:
+            logger.warning("知识库引用校验回退（轮次上限路径）：scene=%s", scene)
         return {
             "messages": [AIMessage(content=fallback)],
             "reply": fallback,
@@ -432,11 +435,18 @@ async def respond_with_llm(
             "tokens_out": tokens_out,
         }
 
+    reply = "" if tool_calls else content
+    if reply:
+        # 3-6：知识库引用强制校验（确定性、不依赖模型自觉）。详见 services/kb_citation.py。
+        reply, forced = kb_citation.enforce_citation(reply, state.get("messages", []))
+        if forced:
+            logger.warning("知识库引用校验回退：scene=%s", scene)
+
     return {
         # 带 tool_calls 时把模型的 AIMessage 原样入历史（否则 ToolNode 找不到调用 ID）
         "messages": [resp],
         # 命中工具调用时不算答案（见 docstring 第 3 点）
-        "reply": "" if tool_calls else content,
+        "reply": reply,
         "model": str(meta.get("model_name") or meta.get("model") or "unknown"),
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,

@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api import agents, chat, fault, llm_probe, ops, restock
+from app.api import agents, chat, fault, kb, llm_probe, ops, restock
 from app.checkpoint import (
     ensure_windows_event_loop_policy,
     get_checkpoint_store,
@@ -158,6 +158,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(agents.router)  # 排期 3-3：GET /agent/agents（场景下发）
     app.include_router(llm_probe.router)  # 排期 3-5：POST /agents/llm/ping（模型连通性探测）
+    app.include_router(kb.router)  # 排期 3-6：/agents/kb/**（知识库 L2，服务间密钥）
     app.include_router(ops.router)
     app.include_router(restock.router)
     app.include_router(fault.router)
@@ -232,7 +233,14 @@ def create_app() -> FastAPI:
         )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_exc_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    async def validation_exc_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # 3-6：知识库接口的参数错误按契约返回 **400**（Java 代理据此映射字段错误）；
+        # 其他接口保持既有 422 语义（`/agent/chat` 的保留场景码等依赖它，改全局会破兼容）。
+        if request.url.path.startswith("/agents/kb"):
+            return JSONResponse(
+                status_code=400,
+                content={"code": 400, "msg": "参数校验失败", "data": None},
+            )
         return JSONResponse(
             status_code=422,
             content={"code": 422, "msg": "参数校验失败", "data": exc.errors()},
