@@ -95,6 +95,28 @@ class Settings(BaseSettings):
     obs_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_OBS_ENABLED")
     # 启动扫描判定"僵尸运行"的阈值：running 超过这么多分钟就被改成 interrupted（F-05）
     run_stale_minutes: int = Field(default=30, validation_alias="DKD_AGENT_RUN_STALE_MINUTES")
+
+    # --- 执行日志采集 agent_log（排期 2-4）---
+    # 为什么单独一个开关：日志入库会让**每一行 INFO 都产生一次 DB 写**，
+    # 单测/演示没有库时必须能整体关掉（AGENTS §8：测试不得连数据库通道）。
+    log_db_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_LOG_DB_ENABLED")
+    # 批量写：一个 INSERT 携带多少行。太小会把 DB 打成 N 次往返（日志量大时尤其明显），
+    # 太大则单次事务变长、一条坏行连坐整批；50 是契约拍板值（排期 2-4）。
+    log_batch_size: int = Field(default=50, ge=1, validation_alias="DKD_AGENT_LOG_BATCH_SIZE")
+    # 后台 flush 周期：决定日志落库的最大延迟；同时是队列满之前的缓冲窗口。
+    log_flush_interval_ms: int = Field(
+        default=1000,
+        ge=50,
+        validation_alias="DKD_AGENT_LOG_FLUSH_INTERVAL_MS",
+    )
+    # 保留天数：**只是配置项**，清理脚本（docs/scripts/cleanup-agent-log.sql）按它执行；
+    # Python 侧不执行 DELETE（Agent 账号无 DELETE 权限，清理属排期 4-4，由 Java/运维做）。
+    log_retention_days: int = Field(
+        default=30,
+        ge=1,
+        validation_alias="DKD_AGENT_LOG_RETENTION_DAYS",
+    )
+
     token_daily_limit_per_user: int = Field(
         default=200_000, validation_alias="DKD_AGENT_TOKEN_LIMIT_PER_USER"
     )

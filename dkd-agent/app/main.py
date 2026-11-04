@@ -26,6 +26,7 @@ from app.db import dispose_engine
 from app.graphs.chat_graph import build_chat_graph, resolve_scene_tools
 from app.llm import build_chat_model
 from app.logging_conf import RequestContextMiddleware, setup_logging
+from app.obs.log_handler import db_log_stats, install_db_log_handler, shutdown_db_log_handler
 from app.obs.run_recorder import sweep_stale_runs
 from app.services import carrier_config
 from app.services.restock_analyzer import build_default_analyzer
@@ -92,6 +93,11 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
 
     store = await open_checkpoint_store(s)
     app.state.checkpoint_store = store
+    # 执行日志采集（排期 2-4）：挂在 checkpointer 之后、事件循环已就绪时。
+    # 为什么不在 create_app() 里挂：那时还没有运行中的事件循环（后台 flush task 建不起来）；
+    # 为什么失败也不阻断启动：agent_log 是排障旁路，表未建/DB 抖动只 WARN 一次
+    # （见 app/obs/log_handler.py 纪律 4），不能因此让服务起不来。
+    install_db_log_handler(s)
     # 给 LLM 分支挂上**只读工具**（2026-10-01 补齐智能功能；同日升级为**按场景**挂）：
     #   场景 2（补货）= 补货清单/设备库存/在途工单/近期销量；
     #   场景 3（诊断）= 设备消歧/异常检测/历史维修单 + 库存/在途；
@@ -119,6 +125,8 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     try:
         yield
     finally:
+        # 先 flush 执行日志、再关连接池：顺序反了会把最后一批日志写进已 dispose 的引擎
+        await shutdown_db_log_handler()
         await get_checkpoint_store().close()
         await dispose_engine()
         logger.info("dkd-agent stopped")
@@ -162,6 +170,8 @@ def create_app() -> FastAPI:
             # lifespan 未完成/已关闭：健康检查必须仍能应答，
             # 否则排障时连“服务是否活着”都问不出来
             pass
+        # 执行日志采集（2-4）的装配状态：只读计数器，**不触发 flush/不连库**。
+        log_db = db_log_stats()
         return {
             "status": "ok",
             "env": s.app_env,
@@ -178,6 +188,14 @@ def create_app() -> FastAPI:
             # `config_from_db=False` 即「一键回落纯代码默认」，是灰度回退的判据。
             "config_from_db": s.config_from_db,
             "config_ttl_s": s.config_ttl_s,
+            # 2-4：执行日志采集。`log_db_dropped`/`log_db_write_errors` 是排障关键信号——
+            # 它们长期 >0 说明“日志在丢/写不进库”，而此时业务可能完全正常（静默观测缺失）。
+            "log_db_enabled": s.log_db_enabled,
+            "log_db_retention_days": s.log_retention_days,
+            "log_db_installed": log_db["installed"],
+            "log_db_queue_size": log_db["queue_size"],
+            "log_db_dropped": log_db["dropped"],
+            "log_db_write_errors": log_db["write_errors"],
         }
 
     @app.exception_handler(StarletteHTTPException)
