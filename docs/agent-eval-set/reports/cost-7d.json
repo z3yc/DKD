@@ -1,0 +1,22 @@
+{
+  "generatedAt": "2026-11-04T13:12:07+08:00",
+  "days": 7,
+  "baselineAvailable": false,
+  "note": "无灰度前后真实流量基线；不得据此声称成本下降 ≥20%（5-5 目标 🧑）",
+  "overall": {
+    "calls": 0,
+    "tokensIn": 0,
+    "tokensOut": 0,
+    "tokensTotal": 0,
+    "avgTokensPerCall": 0,
+    "avgLatencyMs": 0.0
+  },
+  "daily": [],
+  "bySceneRuns": [],
+  "quotaHits": [],
+  "recommendations": [
+    "对短问答场景设置更低 max_tokens（当前按模型默认）；成本下降需灰度前后对比验证",
+    "对重复问题启用检索缓存前，先看 bySceneRuns 的调用分布，避免缓存住错误答案",
+    "429 自助提示已包含‘已用/限额/重置时间’（5-5）；限额调整前先看真实调用量"
+  ]
+}

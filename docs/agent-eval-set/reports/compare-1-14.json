@@ -1,0 +1,30 @@
+{
+  "paired": [],
+  "ruleOnly": [],
+  "baselineOnly": [],
+  "ruleTotal": 0,
+  "baselineTotal": 0,
+  "ruleChannelCount": 0,
+  "baselineChannelCount": 0,
+  "meanDeltaPct": null,
+  "medianDeltaPct": null,
+  "metrics": {
+    "inventoryRows": 3,
+    "channelRows": 272,
+    "stockCoverage": 0.011,
+    "outOfStockChannels": 1,
+    "outOfStockRate": 0.3333,
+    "adjustedPlans": 0,
+    "totalPlans": 0,
+    "manualAdjustRate": null
+  },
+  "planDate": "2026-11-04",
+  "n": 0,
+  "generatedAt": "2026-11-04T13:11:40+08:00",
+  "caliberDoc": "docs/agent-restock-1-14-comparison-caliber.md",
+  "limitations": [
+    "规则版只看容量（85% 补满），基线引擎基于销量预测；两者天生不同源，偏差≠谁对谁错",
+    "偏差率只对两边都有建议的配对货道计算；单边建议单独计数",
+    "本机数据量小（FIX-6 数据未到位）；n 为配对样本数，不得据此下业务结论"
+  ]
+}
