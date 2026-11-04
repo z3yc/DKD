@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentToolMapper">
+
+    <!--
+      工具注册表只读查询 + 受限更新（排期 3-4，DDL 见 docs/ddl/agent_tool_llm_profile.sql）。
+
+      ## 两条刻意的取舍
+
+      1. **UPDATE 只 set enabled / timeout_ms / row_limit**
+         code/source/read_only/builtin 是工具的身份事实：`read_only=0` 表示写工具、不允许被模型
+         直调（AGENTS §7.9）。如果这条 SQL 能改 read_only，一次普通的页面请求就能把写工具
+         变成"可被模型自动调用"——这是红线，所以让 SQL 根本没有这个能力（纵深防御），
+         而不只是在 Service 里校验。
+
+      2. **不提供 INSERT / DELETE**
+         工具行由 seed（随代码发布）与 MCP 同步（排期 3-7）写入。后台删行会让
+         "哪些工具存在"变成运营可改的事实，与"code 必须能映射到代码"的启动校验冲突。
+    -->
+
+    <resultMap type="AgentTool" id="AgentToolResult">
+        <id     property="id"          column="id"          />
+        <result property="code"        column="code"        />
+        <result property="name"        column="name"        />
+        <result property="description" column="description" />
+        <result property="scope"       column="scope"       />
+        <result property="source"      column="source"      />
+        <result property="readOnly"    column="read_only"   />
+        <result property="enabled"     column="enabled"     />
+        <result property="timeoutMs"   column="timeout_ms"  />
+        <result property="rowLimit"    column="row_limit"   />
+        <result property="builtin"     column="builtin"     />
+        <result property="createBy"    column="create_by"   />
+        <result property="createTime"  column="create_time" />
+        <result property="updateBy"    column="update_by"   />
+        <result property="updateTime"  column="update_time" />
+        <result property="delFlag"     column="del_flag"    />
+    </resultMap>
+
+    <sql id="selectAgentToolVo">
+        select id, code, name, description, scope, source, read_only, enabled, timeout_ms, row_limit,
+               builtin, create_by, create_time, update_by, update_time, del_flag
+        from agent_tool
+    </sql>
+
+    <sql id="agentToolWhere">
+        <where>
+            <!-- 查询默认过滤已删除（AGENTS §7.4） -->
+            del_flag = '0'
+            <if test="scope != null and scope != ''">
+                AND scope = #{scope}
+            </if>
+            <if test="source != null and source != ''">
+                AND source = #{source}
+            </if>
+            <if test="enabled != null">
+                AND enabled = #{enabled}
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAgentToolList" parameterType="AgentTool" resultMap="AgentToolResult">
+        <include refid="selectAgentToolVo"/>
+        <include refid="agentToolWhere"/>
+        <!-- 按载体分组再按编码：工具中心按 scope 分块展示，顺序稳定便于人工比对 seed -->
+        order by scope asc, code asc
+    </select>
+
+    <select id="selectAgentToolById" parameterType="Long" resultMap="AgentToolResult">
+        <include refid="selectAgentToolVo"/>
+        where id = #{id} and del_flag = '0'
+        limit 1
+    </select>
+
+    <!-- 只改三个护栏字段（见文件头取舍 1）；身份列不出现在 SET 中 -->
+    <update id="updateAgentTool" parameterType="AgentTool">
+        update agent_tool
+        set enabled = #{enabled},
+            timeout_ms = #{timeoutMs},
+            row_limit = #{rowLimit},
+            update_by = #{updateBy},
+            update_time = #{updateTime}
+        where id = #{id} and del_flag = '0'
+    </update>
+
+</mapper>

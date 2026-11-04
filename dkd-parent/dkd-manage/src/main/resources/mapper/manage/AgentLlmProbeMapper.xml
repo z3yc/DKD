@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentLlmProbeMapper">
+
+    <!--
+      模型连通性探测记录（排期 3-5，表 agent_llm_probe）。
+
+      只增不改：INSERT + SELECT 两个语句，没有 UPDATE/DELETE —— 探测记录是"上次点测试连通
+      得到了什么结论"的证据；能改就不再可信。清理属排期 4-4 的保留策略，由运维执行。
+      落库字段刻意不含响应正文/密钥（AGENTS §6.1/§7.1），error_msg 已在 Service/Client 侧脱敏截断。
+    -->
+
+    <resultMap type="AgentLlmProbe" id="AgentLlmProbeResult">
+        <id     property="id"          column="id"           />
+        <result property="profileCode" column="profile_code" />
+        <result property="ok"          column="ok"           />
+        <result property="httpStatus"  column="http_status"  />
+        <result property="latencyMs"   column="latency_ms"   />
+        <result property="modelServed" column="model_served" />
+        <result property="errorType"   column="error_type"   />
+        <result property="errorMsg"    column="error_msg"    />
+        <result property="requestId"   column="request_id"   />
+        <result property="createBy"    column="create_by"    />
+        <result property="createTime"  column="create_time"  />
+    </resultMap>
+
+    <insert id="insertAgentLlmProbe" parameterType="AgentLlmProbe" useGeneratedKeys="true" keyProperty="id">
+        insert into agent_llm_probe
+        (profile_code, ok, http_status, latency_ms, model_served, error_type, error_msg, request_id,
+         create_by, create_time)
+        values
+        (#{profileCode}, #{ok}, #{httpStatus}, #{latencyMs}, #{modelServed}, #{errorType}, #{errorMsg},
+         #{requestId}, #{createBy}, #{createTime})
+    </insert>
+
+    <select id="selectAgentLlmProbeList" resultMap="AgentLlmProbeResult">
+        select id, profile_code, ok, http_status, latency_ms, model_served, error_type, error_msg,
+               request_id, create_by, create_time
+        from agent_llm_probe
+        where profile_code = #{profileCode}
+        <!-- 倒序：页面先看最近一次探测；id 兜底同毫秒次序 -->
+        order by create_time desc, id desc
+    </select>
+
+</mapper>

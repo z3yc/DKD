@@ -10,11 +10,14 @@ import org.apache.ibatis.session.Configuration;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import com.dkd.manage.domain.AgentLlmProbe;
+import com.dkd.manage.domain.AgentLlmProfile;
 import com.dkd.manage.domain.AgentLog;
 import com.dkd.manage.domain.AgentMessage;
+import com.dkd.manage.domain.AgentTool;
 
 /**
- * 新增 Mapper XML 的**可加载性**测试（Batch A · 排期 2-4 / 2-5）。
+ * 新增 Mapper XML 的**可加载性**测试（Batch A · 2-4/2-5，Batch B2 · 3-4/3-5）。
  *
  * <p>为什么要有这一层：本项目的 Java 门禁是**纯单测**（不启 Spring 容器、不连 MySQL），
  * 而 MyBatis 的 Mapper XML 只在应用启动时才被解析。也就是说：XML 写错标签、
@@ -24,7 +27,7 @@ import com.dkd.manage.domain.AgentMessage;
  *
  * <p>注意边界：OGNL 动态 SQL（{@code <if test="query.level != null">}）是在语句执行时
  * 才编译的，解析阶段只校验结构、别名与语句注册；参数绑定是否正确仍靠 Service 单测 +
- * SQL 形状测试（{@code AgentLogMapperSqlTest} / {@code AgentConversationMapperSqlTest}）覆盖。
+ * SQL 形状测试（{@code AgentLogMapperSqlTest} / {@code AgentToolMapperSqlTest} 等）覆盖。
  *
  * @author ruoyi
  * @date 2026-11-04
@@ -32,16 +35,22 @@ import com.dkd.manage.domain.AgentMessage;
 class AgentMapperXmlBuildTest
 {
     @Test
-    @DisplayName("新增两个 Mapper XML 能被 MyBatis 解析，且语句/别名全部注册成功")
+    @DisplayName("新增 Mapper XML 都能被 MyBatis 解析，且语句/别名全部注册成功")
     void newMapperXmlCanBeParsedByMyBatis() throws Exception
     {
         Configuration configuration = new Configuration();
         // 应用里由 typeAliasesPackage: com.dkd.**.domain 自动注册；测试里手动注册等价的别名
         configuration.getTypeAliasRegistry().registerAlias("AgentLog", AgentLog.class);
         configuration.getTypeAliasRegistry().registerAlias("AgentMessage", AgentMessage.class);
+        configuration.getTypeAliasRegistry().registerAlias("AgentTool", AgentTool.class);
+        configuration.getTypeAliasRegistry().registerAlias("AgentLlmProfile", AgentLlmProfile.class);
+        configuration.getTypeAliasRegistry().registerAlias("AgentLlmProbe", AgentLlmProbe.class);
 
         parse(configuration, "mapper/manage/AgentLogMapper.xml");
         parse(configuration, "mapper/manage/AgentConversationMapper.xml");
+        parse(configuration, "mapper/manage/AgentToolMapper.xml");
+        parse(configuration, "mapper/manage/AgentLlmProfileMapper.xml");
+        parse(configuration, "mapper/manage/AgentLlmProbeMapper.xml");
 
         assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentLogMapper.selectAgentLogList")).isTrue();
         assertThat(configuration
@@ -54,6 +63,17 @@ class AgentMapperXmlBuildTest
         assertThat(configuration
                 .hasStatement("com.dkd.manage.mapper.AgentConversationMapper.selectAgentMessagesByConversationId"))
                         .isTrue();
+
+        // Batch B2：工具中心 / 模型档案 / 探测记录
+        assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentToolMapper.selectAgentToolList")).isTrue();
+        assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentToolMapper.updateAgentTool")).isTrue();
+        assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentLlmProfileMapper.clearDefaultFlag")).isTrue();
+        assertThat(configuration
+                .hasStatement("com.dkd.manage.mapper.AgentLlmProfileMapper.updateAgentLlmProfileEnabled")).isTrue();
+        assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentLlmProbeMapper.insertAgentLlmProbe"))
+                .isTrue();
+        assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentLlmProbeMapper.selectAgentLlmProbeList"))
+                .isTrue();
     }
 
     /**

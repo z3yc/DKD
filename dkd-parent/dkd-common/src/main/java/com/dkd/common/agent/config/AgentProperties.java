@@ -85,6 +85,16 @@ public class AgentProperties
      */
     private int configReloadTimeoutMs = 3000;
 
+    /**
+     * 模型连通性探测（排期 3-5）的 HTTP 超时（毫秒），同时作为连接与读取超时。
+     *
+     * <p>为什么单独一个配置而不是复用 {@link #readTimeout}：探测是"人工点一下"的同步操作，
+     * 需要在页面上尽快给出结论；而 {@code readTimeout} 默认 120s 是给 SSE 长连接用的，
+     * 让「测试连通」卡两分钟既没有意义，也会让运营以为页面死了。默认 30s 与 Python 侧
+     * llm_probe 的模型调用超时量级一致（探测本身要等一次真实 LLM 往返）。
+     */
+    private int llmProbeTimeoutMs = 30000;
+
     public boolean getEnabled()
     {
         return enabled;
@@ -183,5 +193,15 @@ public class AgentProperties
     public void setConfigReloadTimeoutMs(int configReloadTimeoutMs)
     {
         this.configReloadTimeoutMs = configReloadTimeoutMs;
+    }
+
+    public int getLlmProbeTimeoutMs()
+    {
+        return llmProbeTimeoutMs;
+    }
+
+    public void setLlmProbeTimeoutMs(int llmProbeTimeoutMs)
+    {
+        this.llmProbeTimeoutMs = llmProbeTimeoutMs;
     }
 }
