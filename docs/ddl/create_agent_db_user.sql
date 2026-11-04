@@ -71,6 +71,13 @@ GRANT SELECT ON dkd.agent_config_history TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'
 -- 2026-11-03 追加（排期 2-4，DDL 见 agent_config.sql）：执行日志只增不改；
 -- 不授 UPDATE/DELETE —— 保留期清理属排期 4-4，由 Java/运维执行（Python 无删除权限）。
 GRANT SELECT, INSERT ON dkd.agent_log    TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+-- 2026-11-04 追加（排期 3-4/3-5，DDL 见 agent_tool_llm_profile.sql）：工具注册表与模型档案
+-- 同样是 **Java 的业务事实**（工具中心/模型档案页写操作经 RuoYi 权限 + @Log），Python 只读：
+-- agent_tool 用于启动/运行期工具开关过滤；agent_llm_profile 用于读取连接信息（密钥只存 env 变量名）。
+-- agent_llm_probe 由 Java 写探测记录，Python 不读写。
+GRANT SELECT ON dkd.agent_tool         TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT ON dkd.agent_llm_profile  TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
+GRANT SELECT ON dkd.agent_llm_probe    TO 'dkd_agent'@'127.0.0.1', 'dkd_agent'@'localhost';
 
 FLUSH PRIVILEGES;
 
