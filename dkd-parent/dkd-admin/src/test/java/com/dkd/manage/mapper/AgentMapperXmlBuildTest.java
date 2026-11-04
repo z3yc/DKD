@@ -13,11 +13,12 @@ import org.junit.jupiter.api.Test;
 import com.dkd.manage.domain.AgentLlmProbe;
 import com.dkd.manage.domain.AgentLlmProfile;
 import com.dkd.manage.domain.AgentLog;
+import com.dkd.manage.domain.AgentMcpServer;
 import com.dkd.manage.domain.AgentMessage;
 import com.dkd.manage.domain.AgentTool;
 
 /**
- * 新增 Mapper XML 的**可加载性**测试（Batch A · 2-4/2-5，Batch B2 · 3-4/3-5）。
+ * 新增 Mapper XML 的**可加载性**测试（Batch A · 2-4/2-5，Batch B2 · 3-4/3-5，Batch C2 · 3-7）。
  *
  * <p>为什么要有这一层：本项目的 Java 门禁是**纯单测**（不启 Spring 容器、不连 MySQL），
  * 而 MyBatis 的 Mapper XML 只在应用启动时才被解析。也就是说：XML 写错标签、
@@ -45,12 +46,14 @@ class AgentMapperXmlBuildTest
         configuration.getTypeAliasRegistry().registerAlias("AgentTool", AgentTool.class);
         configuration.getTypeAliasRegistry().registerAlias("AgentLlmProfile", AgentLlmProfile.class);
         configuration.getTypeAliasRegistry().registerAlias("AgentLlmProbe", AgentLlmProbe.class);
+        configuration.getTypeAliasRegistry().registerAlias("AgentMcpServer", AgentMcpServer.class);
 
         parse(configuration, "mapper/manage/AgentLogMapper.xml");
         parse(configuration, "mapper/manage/AgentConversationMapper.xml");
         parse(configuration, "mapper/manage/AgentToolMapper.xml");
         parse(configuration, "mapper/manage/AgentLlmProfileMapper.xml");
         parse(configuration, "mapper/manage/AgentLlmProbeMapper.xml");
+        parse(configuration, "mapper/manage/AgentMcpServerMapper.xml");
 
         assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentLogMapper.selectAgentLogList")).isTrue();
         assertThat(configuration
@@ -74,6 +77,14 @@ class AgentMapperXmlBuildTest
                 .isTrue();
         assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentLlmProbeMapper.selectAgentLlmProbeList"))
                 .isTrue();
+
+        // Batch C2：MCP server 配置
+        assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentMcpServerMapper.selectAgentMcpServerList"))
+                .isTrue();
+        assertThat(configuration.hasStatement("com.dkd.manage.mapper.AgentMcpServerMapper.insertAgentMcpServer"))
+                .isTrue();
+        assertThat(configuration
+                .hasStatement("com.dkd.manage.mapper.AgentMcpServerMapper.updateAgentMcpServerEnabled")).isTrue();
     }
 
     /**
