@@ -1,0 +1,122 @@
+{
+  "generatedAt": "2026-11-04T12:58:03+08:00",
+  "mode": "offline",
+  "evalSet": {
+    "name": "dkd-agent-data-retrieval-eval-starter",
+    "version": "v0-starter",
+    "status": "example-only"
+  },
+  "status": "blocked",
+  "casesTotal": 8,
+  "verified": 0,
+  "scorable": 0,
+  "passed": 0,
+  "failed": 0,
+  "blocked": 8,
+  "accuracy": null,
+  "baselineAccuracy": null,
+  "baselineN": null,
+  "errorTypes": {
+    "not-verified": 8
+  },
+  "byTag": {
+    "time-window": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 6
+    },
+    "dimension-region": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 2
+    },
+    "aggregation": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 2
+    },
+    "ranking": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 2
+    },
+    "dimension-vm": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 3
+    },
+    "stockout": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 1
+    },
+    "negative": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 2
+    },
+    "no-cause": {
+      "pass": 0,
+      "fail": 0,
+      "blocked": 1
+    }
+  },
+  "cases": [
+    {
+      "id": "EV-001",
+      "scene": 1,
+      "status": "blocked",
+      "errorType": "not-verified",
+      "problems": []
+    },
+    {
+      "id": "EV-002",
+      "scene": 1,
+      "status": "blocked",
+      "errorType": "not-verified",
+      "problems": []
+    },
+    {
+      "id": "EV-003",
+      "scene": 1,
+      "status": "blocked",
+      "errorType": "not-verified",
+      "problems": []
+    },
+    {
+      "id": "EV-004",
+      "scene": 1,
+      "status": "blocked",
+      "errorType": "not-verified",
+      "problems": []
+    },
+    {
+      "id": "EV-005",
+      "scene": 1,
+      "status": "blocked",
+      "errorType": "not-verified",
+      "problems": []
+    },
+    {
+      "id": "EV-006",
+      "scene": 1,
+      "status": "blocked",
+      "errorType": "not-verified",
+      "problems": []
+    },
+    {
+      "id": "EV-007",
+      "scene": 1,
+      "status": "blocked",
+      "errorType": "not-verified",
+      "problems": []
+    },
+    {
+      "id": "EV-008",
+      "scene": 3,
+      "status": "blocked",
+      "errorType": "not-verified",
+      "problems": []
+    }
+  ]
+}
