@@ -52,6 +52,8 @@ class FakeStore:
         self.releases: list[dict[str, Any]] = []
         self.load_calls: list[date] = []
         self.upserted: list[RestockPlan] = []
+        # 5-6：每次 upsert 携带的校准标记（analyze=None；calibrate=True/False）
+        self.calibration_flags: list[bool | None] = []
 
     async def count_open_by_assignee(self, plan_date: date) -> dict[int, int]:
         self.load_calls.append(plan_date)
@@ -78,8 +80,12 @@ class FakeStore:
         )
         return self.release_result
 
-    async def upsert_plan(self, plan: RestockPlan, *, by: str = "system") -> None:
+    async def upsert_plan(
+        self, plan: RestockPlan, *, by: str = "system", llm_calibrated: bool | None = None
+    ) -> None:
+        # 5-6：analyze 基线落库不携带校准信息（None）；calibrate 节点才回写 True/False
         self.upserted.append(plan)
+        self.calibration_flags.append(llm_calibrated)
 
 
 class FakeCasStore(FakeStore):

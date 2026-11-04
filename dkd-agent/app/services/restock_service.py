@@ -122,7 +122,12 @@ class RestockService:
         plans = []
         for row in rows:
             plan = plan_from_row(row)
-            summary = summarize_plan(plan, plan_id=int(row["id"]))
+            summary = summarize_plan(
+                plan,
+                plan_id=int(row["id"]),
+                # 5-6 降级标记：来自库列（1/0/NULL → True/False/None），供前端显示「未校准」
+                llm_calibrated=row.get("llm_calibrated"),
+            )
             summary["taskId"] = row.get("task_id")
             summary["taskCode"] = row.get("task_code")
             summary["adjustReason"] = row.get("adjust_reason")

@@ -103,7 +103,9 @@ class RestockDeps(Protocol):
         """
         ...
 
-    async def save_plan(self, plan: RestockPlan) -> None: ...
+    async def save_plan(self, plan: RestockPlan, *, llm_calibrated: bool | None = None) -> None:
+        """落库计划（1-6）；`llm_calibrated` 为 5-6 的校准标记（None = 不知道/沿用历史值）。"""
+        ...
 
     async def save_decision(
         self,
@@ -281,14 +283,19 @@ class SqlRestockDeps:
             self._load_date = plan_date
         return self._loads
 
-    async def save_plan(self, plan: RestockPlan) -> None:
+    async def save_plan(self, plan: RestockPlan, *, llm_calibrated: bool | None = None) -> None:
         """落库计划（1-6 的幂等 upsert），顺带补全区域/点位。
 
         为什么在这里补而不是在节点里：`RestockPlan` 的区域只能从设备档案拿，
         而档案缓存属于 deps（`load()` 已取好）。不补的话 `agent_restock_plan.region_id` 永远是
         NULL——它是接单人分配的依据、也是 `idx_agent_restock_plan_region` 与 3-7 按区域审计的前提。
+
+        @param llm_calibrated 5-6 校准标记；由 `calibrate` 包装节点按本轮 applied 传入，
+            其它调用方（analyze 基线落库）保持 None（不覆盖历史值）
         """
-        await self._store.upsert_plan(self._with_region(plan), by="system")
+        await self._store.upsert_plan(
+            self._with_region(plan), by="system", llm_calibrated=llm_calibrated
+        )
 
     def _with_region(self, plan: RestockPlan) -> RestockPlan:
         """把设备区域/点位补进计划（已有则不动，拿不到档案则如实保持 NULL）。"""
@@ -661,8 +668,15 @@ def _wrap_calibration(
         # 安全红线之后第二位）。同样地，1-5 要求“依据”能看到校准理由——依据也存在库里，
         # 不回写就等于校准对运营不可见。
         # 幂等性：`upsert_plan` 本身幂等，且本节点在中断**之前**，不会因恢复而重复触发。
+        # 5-6：同时把本设备的校准结果作为 llm_calibrated 落库（True→1 / False→0）。
+        # `applied=False` 的三种情形（开关关闭 / 解析失败 / 无 entries）必须写 0 而不是 NULL——
+        # 前端要据此显示“未校准”；写 NULL 会被当成“历史未知”，降级就不可见了。
+        notes = result.get("calibration_notes") or {}
         for raw in result.get("plans") or []:
-            await deps.save_plan(_as_plan(raw))
+            plan = _as_plan(raw)
+            note = notes.get(str(plan.vm_id)) if isinstance(notes, dict) else None
+            applied = bool(note.get("applied")) if isinstance(note, dict) else False
+            await deps.save_plan(plan, llm_calibrated=applied)
         return result
 
     return calibrate

@@ -431,6 +431,17 @@ async def _global_usage(session: AsyncSession) -> UsageSummary:
     return summary
 
 
+def quota_reset_at(now: datetime | None = None) -> str:
+    """配额重置时间：本地时区**次日 00:00**，格式 `YYYY-MM-DD HH:MM`（5-5 自助提示）。
+
+    为什么按本地时区而不是 UTC：用户看到的“明天恢复”必须是自己的明天；
+    接口进程与 Java 同机部署（AGENTS §1），用本机时区与运营口径一致。
+    """
+    current = now or datetime.now()
+    tomorrow = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return tomorrow.strftime("%Y-%m-%d %H:%M")
+
+
 async def enforce_daily_quota(
     session: AsyncSession,
     *,
@@ -438,7 +449,11 @@ async def enforce_daily_quota(
     per_user_limit: int,
     global_limit: int,
 ) -> None:
-    """限额熔断：超限抛 QuotaExceededError。
+    """限额熔断：超限抛 `QuotaExceededError`（触发条件/异常类型/HTTP 映射均不变）。
+
+    5-5：消息里带上「已用/限额」与「重置时间」——用户看到 429 时最想知道的两件事是
+    “我还差多少 / 什么时候能再用”。只给“已达上限”会迫使他们去问运维，而运维手里
+    也只有同一句话。配额按自然日统计（`summarize_usage(days=1)`），故重置点 = 次日 00:00。
 
     为什么在请求前判断：LLM 调用一旦发出就会产生费用，事后告警已经晚了。
 
@@ -446,15 +461,18 @@ async def enforce_daily_quota(
     至多 1 次查询（进程内缓存，见 _global_usage）。
     """
     today = date.today()
+    reset_at = quota_reset_at()
     if per_user_limit > 0 and user_id is not None:
         used = await summarize_usage(session, days=1, user_id=user_id)
         if used.tokens_total >= per_user_limit:
             raise QuotaExceededError(
-                f"用户 {today} 当日 token 已达上限（{used.tokens_total}/{per_user_limit}）"
+                f"用户 {today} 当日 token 已达上限（已用 {used.tokens_total}/{per_user_limit}）；"
+                f"额度将于 {reset_at} 重置（本地时间）后恢复"
             )
     if global_limit > 0:
         used_all = await _global_usage(session)
         if used_all.tokens_total >= global_limit:
             raise QuotaExceededError(
-                f"全局 {today} 当日 token 已达上限（{used_all.tokens_total}/{global_limit}）"
+                f"全局 {today} 当日 token 已达上限（已用 {used_all.tokens_total}/{global_limit}）；"
+                f"额度将于 {reset_at} 重置（本地时间）后恢复"
             )

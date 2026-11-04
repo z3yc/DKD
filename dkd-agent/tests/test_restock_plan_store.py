@@ -149,6 +149,41 @@ async def test_upsert_only_overwrites_items_when_status_is_editable():
     assert '"channelCode"' in params["items"] and '"suggestedQuantity"' in params["items"]
 
 
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [(True, 1), (False, 0), (None, None)],
+)
+async def test_upsert_plan_persists_llm_calibrated_tristate(flag, expected):
+    """5-6：True→1 / False→0 / None→NULL（NULL 表示历史未知，不冒充“未校准”）。"""
+    factory = FakeFactory()
+
+    await SqlPlanStore(factory).upsert_plan(_plan(), llm_calibrated=flag)
+
+    sql, params = factory.last.calls[0]
+    assert "llm_calibrated" in sql.lower()
+    assert params["llm_calibrated"] == expected
+
+
+async def test_upsert_plan_none_does_not_overwrite_historical_calibration_flag():
+    """重复 upsert 且本次未校准信息（None）时，不得把历史 1/0 抹成 NULL。"""
+    factory = FakeFactory()
+
+    await SqlPlanStore(factory).upsert_plan(_plan(), llm_calibrated=None)
+
+    sql = factory.last.calls[0][0].lower()
+    assert "llm_calibrated = if(:llm_calibrated is null, llm_calibrated, :llm_calibrated)" in sql
+
+
+async def test_list_plans_selects_llm_calibrated_for_ui_badge():
+    """列表必须带出降级标记，否则前端无法显示「未校准」徽标。"""
+    factory = FakeFactory()
+
+    await SqlPlanStore(factory).list_plans(date(2026, 9, 21), limit=50)
+
+    sql = factory.last.calls[0][0].lower()
+    assert "llm_calibrated" in sql
+
+
 async def test_save_decision_writes_audit_columns_and_task_refs():
     factory = FakeFactory()
     await SqlPlanStore(factory).save_decision(

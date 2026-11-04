@@ -54,6 +54,13 @@ ORDERING_STATUS = 7
 CLAIMABLE_STATUSES = (1, 2, 6)
 
 
+def _calibration_flag(value: bool | None) -> int | None:
+    """三态落库值（5-6）：True→1、False→0、None→NULL（NULL=历史/未知，不冒充“未校准”）。"""
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
 class OrderClaimConflictError(RuntimeError):
     """建单认领失败（1-8 乐观锁未抦到）：该计划正在建单中，或状态已被别人改变。
 
@@ -98,16 +105,20 @@ select assignee_id, count(*) as open_count
 _UPSERT_SQL = """
 insert into agent_restock_plan
   (plan_date, vm_id, inner_code, region_id, node_id, items, sku_count, total_quantity,
-   status, assignee_id, assignee_name, create_by, create_time, update_by, update_time, del_flag)
+   llm_calibrated, status, assignee_id, assignee_name, create_by, create_time, update_by,
+   update_time, del_flag)
 values
   (:plan_date, :vm_id, :inner_code, :region_id, :node_id, :items, :sku_count, :total_quantity,
-   :status, :assignee_id, :assignee_name, :by, :now, :by, :now, '0')
+   :llm_calibrated, :status, :assignee_id, :assignee_name, :by, :now, :by, :now, '0')
 on duplicate key update
   region_id = values(region_id),
   node_id = values(node_id),
   items = if(status in (1, 2), values(items), items),
   sku_count = if(status in (1, 2), values(sku_count), sku_count),
   total_quantity = if(status in (1, 2), values(total_quantity), total_quantity),
+  -- 5-6：本次**明确**给了校准标记才覆盖历史值；NULL（未知/未传）保持旧值，
+  -- 否则“重跑只更新区域”的路径会把历史 1/0 抹成未知（降级统计就失真了）。
+  llm_calibrated = if(:llm_calibrated is null, llm_calibrated, :llm_calibrated),
   update_by = values(update_by),
   update_time = values(update_time),
   -- 复活软删行：唯一键 (vm_id, plan_date) 包含已软删的行，
@@ -137,8 +148,8 @@ update agent_restock_plan
 
 _SELECT_SQL = """
 select id, plan_date, vm_id, inner_code, region_id, node_id, items, sku_count, total_quantity,
-       status, adjust_reason, adjusted_by, adjusted_time, assignee_id, assignee_name,
-       task_id, task_code
+       llm_calibrated, status, adjust_reason, adjusted_by, adjusted_time, assignee_id,
+       assignee_name, task_id, task_code
   from agent_restock_plan
  where plan_date = :plan_date
    and del_flag = '0'
@@ -150,7 +161,9 @@ select id, plan_date, vm_id, inner_code, region_id, node_id, items, sku_count, t
 class PlanStore(Protocol):
     """计划存储契约（图依赖注入用；测试可替换为内存实现，不连 MySQL）。"""
 
-    async def upsert_plan(self, plan: RestockPlan, *, by: str = "system") -> None: ...
+    async def upsert_plan(
+        self, plan: RestockPlan, *, by: str = "system", llm_calibrated: bool | None = None
+    ) -> None: ...
 
     async def save_decision(
         self,
@@ -260,7 +273,13 @@ class SqlPlanStore:
     def __init__(self, session_factory: Any | None = None) -> None:
         self._session_factory = session_factory or get_sessionmaker()
 
-    async def upsert_plan(self, plan: RestockPlan, *, by: str = "system") -> None:
+    async def upsert_plan(
+        self, plan: RestockPlan, *, by: str = "system", llm_calibrated: bool | None = None
+    ) -> None:
+        """幂等 upsert 一份计划（1-6），并写入 5-6 的 LLM 校准标记。
+
+        @param llm_calibrated True=本轮校准生效 / False=退化为纯统计基线 / None=未知（不覆盖历史值）
+        """
         assert_table_allowed(TABLE, writable=True)
         params = {
             "plan_date": plan.plan_date,
@@ -271,6 +290,7 @@ class SqlPlanStore:
             "items": _items_json(plan),
             "sku_count": plan.sku_count,
             "total_quantity": plan.total_quantity,
+            "llm_calibrated": _calibration_flag(llm_calibrated),
             "status": plan.status,
             "assignee_id": plan.assignee_id,
             "assignee_name": plan.assignee_name,
@@ -281,12 +301,13 @@ class SqlPlanStore:
             await session.execute(text(_UPSERT_SQL), params)
             await session.commit()
         logger.info(
-            "计划落库（幂等 upsert）vm_id=%s plan_date=%s status=%s sku=%s total=%s",
+            "计划落库（幂等 upsert）vm_id=%s plan_date=%s status=%s sku=%s total=%s calibrated=%s",
             plan.vm_id,
             plan.plan_date,
             plan.status,
             plan.sku_count,
             plan.total_quantity,
+            llm_calibrated,
         )
 
     async def save_decision(

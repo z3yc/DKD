@@ -318,3 +318,13 @@ def test_summarize_plan_exposes_prototype_fields_without_sensitive_data():
     assert summary["totalQuantity"] == 8
     assert summary["items"][0]["reason"], "原型 V2 的「依据」字段必须能展开看到"
     assert set(summary).isdisjoint({"mobile", "amount", "phone"})
+
+
+def test_summarize_plan_exposes_llm_calibrated_tristate():
+    """5-6：1→True、0→False、NULL→None（不能把 NULL 变成 False，否则历史/未知被算成降级）。"""
+    assert summarize_plan(_plan(), llm_calibrated=1)["llmCalibrated"] is True
+    assert summarize_plan(_plan(), llm_calibrated=True)["llmCalibrated"] is True
+    assert summarize_plan(_plan(), llm_calibrated=0)["llmCalibrated"] is False
+    assert summarize_plan(_plan(), llm_calibrated=False)["llmCalibrated"] is False
+    assert summarize_plan(_plan(), llm_calibrated=None)["llmCalibrated"] is None
+    assert summarize_plan(_plan())["llmCalibrated"] is None, "缺省 = 未知，不默认 False"
