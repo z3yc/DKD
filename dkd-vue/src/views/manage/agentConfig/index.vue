@@ -199,6 +199,7 @@
       :config-id="history.configId"
       :current-version="history.currentVersion"
       :config-name="history.configName"
+      :config-code="history.configCode"
       @refreshed="handleRolledBack"
       @conflict="handleConflict"
     />
@@ -250,7 +251,7 @@ const togglingId = ref(null)
 /** 三个抽屉的状态分开管理：详情/编辑/历史互不干扰，也便于各自按需 reload */
 const detail = reactive({ open: false, configId: null })
 const form = reactive({ open: false, mode: 'edit', configId: null })
-const history = reactive({ open: false, configId: null, currentVersion: null, configName: '' })
+const history = reactive({ open: false, configId: null, currentVersion: null, configName: '', configCode: '' })
 
 const data = reactive({
   queryParams: {
@@ -358,6 +359,8 @@ function openHistory(row) {
   history.configId = row.id
   history.currentVersion = row.version
   history.configName = row.name
+  // 5-1：评测报告按 configCode 查，列表行里一定有
+  history.configCode = row.code || ''
   history.open = true
 }
 
@@ -372,6 +375,10 @@ function handleDetailHistory(item) {
   history.configId = item.id
   history.currentVersion = item.version
   history.configName = item.name
+  // 详情组件 emit 的对象可能没带 code（VO 裁剪）；优先用 item.code，其次回列表按 id 找，
+  // 都取不到时置空——EvalReportPanel 见空 code 会直接不发请求（不会查错配置）
+  const hit = configList.value.filter((row) => row.id === item.id)[0]
+  history.configCode = item.code || (hit && hit.code) || ''
   history.open = true
 }
 

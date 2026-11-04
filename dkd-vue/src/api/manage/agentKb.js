@@ -35,12 +35,18 @@ export function listAgentKbDocuments(query) {
 }
 
 /**
- * 知识库概览统计（页面顶部三张卡：文档数 / 切片数 / 检索次数）。
+ * 知识库概览统计（页面顶部卡片：文档数 / 切片数 / 检索次数 / 检索回退率）。
  *
  * 检索次数来自只增的 `agent_kb_retrieval`，是“知识库到底被用了几次”的唯一客观口径，
  * 不用前端把某次搜索次数凑上去（那会把测试点击也算成真实使用）。
  *
- * @returns AjaxResult：data = { documents, chunks, retrievals }
+ * 5-3 增量字段（Python 并行；未上线时缺失，页面按「—」展示，**不要兜底成 0%**——
+ * 0% 回退率与“没有数据”是两个相反的结论）：
+ *  - `fallbackRetrievals`：回退「仅列证据」的次数；
+ *  - `fallbackRate`：回退率 0~1（= fallbackRetrievals / retrievals），目标 <15%。
+ *
+ * @returns AjaxResult：data = { documents, chunks, retrievals,
+ *          fallbackRetrievals?, fallbackRate? }
  */
 export function getAgentKbStats() {
   return request({

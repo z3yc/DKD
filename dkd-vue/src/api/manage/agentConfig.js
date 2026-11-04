@@ -81,8 +81,12 @@ export function addAgentConfig(data) {
  *
  * 成功时 data = 更新后的 VO（含 +1 后的 version）。
  *
+ * 5-1 评测护栏：护栏开启且该版本评测未通过时，后端返回 **HTTP200 + code409 + data{field:"evalGate"}**；
+ * body 可带 `force: true` + `forceReason`（≥10 字）强制保存（会进审计）。
+ * ⚠️ request.js 会丢弃 409 的 data，页面靠 msg 识别 + /eval/gate 补 reason/latest（见 AgentConfigForm）。
+ *
  * @param {number} id 配置主键
- * @param {Object} data AgentConfigDto（含 version / changeNote）
+ * @param {Object} data AgentConfigDto（含 version / changeNote；强制保存时另含 force/forceReason）
  */
 export function updateAgentConfig(id, data) {
   return request({
@@ -141,5 +145,39 @@ export function rollbackAgentConfig(id, data) {
     method: 'post',
     data,
     silent: true
+  })
+}
+
+/**
+ * 查询评测报告（5-1 评测流水线产物，按配置 + 版本展示在编辑/版本历史抽屉）。
+ *
+ * @param {Object} query configCode（配置编码，必填）、limit（取最近 N 条，建议 ≤50）
+ * @returns AjaxResult：data = rows，元素字段：
+ *          configVersion / mode / status(scored|blocked|failed) / accuracy(0~1) /
+ *          total / passed / failed / blocked / baselineAccuracy / baselineN / createTime / runBy
+ */
+export function listEvalReports(query) {
+  return request({
+    url: '/manage/agent/eval/reports',
+    method: 'get',
+    params: query
+  })
+}
+
+/**
+ * 查询某配置某版本的**保存护栏门禁**（5-1）。
+ *
+ * 为什么保存 409 之后要再查一次它：request.js 的拦截器只把 code!=200 归一化成
+ * `{code, message}`，会丢弃响应里的 data —— 所以 `data{field:"evalGate",reason,latest}`
+ * 到不了页面。这里用只读 gate 接口把 reason/latest 补回来，再弹强制保存确认框。
+ *
+ * @param {Object} query configCode、configVersion
+ * @returns AjaxResult：data = { enabled, passed, latest, reason }
+ */
+export function getEvalGate(query) {
+  return request({
+    url: '/manage/agent/eval/gate',
+    method: 'get',
+    params: query
   })
 }

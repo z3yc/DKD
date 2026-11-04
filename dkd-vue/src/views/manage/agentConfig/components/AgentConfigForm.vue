@@ -39,6 +39,16 @@
           <el-button link type="primary" @click="loadMeta(form.runtime, {})">重试加载元数据</el-button>
         </el-alert>
 
+        <!-- 保存失败原因持久展示在抽屉里（silent 写接口，不能只靠一闪而过的 toast） -->
+        <el-alert
+          v-if="saveError"
+          type="error"
+          :closable="false"
+          show-icon
+          :title="'保存失败：' + saveError"
+          class="form-alert"
+        />
+
         <!-- ============ 基本信息 ============ -->
         <div class="section-title">基本信息</div>
         <el-row :gutter="16">
@@ -211,6 +221,12 @@
             />
           </el-form-item>
         </template>
+        <!-- ============ 评测报告（5-1） ============ -->
+        <!-- 只有编辑态才查：新增还没有 code/版本，查也查不到，只会多一次无意义请求 -->
+        <template v-if="mode === 'edit'">
+          <div class="section-title">评测报告</div>
+          <EvalReportPanel :config-code="form.code" :config-version="form.version" />
+        </template>
       </el-form>
     </div>
 
@@ -225,11 +241,13 @@
 </template>
 
 <script setup name="AgentConfigForm">
-import { ElMessage } from 'element-plus'
+import { h } from 'vue'
+import { ElCheckbox, ElInput, ElMessage, ElMessageBox } from 'element-plus'
 import ParamFields from './ParamFields.vue'
 import PromptEditor from './PromptEditor.vue'
 import ToolPicker from './ToolPicker.vue'
-import { addAgentConfig, getAgentConfig, getAgentConfigMeta, updateAgentConfig } from '@/api/manage/agentConfig'
+import EvalReportPanel from './EvalReportPanel.vue'
+import { addAgentConfig, getAgentConfig, getAgentConfigMeta, getEvalGate, updateAgentConfig } from '@/api/manage/agentConfig'
 
 /**
  * S3/S4 · 新增 / 编辑抽屉（契约 §6.3）。
@@ -270,6 +288,8 @@ const loadFailed = ref(false)
 const failMsg = ref('')
 const metaFailed = ref(false)
 const saving = ref(false)
+/** 保存失败原因：持久展示在抽屉里（silent 写接口，toast 一闪而过不利于改完重试） */
+const saveError = ref('')
 
 const RUNTIME_TEXT = {
   chat: '对话载体（chat）',
@@ -591,6 +611,7 @@ function checkCrossFields() {
 // ---------------------------------------------------------------------------
 function submit() {
   if (!formRef.value) return
+  saveError.value = ''
   formRef.value.validate((valid) => {
     if (!valid) return
     if (!checkCrossFields()) return
@@ -598,30 +619,154 @@ function submit() {
   })
 }
 
-function doSave() {
+/**
+ * 保存。
+ *
+ * @param {Object} [options] `{ forceReason }` —— 评测护栏 409 后强制保存时传入（≥10 字）
+ */
+function doSave(options) {
   saving.value = true
+  saveError.value = ''
+  const forceReason = options && options.forceReason ? String(options.forceReason).trim() : ''
   const payload = buildPayload()
+  if (forceReason) {
+    // 契约：只有带 force + forceReason(≥10) 才允许绕过评测护栏；原因进审计，不是“点一下就过”
+    payload.force = true
+    payload.forceReason = forceReason
+  }
   const req = props.mode === 'add' ? addAgentConfig(payload) : updateAgentConfig(props.configId, payload)
   req
     .then((response) => {
       const fallback = props.mode === 'add' ? 1 : (form.value.version || 0) + 1
       const next = savedVersion(response, fallback)
-      ElMessage.success('已保存，版本 v' + next + ' 已生效')
+      ElMessage.success('已保存，版本 v' + next + ' 已生效' + (forceReason ? '（已记录强制保存原因）' : ''))
       emit('saved', { version: next })
       close()
     })
     .catch((error) => {
       if (error && error.code === 409) {
-        // 版本冲突：交给父组件统一 ElMessageBox + 刷新详情；本抽屉关闭，
-        // 否则用户会拿着旧 version 反复点保存（每次都会 409）
+        // 5-1：409 有两种语义，处置完全不同——
+        //  ① 评测护栏未通过（evalGate）：**保留表单/payload**，弹强制保存确认框；
+        //  ② 乐观锁版本冲突：交给父组件统一刷新并关闭抽屉（避免拿旧 version 反复 409）。
+        if (isEvalGateConflict(error)) {
+          handleEvalGateConflict(error)
+          return
+        }
         emit('conflict')
         close()
         return
       }
-      ElMessage.error((error && error.message) || '保存失败，请稍后重试')
+      // 其余失败：持久展示在抽屉错误条（silent 写接口，toast 一闪而过不利于改完重试）
+      saveError.value = (error && error.message) || '保存失败，请稍后重试'
     })
     .finally(() => {
       saving.value = false
+    })
+}
+
+/**
+ * 评测护栏 409 识别。
+ *
+ * ⚠️ 契约里 409 的 data 是 `{field:"evalGate",reason,latest}`，但 request.js 的响应拦截器
+ * 只把 code!=200 归一化成 `{code,message}`（**data 被丢弃**）。因此这里按 msg 关键字识别，
+ * 再用只读 `/eval/gate` 把 reason/latest 取回来——不改公共拦截器，也不靠字段猜测。
+ */
+function isEvalGateConflict(error) {
+  if (!error || error.code !== 409) return false
+  return /评测|评估|护栏|evalGate/i.test(String(error.message || ''))
+}
+
+/**
+ * 评测护栏未通过 → 强制保存确认（5-1）。
+ *
+ * 两道闸：勾选「我已知风险」+ 原因 ≥10 字，才会带 force/forceReason 重试；
+ * 取消则**不发第二次请求**（“点了取消反而保存了”是最不可接受的失败方式）。
+ */
+async function handleEvalGateConflict(error) {
+  let gate = null
+  try {
+    const response = await getEvalGate({ configCode: form.value.code, configVersion: form.value.version })
+    gate = response && response.data ? response.data : null
+  } catch (gateError) {
+    // gate 查询失败不阻断：用 409 的 msg 作为原因继续弹确认框（至少用户有权决定）
+    gate = null
+  }
+  const reason = (gate && gate.reason) || (error && error.message) || '评测护栏未通过'
+  const latest = gate && gate.latest ? gate.latest : null
+  const latestText = latest
+    ? '最新报告：' + (latest.mode || '—') + ' / ' + (latest.status || '—') +
+      ' / 准确率 ' + (latest.accuracy === null || latest.accuracy === undefined
+        ? '—'
+        : (Number(latest.accuracy) * 100).toFixed(2) + '%') +
+      ' / 通过 ' + (latest.passed === null || latest.passed === undefined ? '—' : latest.passed) +
+      '/' + (latest.total === null || latest.total === undefined ? '—' : latest.total)
+    : '未能取到最新报告详情（可到版本历史抽屉查看评测报告）'
+  const state = { checked: false, reason: '' }
+  const content = h('div', {}, [
+    h('p', { style: 'margin: 0 0 8px; line-height: 1.7;' }, '本次保存未通过评测护栏：' + reason),
+    h('p', { style: 'margin: 0 0 8px; font-size: 12px; line-height: 1.7; color: #909399;' }, latestText),
+    h(
+      'p',
+      { style: 'margin: 0 0 6px; font-size: 12px; line-height: 1.7; color: #e6a23c;' },
+      '强制保存会绕过护栏并记录原因（进入审计）；未通过评测的配置可能降低回答质量。'
+    ),
+    h(
+      'p',
+      { style: 'margin: 0 0 6px; font-size: 12px; line-height: 1.7; color: #909399;' },
+      '取消不会保存：可先到评测流水线跑该版本评测（状态 blocked/无报告时），回到本页再保存。'
+    ),
+    h(
+      ElCheckbox,
+      {
+        modelValue: state.checked,
+        'onUpdate:modelValue': (val) => {
+          state.checked = val
+        }
+      },
+      { default: () => '我已知风险，强制保存' }
+    ),
+    h(ElInput, {
+      modelValue: state.reason,
+      'onUpdate:modelValue': (val) => {
+        state.reason = val
+      },
+      type: 'textarea',
+      rows: 3,
+      // 后端 FORCE_REASON_MIN_LENGTH=10 / MAX=100（会拼进 change_note），前端同步这两个边界
+      maxlength: 100,
+      showWordLimit: true,
+      placeholder: '必填：10~100 字，写清为什么在评测未通过时仍要保存',
+      style: 'margin-top: 8px;'
+    })
+  ])
+  ElMessageBox.confirm(content, '评测护栏未通过（409）', {
+    type: 'warning',
+    confirmButtonText: '强制保存',
+    cancelButtonText: '取消（不保存）',
+    beforeClose: (action, instance, done) => {
+      if (action !== 'confirm') {
+        done()
+        return
+      }
+      const text = (state.reason || '').trim()
+      if (!state.checked) {
+        ElMessage.warning('请先勾选「我已知风险，强制保存」')
+        return
+      }
+      if (text.length < 10) {
+        ElMessage.warning('强制保存原因需 ≥10 字（当前 ' + text.length + ' 字）')
+        return
+      }
+      if (text.length > 100) {
+        ElMessage.warning('强制保存原因最长 100 字（当前 ' + text.length + ' 字）')
+        return
+      }
+      done()
+    }
+  })
+    .then(() => doSave({ forceReason: state.reason.trim() }))
+    .catch(() => {
+      // 取消：不发第二次请求；表单与已填内容保留，用户可继续修改或关闭
     })
 }
 

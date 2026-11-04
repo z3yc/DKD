@@ -1,8 +1,8 @@
 <template>
   <div class="app-container agent-kb">
-    <!-- 顶部统计卡：文档数 / 切片数 / 检索次数（检索次数来自只增的检索记录，是“被用了几次”的客观口径） -->
+    <!-- 顶部统计卡：文档数 / 切片数 / 检索次数 / 检索回退率（回退率=仅列证据回退占比，5-3 治理指标） -->
     <el-row :gutter="12" class="mb8">
-      <el-col :xs="24" :sm="8">
+      <el-col :xs="24" :sm="6">
         <el-card shadow="never" class="stat-card">
           <div class="stat-label">L2 文档数</div>
           <el-skeleton v-if="stats.loading" :rows="1" animated />
@@ -12,7 +12,7 @@
           <div class="stat-foot">已入库的文档（含停用）</div>
         </el-card>
       </el-col>
-      <el-col :xs="24" :sm="8">
+      <el-col :xs="24" :sm="6">
         <el-card shadow="never" class="stat-card">
           <div class="stat-label">切片数</div>
           <el-skeleton v-if="stats.loading" :rows="1" animated />
@@ -20,12 +20,34 @@
           <div class="stat-foot">检索的最小单位（300~500 字/片）</div>
         </el-card>
       </el-col>
-      <el-col :xs="24" :sm="8">
+      <el-col :xs="24" :sm="6">
         <el-card shadow="never" class="stat-card">
           <div class="stat-label">检索次数</div>
           <el-skeleton v-if="stats.loading" :rows="1" animated />
           <div v-else class="stat-value">{{ stats.error ? '—' : (stats.data.retrievals ?? 0) }}</div>
           <div class="stat-foot">含本次页面的检索测试（每次都会记录）</div>
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :sm="6">
+        <el-card shadow="never" class="stat-card">
+          <div class="stat-label">
+            <el-tooltip content="仅列证据回退率，目标 <15%（5-3）" placement="top">
+              <span>检索回退率（仅列证据）</span>
+            </el-tooltip>
+          </div>
+          <el-skeleton v-if="stats.loading" :rows="1" animated />
+          <div
+            v-else
+            class="stat-value"
+            :class="{ 'stat-value--warn': !stats.error && fallbackRateHigh }"
+            :title="stats.error ? '统计加载失败：' + stats.error : ''"
+          >
+            {{ stats.error ? '—' : fallbackRateText }}
+          </div>
+          <div class="stat-foot">
+            <span v-if="stats.error">统计加载失败</span>
+            <span v-else>{{ fallbackDetail }}</span>
+          </div>
         </el-card>
       </el-col>
     </el-row>
@@ -486,7 +508,42 @@ const togglingCode = ref(null)
 const stats = reactive({
   loading: true,
   error: '',
-  data: { documents: 0, chunks: 0, retrievals: 0 }
+  data: {
+    documents: 0,
+    chunks: 0,
+    retrievals: 0,
+    // 5-3 引用治理：回退次数与回退率（Python /agents/kb/stats 增量返回；未上线时为空）
+    fallbackRetrievals: null,
+    fallbackRate: null
+  }
+})
+
+/** 回退率（0~1）；缺失/非法视为无数据（不要显示成 0%，那会被读成“零回退，治理达标”） */
+const fallbackRate = computed(() => {
+  const value = stats.data.fallbackRate
+  if (value === null || value === undefined || value === '') return null
+  const num = Number(value)
+  return Number.isNaN(num) ? null : num
+})
+
+/** 回退率展示：两位小数百分比；无数据显示「—」 */
+const fallbackRateText = computed(() => {
+  if (fallbackRate.value === null) return '—'
+  return (fallbackRate.value * 100).toFixed(2) + '%'
+})
+
+/** 目标 <15%（5-3）：超过阈值用 warning 色，提醒需要回去看语料/阈值，而不是继续加语料硬撑 */
+const fallbackRateHigh = computed(() => fallbackRate.value !== null && fallbackRate.value > 0.15)
+
+/** 卡片副文案：能拿到回退/总检索次数就写清分子分母（百分比没有分母时最容易被误读） */
+const fallbackDetail = computed(() => {
+  if (fallbackRate.value === null) return '暂无数据（后端未返回 fallbackRate）'
+  const fallback = stats.data.fallbackRetrievals
+  const total = stats.data.retrievals
+  if (fallback === null || fallback === undefined || total === null || total === undefined) {
+    return '目标 <15%（5-3）；回退=检索无引用时回退「仅列证据」'
+  }
+  return '回退 ' + fallback + ' / 检索 ' + total + ' 次；目标 <15%（5-3）'
 })
 
 /** 新增文档抽屉状态 */
@@ -692,9 +749,15 @@ function loadStats() {
     .then((response) => {
       // 同 search：兼容扁平 data 与 {stats: {...}} 两种包装（Python/Java 任一侧换信封都不至于把统计画成 0）
       const raw = response.data || {}
-      stats.data = raw.stats && typeof raw.stats === 'object'
-        ? raw.stats
-        : { documents: raw.documents ?? 0, chunks: raw.chunks ?? 0, retrievals: raw.retrievals ?? 0 }
+      const payload = raw.stats && typeof raw.stats === 'object' ? raw.stats : raw
+      stats.data = {
+        documents: payload.documents ?? 0,
+        chunks: payload.chunks ?? 0,
+        retrievals: payload.retrievals ?? 0,
+        // 新字段保留原值（null=未返回），不要兜底成 0：0% 回退率与“无数据”结论相反
+        fallbackRetrievals: payload.fallbackRetrievals ?? null,
+        fallbackRate: payload.fallbackRate ?? null
+      }
     })
     .catch((error) => {
       stats.error = (error && error.message) || '网络异常'
@@ -915,6 +978,11 @@ onMounted(() => {
     font-size: 24px;
     font-weight: 600;
     line-height: 1.3;
+  }
+
+  /* 回退率超阈值（>15%）用 warning 色：数值本身要“扎眼”，否则治理指标会被当装饰忽略 */
+  .stat-value--warn {
+    color: var(--el-color-warning);
   }
 
   .stat-foot {

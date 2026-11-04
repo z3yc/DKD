@@ -15,6 +15,19 @@
         description="每次保存（含启停、回滚）都会 +1 版本并写一条快照。回滚 = 把历史快照复制为新版本，不删除任何历史，因此可以再滚回来。快照字段与 agent_config 列名一致（snake_case）。"
       />
 
+      <!--
+        5-1：评测报告区块（按版本展示）。放在版本表上方而不是每行展开：
+        评测是“跨版本对照”的数据，逐行展开会在同一抽屉里发起 N 次请求（N+1），
+        一次拉回按时间倒序展示，版本号本身就能对上历史行。
+      -->
+      <EvalReportPanel
+        v-if="configCode"
+        class="history-eval"
+        :config-code="configCode"
+        :limit="50"
+        empty-text="该配置暂无评测报告"
+      />
+
       <el-skeleton v-if="loading" :rows="6" animated class="history-skeleton" />
       <el-empty v-else-if="failed" :description="'版本历史加载失败：' + failMsg">
         <el-button type="primary" @click="load">重试</el-button>
@@ -132,6 +145,7 @@
 <script setup name="VersionHistory">
 import { ElMessage, ElMessageBox } from 'element-plus'
 import PromptEditor from './PromptEditor.vue'
+import EvalReportPanel from './EvalReportPanel.vue'
 import { getAgentConfig, listAgentConfigHistory, rollbackAgentConfig } from '@/api/manage/agentConfig'
 
 /**
@@ -158,6 +172,11 @@ const props = defineProps({
     default: null
   },
   configName: {
+    type: String,
+    default: ''
+  },
+  /** 配置编码（5-1 评测报告按 configCode 查；新增/未知时可空，面板自行不请求） */
+  configCode: {
     type: String,
     default: ''
   }
