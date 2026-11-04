@@ -517,10 +517,74 @@ async def test_set_enabled_rejects_illegal_doc_code():
     assert session.calls == []
 
 
-async def test_stats_returns_single_query_counts():
-    session = FakeSession(rows_by_call=[[{"documents": 2, "chunks": 5, "retrievals": 7}]])
-    assert await stats(session) == {"documents": 2, "chunks": 5, "retrievals": 7}
-    assert len(session.calls) == 1, "统计应单查询完成（页面顶部三张卡，不做 3 次往返）"
+async def test_stats_returns_single_query_counts_and_governance_metrics():
+    session = FakeSession(
+        rows_by_call=[
+            [
+                {
+                    "documents": 2,
+                    "chunks": 5,
+                    "retrievals": 7,
+                    "fallback_retrievals": 3,
+                    "used_retrievals": 2,
+                }
+            ]
+        ]
+    )
+    data = await stats(session)
+
+    assert data["documents"] == 2 and data["chunks"] == 5 and data["retrievals"] == 7
+    assert data["fallbackRetrievals"] == 3
+    assert data["usedRetrievals"] == 2
+    assert data["fallbackRate"] == pytest.approx(3 / 7), "回退率 = fallback / retrievals"
+    assert len(session.calls) == 1, "统计应单查询完成（不做多次往返）"
+
+
+async def test_stats_zero_retrievals_returns_zero_rate():
+    """空库/未启用知识库时 retrievals=0 是常态：不得除零，回退率按 0.0。"""
+    session = FakeSession(
+        rows_by_call=[
+            [
+                {
+                    "documents": 0,
+                    "chunks": 0,
+                    "retrievals": 0,
+                    "fallback_retrievals": 0,
+                    "used_retrievals": 0,
+                }
+            ]
+        ]
+    )
+    data = await stats(session)
+    assert data["fallbackRate"] == 0.0
+    assert data["fallbackRetrievals"] == 0 and data["usedRetrievals"] == 0
+
+
+async def test_stats_missing_row_defaults_to_zero():
+    """统计行缺失/字段缺失按 0 处理：一行脏数据不能让统计接口 500。"""
+    data = await stats(FakeSession(rows_by_call=[[]]))
+    assert data == {
+        "documents": 0,
+        "chunks": 0,
+        "retrievals": 0,
+        "fallbackRetrievals": 0,
+        "fallbackRate": 0.0,
+        "usedRetrievals": 0,
+    }
+
+
+async def test_stats_sql_is_select_only_and_counts_fallback_conditions():
+    session = FakeSession(rows_by_call=[[{"retrievals": 1, "fallback_retrievals": 1}]])
+    await stats(session)
+
+    sql, params = session.calls[0]
+    lowered = sql.lower()
+    assert lowered.lstrip().startswith("select")
+    for forbidden in ("insert", "update", "delete"):
+        assert forbidden not in lowered, f"统计只读，不得出现 {forbidden}"
+    assert "fallback_reason is not null" in lowered
+    assert "used = 1" in lowered
+    assert params == {}
 
 
 async def test_mark_used_updates_retrieval_and_reports_missing():
@@ -710,12 +774,54 @@ def test_api_db_error_maps_500_without_leaking_sql():
 
 
 def test_api_stats_returns_counts(monkeypatch):
-    async def fake_stats(session: Any) -> dict[str, int]:
-        return {"documents": 2, "chunks": 5, "retrievals": 7}
+    async def fake_stats(session: Any) -> dict[str, float | int]:
+        return {
+            "documents": 2,
+            "chunks": 5,
+            "retrievals": 7,
+            "fallbackRetrievals": 2,
+            "fallbackRate": 2 / 7,
+            "usedRetrievals": 1,
+        }
 
     monkeypatch.setattr(kb, "stats", fake_stats)
     client = _build_client(FakeSession())
 
     response = client.get("/agents/kb/stats", headers=AUTH_HEADERS)
     assert response.status_code == 200
-    assert response.json()["data"] == {"documents": 2, "chunks": 5, "retrievals": 7}
+    data = response.json()["data"]
+    assert data["documents"] == 2 and data["retrievals"] == 7
+    assert data["fallbackRetrievals"] == 2
+    assert data["fallbackRate"] == pytest.approx(2 / 7)
+    assert data["usedRetrievals"] == 1
+
+
+def test_api_stats_passes_through_store_metrics():
+    """端到端（假 session）：API 不得重算/丢字段，store 返回什么就透传什么。"""
+    session = FakeSession(
+        rows_by_call=[
+            [
+                {
+                    "documents": 1,
+                    "chunks": 3,
+                    "retrievals": 4,
+                    "fallback_retrievals": 1,
+                    "used_retrievals": 2,
+                }
+            ]
+        ]
+    )
+    client = _build_client(session)
+
+    response = client.get("/agents/kb/stats", headers=AUTH_HEADERS)
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data == {
+        "documents": 1,
+        "chunks": 3,
+        "retrievals": 4,
+        "fallbackRetrievals": 1,
+        "fallbackRate": 0.25,
+        "usedRetrievals": 2,
+    }

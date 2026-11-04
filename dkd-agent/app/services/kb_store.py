@@ -848,18 +848,43 @@ SELECT
   (SELECT COUNT(*) FROM agent_kb_chunk c
      JOIN agent_kb_document d ON d.id = c.document_id
     WHERE c.enabled = 1 AND d.enabled = 1 AND d.del_flag = '0') AS chunks,
-  (SELECT COUNT(*) FROM agent_kb_retrieval) AS retrievals
+  (SELECT COUNT(*) FROM agent_kb_retrieval) AS retrievals,
+  (SELECT COUNT(*) FROM agent_kb_retrieval
+    WHERE fallback_reason IS NOT NULL) AS fallback_retrievals,
+  (SELECT COUNT(*) FROM agent_kb_retrieval WHERE used = 1) AS used_retrievals
 """
 
 
-async def stats(session: AsyncSession) -> dict[str, int]:
-    """知识库概览：文档数 / 可检索切片数 / 累计检索次数（页面顶部三张卡的数据源）。"""
+async def stats(session: AsyncSession) -> dict[str, float | int]:
+    """知识库概览 + 检索引用治理指标（单次聚合查询，页面顶部卡片的数据源）。
+
+    除原有 `documents/chunks/retrievals` 外，增量返回 5-3 的回退率指标（**旧字段名不变**）：
+    - `fallbackRetrievals`：`fallback_reason IS NOT NULL` 的检索次数（no_hit/low_score…）；
+    - `fallbackRate`：`fallbackRetrievals / retrievals`，**无检索时为 0.0**（不做除法）；
+    - `usedRetrievals`：`used=1` 的检索次数（被最终回答引用）。
+
+    为什么用一条 SQL 的标量子查询而不是 5 次往返：这是页面首屏统计，
+    多次往返会放大延迟；且 `agent_kb_retrieval` 只增，单次聚合口径天然一致（不会前后数字打架）。
+
+    @return 字段值缺失/异常行按 0 处理（不能因为一行脏数据让统计接口 500）
+    """
     rows = (await session.execute(text(_STATS_SQL))).mappings().all()
     row = rows[0] if rows else {}
+    documents = int(row.get("documents") or 0)
+    chunks = int(row.get("chunks") or 0)
+    retrievals = int(row.get("retrievals") or 0)
+    fallback_retrievals = int(row.get("fallback_retrievals") or 0)
+    used_retrievals = int(row.get("used_retrievals") or 0)
+    # 除零保护是 5-3 的明确要求：新库/未启用知识库时 retrievals=0 是常态，
+    # 若抛 ZeroDivisionError，统计卡会把整页打成 500（看起来像“知识库坏了”）。
+    fallback_rate = fallback_retrievals / retrievals if retrievals > 0 else 0.0
     return {
-        "documents": int(row.get("documents") or 0),
-        "chunks": int(row.get("chunks") or 0),
-        "retrievals": int(row.get("retrievals") or 0),
+        "documents": documents,
+        "chunks": chunks,
+        "retrievals": retrievals,
+        "fallbackRetrievals": fallback_retrievals,
+        "fallbackRate": fallback_rate,
+        "usedRetrievals": used_retrievals,
     }
 
 

@@ -232,8 +232,17 @@ async def search_documents(payload: SearchRequest, session: SessionDep) -> KbRes
     return {"code": 200, "msg": "ok", "data": data}
 
 
-@router.get("/stats", response_model=None, summary="知识库概览（文档数/可检索切片数/累计检索次数）")
+@router.get(
+    "/stats",
+    response_model=None,
+    summary="知识库概览（文档/切片/检索次数 + 回退率指标，5-3）",
+)
 async def kb_stats(session: SessionDep) -> KbResponse:
+    """原样透传 `kb_store.stats()`：旧字段不变，新增 5-3 的回退率三个字段。
+
+    不在 API 层重算比例：口径唯一一处（`kb_store.stats`），页面/报表/告警读到的
+    回退率必须完全一致；API 只负责信封与错误映射。
+    """
     try:
         data = await stats(session)
     except Exception as exc:  # noqa: BLE001
