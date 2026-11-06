@@ -132,6 +132,7 @@ def test_assistant_tools_are_read_only():
         "list_device_anomalies",
         "search_device_history",
         "build_device_diagnosis",
+        "search_knowledge_base",
     }, "工具清单变了就要同步这份断言（它是“能力面”的唯一清单）"
     forbidden = ("create", "confirm", "adjust", "skip", "pause", "resume", "update", "delete")
     for name in names:

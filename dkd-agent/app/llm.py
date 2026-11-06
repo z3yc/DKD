@@ -23,6 +23,9 @@ logger = logging.getLogger("dkd.agent.llm")
 
 DEFAULT_PING_PROMPT = "只回复两个字：连通"
 
+#: 默认重试次数（改造前的硬编码值，配置未设置时保持现状）。
+DEFAULT_MAX_RETRIES = 2
+
 
 class LlmError(RuntimeError):
     """LLM 调用失败的统一异常（API 层据此映射 502，AGENTS §6.3）。"""
@@ -45,22 +48,51 @@ def build_chat_model(
     settings: Settings | None = None,
     *,
     streaming: bool = False,
+    model: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    max_retries: int | None = None,
+    timeout_s: float | None = None,
 ) -> ChatOpenAI:
     """构造 LLM 客户端。
 
     - `api_key` 不配置时**立即失败**，避免带着空 key 发出请求后拿到难排查的 401；
-    - `max_retries=2`：网络抖动重试，但不做无限重试（防止成本失控）。
+    - 默认 `max_retries=2`：网络抖动重试，但不做无限重试（防止成本失控）。
+
+    ## 配置注入（排期 2-7 / 契约 §5.2）
+
+    `model / temperature / max_tokens / max_retries / timeout_s` 全部是**可选覆盖**：
+
+    - `None`（默认）= **不传该参数**，行为与改造前逐字一致（`model` 走 env、
+      `temperature` 走模型默认、`max_retries=2`、`timeout` 走 `llm_timeout_s`）；
+    - 有值才注入——这是「配置留空 = 现状」的落地方式（契约 §1 Q3：NULL = 未设置）。
+
+    为什么逐个判断而不是直接传 `None`：`ChatOpenAI(temperature=None)` 的语义由第三方
+    库决定（会被当成“显式设置 None”并可能在请求体里带 `temperature: null`），
+    与“未配置”并不等价；而配置回落的验收标准恰恰是「不传 = 与改造前一致」。
     """
     s = settings or get_settings()
     if not s.llm_api_key:
         raise LlmError("DKD_DEEPSEEK_API_KEY 未配置，LLM 不可用（参见 .env.example）")
+    options: dict[str, Any] = {
+        "timeout": s.llm_timeout_s,
+        "max_retries": DEFAULT_MAX_RETRIES,
+    }
+    # 仅在配置真的给了值时才覆盖（None = 现状）；空串 model 同样视为未配置。
+    if temperature is not None:
+        options["temperature"] = float(temperature)
+    if max_tokens is not None:
+        options["max_tokens"] = int(max_tokens)
+    if max_retries is not None:
+        options["max_retries"] = int(max_retries)
+    if timeout_s is not None:
+        options["timeout"] = float(timeout_s)
     return ChatOpenAI(
-        model=s.llm_model,
+        model=model or s.llm_model,
         api_key=s.llm_api_key,  # 内部包装为 SecretStr，repr/日志不会泄漏
         base_url=s.llm_base_url,
-        timeout=s.llm_timeout_s,
-        max_retries=2,
         streaming=streaming,
+        **options,
     )
 
 

@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentLlmProfileMapper">
+
+    <!--
+      模型档案读写（排期 3-5，表 agent_llm_profile，DDL 见 docs/ddl/agent_tool_llm_profile.sql）。
+
+      ## 三条刻意的取舍
+
+      1. **没有任何密钥列**
+         表里只有 api_key_env（环境变量名）；SELECT 列表里自然也没有密钥。
+         这意味着"接口泄露密钥"在 SQL 层就不可能发生（AGENTS §7.1「密钥永不入库」）。
+
+      2. **is_default 互斥用两条 SQL 在 Service 同一事务内完成**
+         MySQL 不支持"部分唯一索引"（UNIQUE ... WHERE is_default=1），所以由应用层保证：
+         先 `clearDefaultFlag`（把其它行清 0），再写本行的 is_default。
+         顺序不能反——先写本行再清其它行，中途失败会留下两个默认档案。
+
+      3. **UPDATE 不 set code**
+         编码是档案的身份（agent_llm_probe.profile_code 引用它），编辑只读。
+         让 SQL 层也改不了，避免"Service 校验漏了"时把历史探测记录挂到不存在的编码上。
+    -->
+
+    <resultMap type="AgentLlmProfile" id="AgentLlmProfileResult">
+        <id     property="id"          column="id"          />
+        <result property="code"        column="code"        />
+        <result property="name"        column="name"        />
+        <result property="provider"    column="provider"    />
+        <result property="baseUrl"     column="base_url"    />
+        <result property="model"       column="model"       />
+        <!-- 只映射环境变量名；本表没有密钥列（见文件头取舍 1） -->
+        <result property="apiKeyEnv"   column="api_key_env" />
+        <result property="timeoutS"    column="timeout_s"   />
+        <result property="maxRetries"  column="max_retries" />
+        <result property="enabled"     column="enabled"     />
+        <result property="isDefault"   column="is_default"  />
+        <result property="description" column="description" />
+        <result property="createBy"    column="create_by"   />
+        <result property="createTime"  column="create_time" />
+        <result property="updateBy"    column="update_by"   />
+        <result property="updateTime"  column="update_time" />
+        <result property="delFlag"     column="del_flag"    />
+    </resultMap>
+
+    <sql id="selectAgentLlmProfileVo">
+        select id, code, name, provider, base_url, model, api_key_env, timeout_s, max_retries,
+               enabled, is_default, description, create_by, create_time, update_by, update_time, del_flag
+        from agent_llm_profile
+    </sql>
+
+    <sql id="agentLlmProfileWhere">
+        <where>
+            del_flag = '0'
+            <if test="code != null and code != ''">
+                AND code like concat('%', #{code}, '%')
+            </if>
+            <if test="enabled != null">
+                AND enabled = #{enabled}
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAgentLlmProfileList" parameterType="AgentLlmProfile" resultMap="AgentLlmProfileResult">
+        <include refid="selectAgentLlmProfileVo"/>
+        <include refid="agentLlmProfileWhere"/>
+        <!-- 默认档案置顶：运营进页面第一眼要看到"当前在用哪条连接" -->
+        order by is_default desc, id asc
+    </select>
+
+    <select id="selectAgentLlmProfileById" parameterType="Long" resultMap="AgentLlmProfileResult">
+        <include refid="selectAgentLlmProfileVo"/>
+        where id = #{id} and del_flag = '0'
+        limit 1
+    </select>
+
+    <select id="selectAgentLlmProfileByCode" parameterType="String" resultMap="AgentLlmProfileResult">
+        <include refid="selectAgentLlmProfileVo"/>
+        where code = #{code} and del_flag = '0'
+        limit 1
+    </select>
+
+    <select id="countAgentLlmProfileByCode" resultType="java.lang.Integer">
+        select count(1) from agent_llm_profile
+        where del_flag = '0' and code = #{code}
+        <if test="excludeId != null">
+            and id != #{excludeId}
+        </if>
+    </select>
+
+    <insert id="insertAgentLlmProfile" parameterType="AgentLlmProfile" useGeneratedKeys="true" keyProperty="id">
+        insert into agent_llm_profile
+        (code, name, provider, base_url, model, api_key_env, timeout_s, max_retries, enabled, is_default,
+         description, create_by, create_time, update_by, update_time, del_flag)
+        values
+        (#{code}, #{name}, #{provider}, #{baseUrl}, #{model}, #{apiKeyEnv}, #{timeoutS}, #{maxRetries},
+         #{enabled}, #{isDefault}, #{description}, #{createBy}, #{createTime}, #{updateBy}, #{updateTime},
+         #{delFlag})
+    </insert>
+
+    <!-- 全列更新可编辑字段；code 不在此处（见文件头取舍 3） -->
+    <update id="updateAgentLlmProfile" parameterType="AgentLlmProfile">
+        update agent_llm_profile
+        set name = #{name},
+            provider = #{provider},
+            base_url = #{baseUrl},
+            model = #{model},
+            api_key_env = #{apiKeyEnv},
+            timeout_s = #{timeoutS},
+            max_retries = #{maxRetries},
+            enabled = #{enabled},
+            is_default = #{isDefault},
+            description = #{description},
+            update_by = #{updateBy},
+            update_time = #{updateTime}
+        where id = #{id} and del_flag = '0'
+    </update>
+
+    <!-- is_default 互斥第一步：把其它行的默认标记清掉（excludeId=null 时清全部，用于新增） -->
+    <update id="clearDefaultFlag">
+        update agent_llm_profile
+        set is_default = 0,
+            update_by = #{updateBy},
+            update_time = #{updateTime}
+        where del_flag = '0' and is_default = 1
+        <if test="excludeId != null">
+            and id != #{excludeId}
+        </if>
+    </update>
+
+    <update id="updateAgentLlmProfileEnabled">
+        update agent_llm_profile
+        set enabled = #{enabled},
+            update_by = #{updateBy},
+            update_time = #{updateTime}
+        where id = #{id} and del_flag = '0'
+    </update>
+
+</mapper>

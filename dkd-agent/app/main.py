@@ -8,29 +8,116 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api import chat, fault, ops, restock
+from app.api import agents, chat, fault, kb, llm_probe, mcp, ops, restock
 from app.checkpoint import (
     ensure_windows_event_loop_policy,
     get_checkpoint_store,
     open_checkpoint_store,
 )
 from app.config import get_settings
-from app.db import dispose_engine
-from app.graphs.chat_graph import build_chat_graph
+from app.db import dispose_engine, get_sessionmaker
+from app.graphs.chat_graph import build_chat_graph, resolve_scene_tools
 from app.llm import build_chat_model
 from app.logging_conf import RequestContextMiddleware, setup_logging
+from app.obs.log_handler import db_log_stats, install_db_log_handler, shutdown_db_log_handler
 from app.obs.run_recorder import sweep_stale_runs
-from app.prompts.assistant_chat import SCENE_DIAGNOSE, SCENE_RESTOCK
+from app.prompts.assistant_chat import SCENE_DIAGNOSE
+from app.services import carrier_config, mcp_client
 from app.services.restock_analyzer import build_default_analyzer
+from app.services.tool_registry import get_tool_registry, tool_registry_stats
 from app.tools.assistant_tools import all_assistant_tools, tools_for_scene
 
 logger = logging.getLogger("dkd.agent")
+
+#: 启动期加载的 MCP 只读工具：`(agent_tool.code, StructuredTool)`。
+#: 为什么单独放模块级：`_chat_tools_provider` 是图在**每轮**调用的模块级函数，
+#: 拿不到 app.state；只在 lifespan 启动时写一次、之后只读（MCP 变更需重启，与“启动探测”一致）。
+#: 工具名用 MCP 原始名（OpenAI function name 不允许点号），注册表 code 是
+#: `mcp.<server>.<tool>`，所以这里必须保留 code↔tool 的映射给注册表开关过滤用。
+_MCP_TOOLS: list[tuple[str, Any]] = []
+
+
+async def _load_mcp_tools(settings: Any) -> None:
+    """启动期探测所有 enabled MCP server、同步只读工具并构建 LangChain 工具。
+
+    为什么失败要拒绝启动（而不是降级）：MCP 是外部工具来源，运营在页面上看到“已启用”
+    就意味着它应参与模型能力面；静默跳过会让模型“少一组工具”而页面显示正常，
+    排障时极难定位。停用的 server 不参与（运营显式关闭不算故障）。
+    """
+    _MCP_TOOLS.clear()
+    if not (settings.mcp_enabled and settings.config_from_db):
+        logger.info("MCP 未启用或配置非 DB 来源，跳过启动探测")
+        return
+    async with get_sessionmaker()() as session:
+        servers = await mcp_client.load_enabled_servers(session)
+        for server in servers:
+            probe = await mcp_client.probe_and_sync(session, server)
+            if not probe.get("ok"):
+                raise RuntimeError(
+                    f"MCP server「{server.code}」启动探测失败："
+                    f"{probe.get('errorType') or 'unknown'} / {probe.get('errorMsg') or '无详情'}。"
+                    "请在管理台停用该 server 或修复连通后重启。"
+                )
+            synced = await mcp_client.list_synced_tools(session, server.code)
+            # 用 probe 返回的**原始工具定义**（含 annotations/inputSchema）构建 LangChain 工具：
+            # list_synced_tools 是落库视图（只有 readOnly=1/0），拿它再判只读会被误拒
+            # （2026-11-04 真机踩到：probe 1 个只读工具，build 却 tools=0）。
+            built = mcp_client.build_langchain_tools(server, probe.get("tools") or [])
+            by_name = {tool.name: tool for tool in built}
+            for row in synced:
+                tool = by_name.get(str(row.get("name") or ""))
+                if tool is not None:
+                    _MCP_TOOLS.append((str(row.get("code") or ""), tool))
+            logger.info(
+                "MCP server 已加载：code=%s tools=%d synced=%s",
+                server.code,
+                len(built),
+                probe.get("synced"),
+            )
+
+
+async def _chat_tools_provider(scene: int) -> list[Any]:
+    """按场景解析**本轮**工具集（排期 2-7 / 契约 §5.2）。
+
+    为什么放在装配层而不是图里：图不该知道“工具注册表与配置从哪来”，它只承诺
+    “每次 respond 前调用一次 provider”——这样配置改后**下一次对话**即生效（不必重启）。
+    解析规则见 `chat_graph.resolve_scene_tools`：
+      1/4 → 无工具；2/3 → `tools_for_scene(scene)` ∩ `agent_tool` 启用集（效果与改造前一致，
+            因为默认/旧环境全部启用）；≥101 → 配置 `tools` ∩ 代码注册表 ∩ 注册表启用
+            （配置写坏 → 空工具 + WARN，不抛穿）。
+    `tool_registry` 是排期 3-4 的开关层：停用/写工具在这里被摘掉，**不会注入模型**。
+    读取失败时它回落代码默认（`ToolRegistry.list_enabled` 内部兜底），不会把工具全摘掉。
+    """
+    tools = await resolve_scene_tools(
+        scene,
+        builtin_tools=tools_for_scene,
+        registry=all_assistant_tools,
+        config_loader=carrier_config.load_chat_config,
+        tool_registry=get_tool_registry(),
+    )
+    # 3-7：MCP 只读工具挂到诊断场景（与知识库工具同一场景）。
+    # 为什么只挂诊断：MCP 工具来自外部 server、能力面不受本仓控制，本期先收敛到一个
+    # “排障/查手册”场景；自定义场景选择 MCP 工具需要配置台 meta 与 code 映射一起改，
+    # 留到后续批次（本批不假装已支持）。开关仍走 agent_tool：停用的 mcp 行不注入。
+    if scene == SCENE_DIAGNOSE and _MCP_TOOLS:
+        try:
+            enabled = {
+                str(entry.code)
+                for entry in await get_tool_registry().list_enabled(scope="chat")
+                if getattr(entry, "code", "")
+            }
+        except Exception as exc:  # noqa: BLE001 —— 开关层失败不得把对话打成 500
+            logger.warning("MCP 工具启用集读取失败，按启动集注入：%s", type(exc).__name__)
+            enabled = None
+        tools = tools + [tool for code, tool in _MCP_TOOLS if enabled is None or code in enabled]
+    return tools
 
 
 @asynccontextmanager
@@ -74,20 +161,41 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
 
     store = await open_checkpoint_store(s)
     app.state.checkpoint_store = store
+    # 执行日志采集（排期 2-4）：挂在 checkpointer 之后、事件循环已就绪时。
+    # 为什么不在 create_app() 里挂：那时还没有运行中的事件循环（后台 flush task 建不起来）；
+    # 为什么失败也不阻断启动：agent_log 是排障旁路，表未建/DB 抖动只 WARN 一次
+    # （见 app/obs/log_handler.py 纪律 4），不能因此让服务起不来。
+    install_db_log_handler(s)
+    # 3-7：MCP 启动探测/同步（必须在工具注册表启动校验之前：先同步 mcp 行，再一起校验；
+    # mcp 行由 mcp_client 校验过只读闸/inputSchema，tool_registry 对 source=mcp 放行）。
+    await _load_mcp_tools(s)
+    # 工具注册表（排期 3-4）：在 checkpointer/config 之后、编译图之前初始化并做**启动校验**。
+    # 为什么在启动期校验：某行 code 映射不到代码工具 = 配置错误（运营以为启用了、实际不存在），
+    # 必须启动即拒绝（RuntimeError）；表不存在/DB 不可达只是“旧环境”，回落代码默认 + WARN，
+    # 绝不因此拒绝启动（见 app/services/tool_registry.py 纪律 1/2）。
+    # `_chat_tools_provider` 通过 `get_tool_registry()` 读同一份单例，配置改后 ≤TTL(30s) 生效。
+    registry = get_tool_registry()
+    await registry.validate_startup()
+    app.state.tool_registry = registry
     # 给 LLM 分支挂上**只读工具**（2026-10-01 补齐智能功能；同日升级为**按场景**挂）：
     #   场景 2（补货）= 补货清单/设备库存/在途工单/近期销量；
     #   场景 3（诊断）= 设备消歧/异常检测/历史维修单 + 库存/在途；
     #   场景 1/4 = 不挂工具（提示词也如实说“本场景查不了”，不许凭印象编数）。
     # 写操作**不在这里**：建单/确认/调整一律走页面人工确认（AGENTS §7.9），
     # 工具集里没有任何写工具，且有测试断言这一点。
+    # 排期 2-7：工具集改为**每轮按场景求值**（`tools_provider`），而不是启动时把 2/3 两套
+    # 写死——否则「新增/停用自定义场景」「改工具子集」必须重启服务。ToolNode 仍注册全量并集
+    # （`tool_registry`）：模型只能 bind 到本轮子集，但工具节点必须认识所有可能被请求的工具。
+    # `config_loader` 负责提示词覆盖与 LLM 参数（温度/上限/重试/超时/模型）每轮从配置读；
+    # 配置不可读时它返回 None → 逐字回现状（契约 §5.2）。
     app.state.chat_graph = build_chat_graph(
         checkpointer=store.saver,
         use_llm=s.use_llm,
-        tools_by_scene=(
-            {scene: tools_for_scene(scene) for scene in (SCENE_RESTOCK, SCENE_DIAGNOSE)}
-            if s.use_llm
-            else None
+        tools_provider=_chat_tools_provider if s.use_llm else None,
+        tool_registry=(
+            [*all_assistant_tools(), *[tool for _, tool in _MCP_TOOLS]] if s.use_llm else None
         ),
+        config_loader=carrier_config.load_chat_config,
     )
     # 补货工作台服务（1-7）：真实 store + 真实只读依赖；测试可用 app.state.restock_service 整体替换
     app.state.restock_service = restock.build_default_service()
@@ -98,6 +206,8 @@ async def lifespan(app: FastAPI):  # noqa: ANN201 —— FastAPI lifespan 签名
     try:
         yield
     finally:
+        # 先 flush 执行日志、再关连接池：顺序反了会把最后一批日志写进已 dispose 的引擎
+        await shutdown_db_log_handler()
         await get_checkpoint_store().close()
         await dispose_engine()
         logger.info("dkd-agent stopped")
@@ -114,6 +224,10 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(RequestContextMiddleware)
     app.include_router(chat.router)
+    app.include_router(agents.router)  # 排期 3-3：GET /agent/agents（场景下发）
+    app.include_router(llm_probe.router)  # 排期 3-5：POST /agents/llm/ping（模型连通性探测）
+    app.include_router(kb.router)  # 排期 3-6：/agents/kb/**（知识库 L2，服务间密钥）
+    app.include_router(mcp.router)  # 排期 3-7：/agents/mcp/**（MCP 探测/同步/只读调用）
     app.include_router(ops.router)
     app.include_router(restock.router)
     app.include_router(fault.router)
@@ -141,6 +255,10 @@ def create_app() -> FastAPI:
             # lifespan 未完成/已关闭：健康检查必须仍能应答，
             # 否则排障时连“服务是否活着”都问不出来
             pass
+        # 执行日志采集（2-4）的装配状态：只读计数器，**不触发 flush/不连库**。
+        log_db = db_log_stats()
+        # 工具注册表（3-4）：只读缓存快照，**不触发加载/不连库**（health 必须能应答 DB 故障）。
+        tools = tool_registry_stats()
         return {
             "status": "ok",
             "env": s.app_env,
@@ -152,6 +270,27 @@ def create_app() -> FastAPI:
             "checkpoint_location": checkpoint_location,
             "checkpoint_open": checkpoint_open,
             "whitelist_tables": len(s.whitelist_tables),
+            # 2-7/2-8：配置来源开关与 TTL。**只报配置值，不在这里连库**——
+            # 健康检查必须能在 DB 不可达/表未建时照常应答，而那正是它最有用的时刻。
+            # `config_from_db=False` 即「一键回落纯代码默认」，是灰度回退的判据。
+            "config_from_db": s.config_from_db,
+            "config_ttl_s": s.config_ttl_s,
+            # 2-4：执行日志采集。`log_db_dropped`/`log_db_write_errors` 是排障关键信号——
+            # 它们长期 >0 说明“日志在丢/写不进库”，而此时业务可能完全正常（静默观测缺失）。
+            "log_db_enabled": s.log_db_enabled,
+            "log_db_retention_days": s.log_retention_days,
+            "log_db_installed": log_db["installed"],
+            "log_db_queue_size": log_db["queue_size"],
+            "log_db_dropped": log_db["dropped"],
+            "log_db_write_errors": log_db["write_errors"],
+            # 3-4：工具注册表。`tool_registry_degraded=true` 表示当前用的是代码默认
+            # （DB 关闭/表未建/查询失败），此时“停用某工具”的运营动作不生效——
+            # 这是排障时必须先看的一格，否则会误以为配置没保存。
+            "tool_registry_installed": tools["installed"],
+            "tool_registry_degraded": tools["degraded"],
+            "tool_registry_enabled": tools["enabled"],
+            "tool_registry_source": tools["source"],
+            "tool_registry_unknown": tools["unknown"],
         }
 
     @app.exception_handler(StarletteHTTPException)
@@ -163,7 +302,14 @@ def create_app() -> FastAPI:
         )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_exc_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    async def validation_exc_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # 3-6：知识库接口的参数错误按契约返回 **400**（Java 代理据此映射字段错误）；
+        # 其他接口保持既有 422 语义（`/agent/chat` 的保留场景码等依赖它，改全局会破兼容）。
+        if request.url.path.startswith(("/agents/kb", "/agents/mcp")):
+            return JSONResponse(
+                status_code=400,
+                content={"code": 400, "msg": "参数校验失败", "data": None},
+            )
         return JSONResponse(
             status_code=422,
             content={"code": 422, "msg": "参数校验失败", "data": exc.errors()},

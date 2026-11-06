@@ -46,6 +46,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from app.config import Settings, get_settings
+from app.config_store import AgentConfigSnapshot
 from app.graphs.restock_baseline import compute_device_baseline
 from app.graphs.restock_calibration import calibrate_state_node
 from app.graphs.restock_decisions import (
@@ -66,6 +67,7 @@ from app.graphs.restock_state import (
     RestockState,
     empty_state,
 )
+from app.services import carrier_config
 from app.tools.read_tools import (
     ASSIGNEE_ROLE_CODE,
     Assignee,
@@ -101,7 +103,9 @@ class RestockDeps(Protocol):
         """
         ...
 
-    async def save_plan(self, plan: RestockPlan) -> None: ...
+    async def save_plan(self, plan: RestockPlan, *, llm_calibrated: bool | None = None) -> None:
+        """落库计划（1-6）；`llm_calibrated` 为 5-6 的校准标记（None = 不知道/沿用历史值）。"""
+        ...
 
     async def save_decision(
         self,
@@ -279,14 +283,19 @@ class SqlRestockDeps:
             self._load_date = plan_date
         return self._loads
 
-    async def save_plan(self, plan: RestockPlan) -> None:
+    async def save_plan(self, plan: RestockPlan, *, llm_calibrated: bool | None = None) -> None:
         """落库计划（1-6 的幂等 upsert），顺带补全区域/点位。
 
         为什么在这里补而不是在节点里：`RestockPlan` 的区域只能从设备档案拿，
         而档案缓存属于 deps（`load()` 已取好）。不补的话 `agent_restock_plan.region_id` 永远是
         NULL——它是接单人分配的依据、也是 `idx_agent_restock_plan_region` 与 3-7 按区域审计的前提。
+
+        @param llm_calibrated 5-6 校准标记；由 `calibrate` 包装节点按本轮 applied 传入，
+            其它调用方（analyze 基线落库）保持 None（不覆盖历史值）
         """
-        await self._store.upsert_plan(self._with_region(plan), by="system")
+        await self._store.upsert_plan(
+            self._with_region(plan), by="system", llm_calibrated=llm_calibrated
+        )
 
     def _with_region(self, plan: RestockPlan) -> RestockPlan:
         """把设备区域/点位补进计划（已有则不动，拿不到档案则如实保持 NULL）。"""
@@ -353,18 +362,34 @@ class SqlRestockDeps:
             raise
 
 
+async def _restock_snapshot(
+    config_loader: Callable[[], Awaitable[AgentConfigSnapshot | None]] | None,
+) -> AgentConfigSnapshot | None:
+    """读本次运行生效的 restock 配置（None = 未接入/不可读 → 全部用 Settings 现状）。"""
+    if config_loader is None:
+        return None
+    try:
+        return await config_loader()
+    except Exception as exc:  # noqa: BLE001 —— 配置是旁路：读坏不得让补货分析整体失败
+        logger.warning("读取 restock 配置失败，回落 Settings 默认值：err=%s", type(exc).__name__)
+        return None
+
+
 def build_restock_graph(
     *,
     deps: RestockDeps,
     checkpointer: Any,
     settings: Settings | None = None,
     model: Any | None = None,
+    config_loader: Callable[[], Awaitable[AgentConfigSnapshot | None]] | None = None,
 ) -> Any:
     """编译补货子图。
 
     @param deps 外部依赖（取数/落库/建单）
     @param checkpointer SQLite saver（依赖 0-10）；**必须传**，否则中断无法跨请求/重启恢复
     @param model LLM 客户端（测试注入假实现；None 时按配置真实构造）
+    @param config_loader 每次运行读一次 restock 配置（排期 2-7；None = 不读 = 现状）：
+        业务参数覆盖 Settings、提示词用配置 `system_prompt`、LLM 参数用配置快照。
     """
     settings = settings or get_settings()
 
@@ -375,7 +400,11 @@ def build_restock_graph(
         落库必须在 interrupt 之前完成，这样 06:00 定时任务即使没人确认，工作台也有数据可看。
         """
         plan_date = date.fromisoformat(state["plan_date"])
-        stock, daily = await deps.load(plan_date=plan_date, limit=settings.read_row_limit)
+        # 排期 2-7：本次运行取一次配置，业务参数覆盖 Settings（**缺失字段保持现状**）。
+        # 在节点内读而不是建图时读：配置 TTL 30s，而生产分析器在 lifespan 里只建一次图工厂。
+        snapshot = await _restock_snapshot(config_loader)
+        effective = carrier_config.effective_restock_settings(settings, snapshot)
+        stock, daily = await deps.load(plan_date=plan_date, limit=effective.read_row_limit)
         by_vm: dict[str, list[ChannelStockItem]] = {}
         for item in stock:
             by_vm.setdefault(item.inner_code, []).append(item)
@@ -386,7 +415,7 @@ def build_restock_graph(
                 stock_items=items,
                 daily_rows=[row for row in daily if row.inner_code == inner_code],
                 today=plan_date,
-                settings=settings,
+                settings=effective,
             )
             actionable = [s for s in suggestions if s.suggested_quantity > 0]
             if not actionable:
@@ -407,12 +436,13 @@ def build_restock_graph(
             plans.append(plan)
 
         logger.info(
-            "补货分析完成 plan_date=%s 设备=%s 货道=%s 销量行=%s 计划=%s",
+            "补货分析完成 plan_date=%s 设备=%s 货道=%s 销量行=%s 计划=%s config_version=%s",
             plan_date,
             len(by_vm),
             len(stock),
             len(daily),
             len(plans),
+            snapshot.version if snapshot is not None else None,
         )
         return {
             "candidate_vm_ids": sorted({item.vm_id for item in stock}),
@@ -593,7 +623,7 @@ def build_restock_graph(
 
     graph = StateGraph(RestockState)
     graph.add_node("analyze", analyze)
-    graph.add_node("calibrate", _wrap_calibration(deps, model))
+    graph.add_node("calibrate", _wrap_calibration(deps, model, settings, config_loader))
     graph.add_node("await_confirmation", await_confirmation)
     graph.add_node("apply_decisions", apply_decisions)
     graph.add_node("create_tasks", create_tasks)
@@ -608,7 +638,10 @@ def build_restock_graph(
 
 
 def _wrap_calibration(
-    deps: RestockDeps, model: Any | None
+    deps: RestockDeps,
+    model: Any | None,
+    settings: Settings,
+    config_loader: Callable[[], Awaitable[AgentConfigSnapshot | None]] | None = None,
 ) -> Callable[[RestockState], Awaitable[dict[str, Any]]]:
     """把 1-5 的校准节点包成图节点（注入假模型，测试不打真实 LLM）。
 
@@ -617,7 +650,15 @@ def _wrap_calibration(
     """
 
     async def calibrate(state: RestockState) -> dict[str, Any]:
-        result = await calibrate_state_node(state, model=model)
+        # 排期 2-7：提示词与 LLM 参数按**本次运行**的配置快照注入（None = 现状）。
+        snapshot = await _restock_snapshot(config_loader)
+        result = await calibrate_state_node(
+            state,
+            model=model,
+            settings=carrier_config.effective_restock_settings(settings, snapshot),
+            system_prompt_override=(snapshot.system_prompt if snapshot is not None else None),
+            llm_options=carrier_config.llm_options(snapshot),
+        )
         # ⚠️ 为什么必须在这里回写（F-8，2026-10-03 真环境实测）：
         # 落库发生在 `analyze` 节点，而校准在它**之后**——原实现只把校准结果写进 state。
         # 后果是两个数同时存在且都“看上去对”：
@@ -627,8 +668,15 @@ def _wrap_calibration(
         # 安全红线之后第二位）。同样地，1-5 要求“依据”能看到校准理由——依据也存在库里，
         # 不回写就等于校准对运营不可见。
         # 幂等性：`upsert_plan` 本身幂等，且本节点在中断**之前**，不会因恢复而重复触发。
+        # 5-6：同时把本设备的校准结果作为 llm_calibrated 落库（True→1 / False→0）。
+        # `applied=False` 的三种情形（开关关闭 / 解析失败 / 无 entries）必须写 0 而不是 NULL——
+        # 前端要据此显示“未校准”；写 NULL 会被当成“历史未知”，降级就不可见了。
+        notes = result.get("calibration_notes") or {}
         for raw in result.get("plans") or []:
-            await deps.save_plan(_as_plan(raw))
+            plan = _as_plan(raw)
+            note = notes.get(str(plan.vm_id)) if isinstance(notes, dict) else None
+            applied = bool(note.get("applied")) if isinstance(note, dict) else False
+            await deps.save_plan(plan, llm_calibrated=applied)
         return result
 
     return calibrate

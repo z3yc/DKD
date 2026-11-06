@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentMcpServerMapper">
+
+    <!--
+      MCP server 配置读写（排期 3-7，表 agent_mcp_server，DDL 见 docs/ddl/agent_kb_mcp.sql）。
+
+      ## 三条刻意的取舍
+
+      1. **UPDATE 不 set status / last_probe_time / last_probe_msg**
+         这三列是 Python 探测后回写的运行时结论（Python 账号有 UPDATE 授权）。Java 再写一遍
+         就会出现两个写者：页面上的"最近探测结果"无法判断是谁写的，排障时直接失去依据。
+         Java 只写"配置"（name/transport/endpoint/env_keys_json/enabled/timeout_ms/row_limit/read_only_only）。
+
+      2. **UPDATE 不 set code**
+         code 是配置身份：Python 按 code 调 probe/sync，agent_mcp_tool.code 也内嵌它；
+         编辑只读，SQL 层也不给改的能力（纵深防御）。
+
+      3. **env_keys_json 只存变量名映射**
+         形如 {"X-Api-Key":"DKD_MCP_X_KEY"}；表里没有密钥值列，SELECT 列清单里自然也没有，
+         "接口泄露密钥"在 SQL 层就不可能发生（AGENTS §7.1）。
+    -->
+
+    <resultMap type="AgentMcpServer" id="AgentMcpServerResult">
+        <id     property="id"            column="id"              />
+        <result property="code"          column="code"            />
+        <result property="name"          column="name"            />
+        <result property="transport"     column="transport"       />
+        <result property="endpoint"      column="endpoint"        />
+        <result property="envKeysJson"   column="env_keys_json"   />
+        <result property="enabled"       column="enabled"         />
+        <result property="timeoutMs"     column="timeout_ms"      />
+        <result property="rowLimit"      column="row_limit"       />
+        <result property="readOnlyOnly"  column="read_only_only"  />
+        <result property="status"        column="status"          />
+        <result property="lastProbeTime" column="last_probe_time" />
+        <result property="lastProbeMsg"  column="last_probe_msg"  />
+        <result property="createBy"      column="create_by"       />
+        <result property="createTime"    column="create_time"     />
+        <result property="updateBy"      column="update_by"       />
+        <result property="updateTime"    column="update_time"     />
+        <result property="delFlag"       column="del_flag"        />
+    </resultMap>
+
+    <sql id="selectAgentMcpServerVo">
+        select id, code, name, transport, endpoint, env_keys_json, enabled, timeout_ms, row_limit,
+               read_only_only, status, last_probe_time, last_probe_msg,
+               create_by, create_time, update_by, update_time, del_flag
+        from agent_mcp_server
+    </sql>
+
+    <sql id="agentMcpServerWhere">
+        <where>
+            <!-- 查询默认过滤已删除（AGENTS §7.4） -->
+            del_flag = '0'
+            <if test="enabled != null">
+                AND enabled = #{enabled}
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAgentMcpServerList" parameterType="AgentMcpServer" resultMap="AgentMcpServerResult">
+        <include refid="selectAgentMcpServerVo"/>
+        <include refid="agentMcpServerWhere"/>
+        <!-- 最近改过的在前：配置页最常看的是刚加/刚改的 server；id 兜底同一时间 -->
+        order by update_time desc, id desc
+    </select>
+
+    <select id="selectAgentMcpServerById" parameterType="Long" resultMap="AgentMcpServerResult">
+        <include refid="selectAgentMcpServerVo"/>
+        where id = #{id} and del_flag = '0'
+        limit 1
+    </select>
+
+    <select id="selectAgentMcpServerByCode" parameterType="String" resultMap="AgentMcpServerResult">
+        <include refid="selectAgentMcpServerVo"/>
+        where code = #{code} and del_flag = '0'
+        limit 1
+    </select>
+
+    <select id="countAgentMcpServerByCode" resultType="java.lang.Integer">
+        select count(1) from agent_mcp_server
+        where del_flag = '0' and code = #{code}
+        <if test="excludeId != null">
+            and id != #{excludeId}
+        </if>
+    </select>
+
+    <insert id="insertAgentMcpServer" parameterType="AgentMcpServer" useGeneratedKeys="true" keyProperty="id">
+        insert into agent_mcp_server
+        (code, name, transport, endpoint, env_keys_json, enabled, timeout_ms, row_limit, read_only_only,
+         status, create_by, create_time, update_by, update_time, del_flag)
+        values
+        (#{code}, #{name}, #{transport}, #{endpoint}, #{envKeysJson}, #{enabled}, #{timeoutMs}, #{rowLimit},
+         #{readOnlyOnly}, #{status}, #{createBy}, #{createTime}, #{updateBy}, #{updateTime}, #{delFlag})
+    </insert>
+
+    <!-- 只覆盖配置列（见文件头取舍 1/2）；status/last_probe_* 归 Python 写 -->
+    <update id="updateAgentMcpServer" parameterType="AgentMcpServer">
+        update agent_mcp_server
+        set name = #{name},
+            transport = #{transport},
+            endpoint = #{endpoint},
+            env_keys_json = #{envKeysJson},
+            enabled = #{enabled},
+            timeout_ms = #{timeoutMs},
+            row_limit = #{rowLimit},
+            read_only_only = #{readOnlyOnly},
+            update_by = #{updateBy},
+            update_time = #{updateTime}
+        where id = #{id} and del_flag = '0'
+    </update>
+
+    <update id="updateAgentMcpServerEnabled">
+        update agent_mcp_server
+        set enabled = #{enabled},
+            update_by = #{updateBy},
+            update_time = #{updateTime}
+        where id = #{id} and del_flag = '0'
+    </update>
+
+</mapper>

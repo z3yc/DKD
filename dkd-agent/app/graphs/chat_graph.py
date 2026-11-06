@@ -17,9 +17,11 @@ state schema 冻结约定（任务 0-13）：本文件 `ChatState` 的字段一�
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
@@ -27,9 +29,16 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
+from app.agent_defaults import CUSTOM_SCENE_BASE
+from app.config import get_settings
 from app.llm import LlmError, build_chat_model
-from app.prompts.assistant_chat import SCENE_DIAGNOSE, SCENE_GENERAL, system_prompt
-from app.services import diagnosis_checklist, time_hint
+from app.prompts.assistant_chat import (
+    SCENE_DIAGNOSE,
+    SCENE_GENERAL,
+    SCENE_RESTOCK,
+    system_prompt,
+)
+from app.services import carrier_config, diagnosis_checklist, kb_citation, time_hint, tool_timing
 
 # 工具调用轮次上限（防“模型反复调工具烧 token”）。3 轮足够覆盖
 # “清单 → 查某台设备 → 查销量”这种最多三跳的问题；超出则强制作答。
@@ -263,7 +272,126 @@ def _guard_diagnosis_tool_calls(
     return kept + [synthesized], None
 
 
-async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, Any]:
+# ------------------------------------------------------------------------------------
+# 4-5 上下文窗口治理：预算估算 + 长会话裁剪
+# ------------------------------------------------------------------------------------
+def _message_text(message: Any) -> str:
+    """取消息正文（content 可能是 str 或多模态列表，统一成可估算/可截断的文本）。"""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _estimate_tokens(text_value: str) -> int:
+    """粗略 token 估算（不引入 tokenizer 依赖）：CJK 字符 ≈1 token，其余 ≈4 字符/token。
+
+    为什么够用：预算只用于“该不该裁剪”的粗判断，误差方向也偏保守（宁可早裁一点）。
+    """
+    if not text_value:
+        return 0
+    cjk = sum(
+        1 for char in text_value if "\u3400" <= char <= "\u9dff" or "\uf900" <= char <= "\ufaff"
+    )
+    return cjk + (len(text_value) - cjk + 3) // 4
+
+
+def _estimate_messages_tokens(messages: Sequence[Any]) -> int:
+    return sum(_estimate_tokens(_message_text(message)) for message in messages)
+
+
+def _summarize_tool_message(message: Any, limit: int) -> Any:
+    """把历史工具消息正文摘要化（截断 + 显式标注），保留消息类型/元数据。"""
+    text_value = _message_text(message)
+    head = text_value[:limit] if limit > 0 else ""
+    summary = (
+        f"{head}…（历史工具结果已摘要，原文 {len(text_value)} 字符）"
+        if head != text_value
+        else f"{text_value}（历史工具结果已摘要）"
+    )
+    model_copy = getattr(message, "model_copy", None)
+    if callable(model_copy):
+        try:
+            return model_copy(update={"content": summary})
+        except (TypeError, ValueError):  # pragma: no cover —— 消息实现不支持复制时兜底
+            return AIMessage(content=summary)
+    return AIMessage(content=summary)
+
+
+def trim_history(
+    history: Sequence[Any],
+    *,
+    budget_tokens: int = 8000,
+    keep_recent: int = 12,
+    tool_result_chars: int = 600,
+) -> tuple[list[Any], int]:
+    """按预算裁剪会话历史（返回 `(trimmed, dropped_count)`）。
+
+    规则（按顺序）：
+    1. **开头的 system 消息原样保留、不参与裁剪**（它是角色设定，丢了行为直接漂移）；
+    2. 未超预算 → 原样返回（**短会话/现有提示词逐字不变**）；
+    3. 超预算 → 最近 `keep_recent` 条保留原文，更早的**工具消息正文摘要化**
+       （截断到 `tool_result_chars` 并标注「历史工具结果已摘要」）；
+    4. 仍然超预算 → 从最旧的正文消息开始丢（system 与最近 keep_recent 不丢），
+       超预算即记一条 WARNING（含 budget/dropped，便于线上确认“何时开始截断”）。
+
+    @param history 会话消息（可含 system 前缀）
+    @param budget_tokens 预算（≤0 = 不裁剪；配置为 0 常被用作临时关闭）
+    @param keep_recent 原样保留的最近消息数（不含 system）
+    @param tool_result_chars 历史工具结果摘要保留的字符数
+    @return (裁剪后的消息列表, 被丢弃的消息数)
+    """
+    messages = list(history or [])
+    if not messages:
+        return [], 0
+    budget = int(budget_tokens)
+    if budget <= 0:
+        return messages, 0
+    keep_recent = max(int(keep_recent), 0)
+    tool_chars = max(int(tool_result_chars), 0)
+
+    system_prefix: list[Any] = []
+    body_start = 0
+    while body_start < len(messages) and isinstance(messages[body_start], SystemMessage):
+        system_prefix.append(messages[body_start])
+        body_start += 1
+    body = messages[body_start:]
+
+    if _estimate_messages_tokens(messages) <= budget:
+        return messages, 0  # 短会话：一个字节都不改
+
+    recent_start = max(len(body) - keep_recent, 0)
+    trimmed = list(body)
+    for index in range(recent_start):
+        if isinstance(trimmed[index], ToolMessage):
+            trimmed[index] = _summarize_tool_message(trimmed[index], tool_chars)
+
+    dropped = 0
+    while (
+        _estimate_messages_tokens(system_prefix + trimmed) > budget and len(trimmed) > keep_recent
+    ):
+        trimmed.pop(0)
+        dropped += 1
+
+    logger.warning(
+        "会话上下文截断：budget=%s keep_recent=%s dropped=%s final_tokens=%s",
+        budget,
+        keep_recent,
+        dropped,
+        _estimate_messages_tokens(system_prefix + trimmed),
+    )
+    return system_prefix + trimmed, dropped
+
+
+async def respond_with_llm(
+    state: ChatState,
+    *,
+    tools: Any = None,
+    config: Any = None,
+) -> dict[str, Any]:
     """LLM 回复节点（带工具调用，需 DKD_DEEPSEEK_API_KEY + DKD_AGENT_USE_LLM=1）。
 
     `streaming=True` 是刻意显式打开的：API 层用 `astream(stream_mode="messages")` 逐 token 下发，
@@ -296,16 +424,61 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
     ⚠️ **能力变了必须同步改提示词**：提示词说“我看不了数据”而工具已经能查，
     模型就会拒绝回答——这正是本次修的那类“提示与能力脱节”缺陷。
     """
-    client = build_chat_model(streaming=True)
+    # 排期 2-7：LLM 参数与提示词覆盖来自**本次调用时**读到的配置快照（config=None = 现状）。
+    # 为什么由节点把快照传进来、而不在这里再读一次配置：同一轮对话里工具集、提示词、
+    # 采样参数必须来自同一份快照；两处各读一次会在 TTL 边界上出现“工具是新的、prompt 是旧的”。
+    options = carrier_config.llm_options(config)
+    client = build_chat_model(streaming=True, **options)
+    # 4-5 上下文预算：在转成 prompt 消息**之前**裁剪原始历史（保留 ToolMessage 角色，
+    # 这样“更早的工具结果摘要化”才有类型依据）。短会话/未超预算时逐字不变。
+    settings = get_settings()
+    trimmed_history, dropped = trim_history(
+        state.get("messages", []),
+        budget_tokens=settings.history_token_budget,
+        keep_recent=settings.history_keep_recent_messages,
+        tool_result_chars=settings.history_tool_result_chars,
+    )
+    if dropped:
+        logger.info("本轮上下文裁剪：dropped=%s（预算内不打断回答）", dropped)
     history = [
         m if isinstance(m, HumanMessage) else AIMessage(content=str(m.content))
-        for m in state.get("messages", [])
+        for m in trimmed_history
     ]
+    scene = int(state.get("scene", SCENE_GENERAL))
+    # 排期 3-2（自定义 chat 智能体）：scene≥101 时，提示词里的工具子集与角色名必须来自
+    # **同一份配置快照**（与工具绑定同源，避免“提示词说能查 A、实际绑的是 B”）。
+    # ⚠️ 内置 1-4 一律传 None：`chat` 行在 seed 里就带着 system_prompt，若把配置 tools
+    # 也传进来，会把内置场景误判成自定义（追加 footer、覆盖内置工具名单），
+    # 破坏「配置=默认 ⇒ 提示词逐字相同」的回归锚点（tests/test_config_carrier.py）。
+    custom_scene = scene >= CUSTOM_SCENE_BASE
+    # 工具通过**闭包注入**而不是放进 state：工具实例不可 JSON 序列化，
+    # 进 state 会被 checkpointer 试图序列化并报错（而且那也不属于“会话状态”）。
+    provided_tools = list(tools or [])
+    if tools is not None:
+        # 排期 3-4：提示词里的工具名单以**本轮实际绑定**为准（内置场景=注册表启用集；
+        # 自定义场景=配置 tools ∩ 注册表启用集）。停用工具不得留在 tool_list 里，
+        # 否则模型会去调一个没绑的工具（“提示与能力脱节”，本项目已踩过两次）。
+        # 内置场景必须显式 custom_safety=False：只是换工具名单，不能因此变成自定义语义
+        # （否则会追加安全 footer、换写操作约束，破坏「配置=默认 ⇒ 提示词逐字相同」）。
+        tool_names_override = tuple(str(getattr(tool, "name", "")) for tool in provided_tools)
+        custom_safety = custom_scene
+    elif custom_scene and config is not None:
+        # 调用方没传 tools（不绑定任何工具）：回配置子集渲染能力面。
+        tool_names_override = tuple(getattr(config, "tools", ()) or ())
+        custom_safety = True
+    else:
+        tool_names_override = None
+        custom_safety = None
+    scene_label = (
+        str(getattr(config, "name", "") or "").strip()
+        if custom_scene and config is not None
+        else ""
+    )
     # system 必须在最前面（放在历史之后会变成“事后补充说明”，模型容易忽略）
     messages: list[AnyMessage] = [
         SystemMessage(
             content=system_prompt(
-                int(state.get("scene", SCENE_GENERAL)),
+                scene,
                 focus_inner_code=str(state.get("focus_inner_code") or ""),
                 # 本轮窗口来自用户原话（FIX-28）。为什么从 contextvar 读而不是进 state：
                 # 它**不是会话状态**（下一轮不该沿用上一轮的窗口，见 time_hint 模块注释），
@@ -314,15 +487,24 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
                 # 2-3 问诊循环：把「本轮排查到哪一步、下一步查什么」写进提示词，
                 # 避免模型一上来就下结论（硬拦截在工具侧的 can_conclude 守卫）。
                 diagnosis_hint=_diagnosis_hint(state),
+                # 2-7：配置台里的「角色设定」；None/空 = 代码默认模板（逐字相同）。
+                base_prompt_override=(
+                    getattr(config, "system_prompt", None) if config is not None else None
+                ),
+                # 3-2：自定义场景的工具子集与角色名（内置场景为 None/空，行为不变）
+                tool_names_override=tool_names_override,
+                scene_label=scene_label or None,
+                # 3-4：内置场景只是换工具名单，不能因此变成自定义语义（不追加 footer）
+                custom_safety=custom_safety,
             )
         )
     ]
     messages.extend(history)
 
     rounds_used = _tool_rounds_used(state)
-    # 工具通过**闭包注入**而不是放进 state：工具实例不可 JSON 序列化，
-    # 进 state 会被 checkpointer 试图序列化并报错（而且那也不属于“会话状态”）。
-    tool_list = list(tools or [])
+    # 工具清单已在上面算好（`provided_tools`）：提示词与本轮绑定必须用**同一份**，
+    # 否则会出现“提示词说能查 A、实际只绑了 B”的能力面漂移（排期 3-4 的验收点）。
+    tool_list = provided_tools
     if tool_list and rounds_used < MAX_TOOL_ROUNDS:
         try:
             call_model = client.bind_tools(tool_list)
@@ -368,6 +550,9 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
             f"我连续查询了 {MAX_TOOL_ROUNDS} 轮仍未能得出结论。"
             "请把问题说得更具体一些（例如指定设备编码或日期），我再查一次。"
         )
+        fallback, forced = kb_citation.enforce_citation(fallback, state.get("messages", []))
+        if forced:
+            logger.warning("知识库引用校验回退（轮次上限路径）：scene=%s", scene)
         return {
             "messages": [AIMessage(content=fallback)],
             "reply": fallback,
@@ -376,22 +561,138 @@ async def respond_with_llm(state: ChatState, *, tools: Any = None) -> dict[str, 
             "tokens_out": tokens_out,
         }
 
+    reply = "" if tool_calls else content
+    if reply:
+        # 3-6：知识库引用强制校验（确定性、不依赖模型自觉）。详见 services/kb_citation.py。
+        reply, forced = kb_citation.enforce_citation(reply, state.get("messages", []))
+        if forced:
+            logger.warning("知识库引用校验回退：scene=%s", scene)
+
     return {
         # 带 tool_calls 时把模型的 AIMessage 原样入历史（否则 ToolNode 找不到调用 ID）
         "messages": [resp],
         # 命中工具调用时不算答案（见 docstring 第 3 点）
-        "reply": "" if tool_calls else content,
+        "reply": reply,
         "model": str(meta.get("model_name") or meta.get("model") or "unknown"),
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
     }
 
 
-def _make_llm_node(tools: Any, tools_by_scene: Any = None) -> Any:
+async def _enabled_tool_codes(tool_registry: Any) -> set[str] | None:
+    """工具注册表的「启用且只读」工具名集合；未注入/读取失败 → None（不过滤，回现状）。
+
+    为什么失败回 None 而不是空集：注册表是**开关增强层**（排期 3-4），读取失败时
+    行为应回到改造前（内置候选全给），而不是“一个工具都不给”把助手能力整体打没。
+    """
+    if tool_registry is None:
+        return None
+    try:
+        enabled = await tool_registry.list_enabled(scope="chat")
+    except Exception as exc:  # noqa: BLE001 —— 开关层是旁路，不得把对话打成 500
+        logger.warning("工具注册表读取失败，本轮不过滤工具（回落现状）：%s", type(exc).__name__)
+        return None
+    return {str(getattr(entry, "code", "")) for entry in enabled if getattr(entry, "code", "")}
+
+
+async def resolve_scene_tools(
+    scene: int,
+    *,
+    builtin_tools: Callable[[int], Sequence[Any]],
+    registry: Callable[[], Sequence[Any]],
+    config_loader: Callable[[int], Awaitable[Any]] | None,
+    tool_registry: Any = None,
+) -> list[Any]:
+    """按场景解析**本轮**工具集（排期 2-7 / 契约 §5.2；3-4 增加注册表开关过滤）。
+
+    | 场景 | 结果 | 为什么 |
+    | --- | --- | --- |
+    | 2 补货 / 3 诊断 | `builtin_tools(scene)` ∩ 注册表启用 | 候选集不变，启停由 `agent_tool` 决定 |
+    | 1 通用 / 4 运营分析 | `[]` | 与改造前完全一致（这两个场景本来就不挂工具）|
+    | ≥101 自定义 | 配置 `tools` ∩ 代码注册表 ∩ 注册表启用 | 自定义智能体的能力面由配置决定 |
+    | 其它（5~100） | `[]` | 未定义场景，不赋予任何能力（API 层已拒绝，这里是第二道）|
+
+    `tool_registry`（排期 3-4）为空时**不过滤**，与改造前完全一致；这正是单测/旧调用方
+    的安全默认。生产由 `main._chat_tools_provider` 注入进程单例。
+
+    四条防御（都只 WARN 不抛穿）：
+      1. 配置读不到（`config_loader` 为 None / 返回 None）→ 空工具；
+      2. 配置里写了代码注册表没有的工具名 → 过滤掉，并把缺失名单写进 WARN（便于发现拼错）；
+      3. 配置/候选里的工具**已被注册表停用或非只读** → 过滤掉并 WARN（避免“提示与能力脱节”）；
+      4. 过滤后为空 → 空工具（提示词里会如实告诉模型“本场景查不了”，不编数字）。
+    """
+    allowed = await _enabled_tool_codes(tool_registry)
+
+    def _keep(tool_list: Sequence[Any]) -> list[Any]:
+        items = list(tool_list)
+        if allowed is None:
+            return items
+        return [tool for tool in items if str(getattr(tool, "name", "")) in allowed]
+
+    if scene in (SCENE_RESTOCK, SCENE_DIAGNOSE):
+        candidates = list(builtin_tools(scene))
+        kept = _keep(candidates)
+        if allowed is not None:
+            disabled = [
+                str(getattr(tool, "name", ""))
+                for tool in candidates
+                if str(getattr(tool, "name", "")) not in allowed
+            ]
+            if disabled:
+                logger.warning(
+                    "内置场景有工具被注册表停用/设为非只读，本轮不注入：scene=%s tools=%s",
+                    scene,
+                    disabled,
+                )
+        return kept
+    if scene < CUSTOM_SCENE_BASE:
+        return []
+    if config_loader is None:
+        logger.warning("自定义场景未接入配置读取，本轮不挂工具：scene=%s", scene)
+        return []
+    snapshot = await config_loader(scene)
+    if snapshot is None:
+        logger.warning("自定义场景未命中已启用配置，本轮不挂工具：scene=%s", scene)
+        return []
+    wanted = tuple(getattr(snapshot, "tools", ()) or ())
+    by_name = {str(getattr(tool, "name", "")): tool for tool in registry()}
+    missing = [name for name in wanted if name not in by_name]
+    unavailable = [
+        name for name in wanted if name in by_name and allowed is not None and name not in allowed
+    ]
+    filtered = [
+        by_name[name] for name in wanted if name in by_name and (allowed is None or name in allowed)
+    ]
+    if missing:
+        logger.warning("自定义场景配置了未注册的工具，已忽略：scene=%s tools=%s", scene, missing)
+    if unavailable:
+        logger.warning(
+            "自定义场景配置了已被停用/非只读的工具，本轮不注入：scene=%s tools=%s",
+            scene,
+            unavailable,
+        )
+    if not filtered:
+        logger.warning("自定义场景本轮可用工具为空（配置 tools=%r）：scene=%s", wanted, scene)
+    return filtered
+
+
+def _make_llm_node(
+    tools: Any,
+    tools_by_scene: Any = None,
+    *,
+    tools_provider: Callable[[int], Any] | None = None,
+    config_loader: Callable[[int], Awaitable[Any]] | None = None,
+) -> Any:
     """把工具列表闭包进节点函数（LangGraph 节点只接收 state，工具必须从外部带入）。
 
-    @param tools         固定工具集（未提供 `tools_by_scene` 时使用）
-    @param tools_by_scene 按场景选工具（**场景决定能力面**，2026-10-01）
+    @param tools          固定工具集（未提供 `tools_by_scene` / `tools_provider` 时使用）
+    @param tools_by_scene  按场景选工具（**场景决定能力面**，2026-10-01）
+    @param tools_provider  每次 respond **求值一次**的工具提供者（排期 2-7；可同步可异步）。
+       契约 §5.2 要求“配置改后下一次调用生效”，所以它不能是启动时定死的一份字典；
+       生产实现见 `app/main._chat_tools_provider`（内置 2/3 走 tools_for_scene、
+       ≥101 走配置过滤、1/4 空）。
+    @param config_loader  每次 respond 读一次配置快照（提示词覆盖 + LLM 参数）；
+       None = 不读配置（测试/旧调用方的现状路径）。
 
     为什么按场景选：补货场景不需要知道“怎么查故障案例”，诊断场景也不需要“补货建议清单”。
     多绑一个工具就多一份 schema（每轮都进 prompt），还会把模型注意力引到无关问题上。
@@ -400,10 +701,18 @@ def _make_llm_node(tools: Any, tools_by_scene: Any = None) -> Any:
     """
 
     async def _node(state: ChatState) -> dict[str, Any]:
+        scene = int(state.get("scene", 0) or 0)
+        snapshot = await config_loader(scene) if config_loader is not None else None
+        if tools_provider is not None:
+            resolved = tools_provider(scene)
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+            return await respond_with_llm(state, tools=list(resolved or []), config=snapshot)
         if tools_by_scene is not None:
-            scene = int(state.get("scene", 0) or 0)
-            return await respond_with_llm(state, tools=tools_by_scene.get(scene, []))
-        return await respond_with_llm(state, tools=tools)
+            return await respond_with_llm(
+                state, tools=tools_by_scene.get(scene, []), config=snapshot
+            )
+        return await respond_with_llm(state, tools=tools, config=snapshot)
 
     return _node
 
@@ -414,8 +723,11 @@ def build_chat_graph(
     use_llm: bool = False,
     tools: Any = None,
     tools_by_scene: dict[int, Any] | None = None,
+    tools_provider: Callable[[int], Any] | None = None,
+    tool_registry: Sequence[Any] | None = None,
+    config_loader: Callable[[int], Awaitable[Any]] | None = None,
 ) -> Any:
-    """编译对话图（带 checkpointer）。
+    """编译对话图（带 checkpointer；排期 2-7 支持每轮按配置解析工具与 LLM 参数）。
 
     @param tools 只读工具列表（`StructuredTool`）；仅 LLM 分支生效。
                  - 传具体列表 → 所有场景都用这一套（测试用）；
@@ -428,16 +740,27 @@ def build_chat_graph(
                  但每个场景只 bind 自己那份；模型只能调用被 bind 的工具。
     """
     builder = StateGraph(ChatState)
-    if tools_by_scene is not None:
+    if tools_provider is not None:
+        # 排期 2-7：工具集**每轮求值**（配置改后下一次对话即生效）。
+        # ToolNode 注册 `tool_registry` 的全量并集；每次 respond 只 bind 本轮子集。
+        tool_list = list(tool_registry or tools or [])
+        node = (
+            _make_llm_node([], tools_provider=tools_provider, config_loader=config_loader)
+            if use_llm
+            else respond
+        )
+    elif tools_by_scene is not None:
         union: dict[str, Any] = {}
         for scene_tools in tools_by_scene.values():
             for tool in scene_tools:
                 union[tool.name] = tool
         tool_list = list(union.values())
-        node = _make_llm_node([], tools_by_scene) if use_llm else respond
+        node = (
+            _make_llm_node([], tools_by_scene, config_loader=config_loader) if use_llm else respond
+        )
     else:
         tool_list = list(tools or [])
-        node = _make_llm_node(tool_list) if use_llm else respond
+        node = _make_llm_node(tool_list, config_loader=config_loader) if use_llm else respond
     # 入口先跑焦点节点（2-3）：在“问”之前把“这次在诊断哪台设备”算出来，
     # 这样 system 提示词里能带上它，追问才落到同一台设备上。
     builder.add_node("focus", resolve_focus)
@@ -449,7 +772,12 @@ def build_chat_graph(
         # handle_tool_errors 显式传**自定义处理器**而不是默认值/True：
         # 实测默认只处理参数校验类异常，工具体内的异常会抛穿整个图（把对话打成 502）；
         # 而传 True 会把原始异常文本喂给模型与留痕，可能带上连接串（见 _handle_tool_error）。
-        builder.add_node("tools", ToolNode(tool_list, handle_tool_errors=_handle_tool_error))
+        #
+        # 4-1：ToolNode 执行的是**轻量包装后**的工具（只加耗时/返回规模采样，
+        # 保留 name/description/args_schema 与异常语义）；bind_tools 仍用上面的原始工具对象，
+        # 因此模型看到的 schema 与执行行为都不变。
+        timed_tools = tool_timing.wrap_tools(tool_list)
+        builder.add_node("tools", ToolNode(timed_tools, handle_tool_errors=_handle_tool_error))
         builder.add_conditional_edges("respond", _should_call_tools, {"tools": "tools", END: END})
         builder.add_edge("tools", "respond")
     else:

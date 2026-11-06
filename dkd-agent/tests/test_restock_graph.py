@@ -68,6 +68,8 @@ class FakeDeps:
         self.task_error = task_error
         self.load_calls = 0
         self.saved_plans: list[Any] = []
+        # 5-6：每次落库携带的校准标记（analyze 基线落库为 None，calibrate 回写为 True/False）
+        self.saved_flags: list[bool | None] = []
         self.saved_decisions: list[tuple[Any, Any, int | None]] = []
         self.created: list[Any] = []
 
@@ -78,8 +80,9 @@ class FakeDeps:
     async def resolve_assignee(self, plan: Any) -> tuple[int | None, str | None]:
         return self.assignee
 
-    async def save_plan(self, plan: Any) -> None:
+    async def save_plan(self, plan: Any, *, llm_calibrated: bool | None = None) -> None:
         self.saved_plans.append(plan)
+        self.saved_flags.append(llm_calibrated)
 
     async def save_decision(
         self, plan: Any, *, decision: Any, task_id: int | None = None, task_code: str | None = None
@@ -151,12 +154,25 @@ async def _interrupt_value(result: dict[str, Any]) -> dict[str, Any]:
     return dict(interrupts[0].value)
 
 
-async def _open_graph(path: Any, deps: FakeDeps, *, model: Any | None = None) -> tuple[Any, Any]:
-    """按给定检查点文件编译图，返回 (graph, store)。每次调用等价于“一次进程启动”。"""
+async def _open_graph(
+    path: Any,
+    deps: FakeDeps,
+    *,
+    model: Any | None = None,
+    settings: Settings | None = None,
+) -> tuple[Any, Any]:
+    """按给定检查点文件编译图，返回 (graph, store)。每次调用等价于“一次进程启动”。
+
+    @param settings 可选覆盖（文件级默认关闭 LLM 校准以避免误调模型；
+        需要验「校准结果真的落库」的用例显式启用，见 F-8 用例）。
+    """
     store = CheckpointStore(path)
     saver = await store.open()
     graph = build_restock_graph(
-        deps=deps, checkpointer=saver, settings=_settings(), model=model or FakeModel()
+        deps=deps,
+        checkpointer=saver,
+        settings=settings or _settings(),
+        model=model or FakeModel(),
     )
     return graph, store
 
@@ -576,7 +592,14 @@ async def test_calibrated_quantity_is_persisted_so_ui_matches_state(tmp_path):
     model = FakeModel(
         content='{"calibrations": [{"channelCode": "1-1", "factor": 1.5, "reason": "节前客流"}]}'
     )
-    graph, store = await _open_graph(tmp_path / "f8.db", deps, model=model)
+    # 排期 2-7 起校准节点改用**图装配时的 Settings**（此前它另读 get_settings()，两套口径）：
+    # 本文件默认关闭校准以免误调 LLM，验 F-8 回写必须显式启用。
+    graph, store = await _open_graph(
+        tmp_path / "f8.db",
+        deps,
+        model=model,
+        settings=_settings(DKD_AGENT_RESTOCK_CALIBRATION_ENABLED="1"),
+    )
     try:
         result = await graph.ainvoke(
             new_restock_state(plan_date=PLAN_DATE, request_id="rid-f8"),
@@ -598,3 +621,48 @@ async def test_calibrated_quantity_is_persisted_so_ui_matches_state(tmp_path):
     assert _last_saved(deps, 80).total_quantity == payload["plans"][0]["totalQuantity"]
     # 反向：基线值**不能**是最终留在库里的那个（这正是 F-8 的错法）
     assert baseline not in {p.items[0].suggested_quantity for p in [deps.saved_plans[-1]]}
+
+
+async def test_calibration_flag_written_false_when_calibration_not_applied(tmp_path):
+    """5-6：校准未生效（开关关闭/解析失败/无 entries）必须写 0，不能写 NULL。
+
+    否则前端把“未校准”当“历史未知”，降级样本在驾驶舱里就永远统计不到。
+    """
+    deps = FakeDeps(stock=_stock(), daily=_daily(), assignee=(10, "孙权"))
+    graph, store = await _open_graph(tmp_path / "flag0.db", deps)
+    try:
+        await graph.ainvoke(
+            new_restock_state(plan_date=PLAN_DATE, request_id="rid-flag0"),
+            {"configurable": {"thread_id": THREAD}},
+        )
+    finally:
+        await store.close()
+
+    # analyze 基线落库不携带校准信息（None），calibrate 回写明确 False
+    assert deps.saved_flags[0] is None
+    assert deps.saved_flags[-1] is False
+    assert [flag for flag in deps.saved_flags if flag is not None] == [False]
+
+
+async def test_calibration_flag_written_true_when_calibration_applied(tmp_path):
+    """5-6：校准真的生效时写 1（与 F-8 的校准数量回写同一次落库）。"""
+    deps = FakeDeps(stock=_stock(), daily=_daily(), assignee=(10, "孙权"))
+    model = FakeModel(
+        content='{"calibrations": [{"channelCode": "1-1", "factor": 1.5, "reason": "节前客流"}]}'
+    )
+    graph, store = await _open_graph(
+        tmp_path / "flag1.db",
+        deps,
+        model=model,
+        settings=_settings(DKD_AGENT_RESTOCK_CALIBRATION_ENABLED="1"),
+    )
+    try:
+        await graph.ainvoke(
+            new_restock_state(plan_date=PLAN_DATE, request_id="rid-flag1"),
+            {"configurable": {"thread_id": THREAD}},
+        )
+    finally:
+        await store.close()
+
+    assert deps.saved_flags[0] is None, "基线落库不改校准标记"
+    assert deps.saved_flags[-1] is True

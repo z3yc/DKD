@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentLogMapper">
+
+    <!--
+      智能体执行日志的只读查询（Batch A · 排期 2-4，DDL 见 docs/ddl/agent_config.sql）。
+
+      ## 三条刻意的取舍
+
+      1. **时间条件是无条件的，没有 <if> 包裹**
+         护栏（默认近 24h / 最大 30 天）在 Java 侧 AgentReadQuerySupport.resolveWindow 里做，
+         SQL 这边只接受"已校验的窗口"。写成 <if test="window != null"> 会留下一个口子：
+         某天有人绕过 Service 直接调 Mapper，SQL 就退化成无界查询（全表扫描）。
+         无条件条件下漏传窗口只会查不到数据（fail-closed），不会拖慢主库。
+
+      2. **范围比较，不用 date_format()**
+         仓库里既有的 OrderMapper.xml:44 / InventoryLogMapper.xml:46 是函数包裹索引列的反例
+         （AGENTS §10 明确禁止）。本表有 idx_agent_log_create_time(create_time)，
+         用 `create_time >= ? AND create_time <= ?` 才能把它真正用成 range；
+         上界用闭区间是因为 Java 侧已把上界补齐到请求精度的末尾（日期串 → 当天 23:59:59.999），
+         SQL 里不需要再做 DATE_ADD，也就没有"函数包参数还是包列"的歧义。
+
+      3. **列表不返回任何超长列**
+         本表最大列是 message/error_msg（各 1000 字），列表页需要它们
+         （关键词就是靠这两列匹配的），所以照常返回；这里没有像审计表那样剔除 JSON 大列的必要。
+
+      注：agent_log 是"只增不改"的流水表，DDL 里没有 del_flag（只有 create_by），
+      因此查询不做逻辑删除过滤——若将来加了软删列，必须同步改本文件与 AgentLog 的注释。
+    -->
+
+    <resultMap type="AgentLog" id="AgentLogResult">
+        <id     property="id"             column="id"              />
+        <result property="createTime"     column="create_time"     />
+        <result property="level"          column="level"           />
+        <result property="logger"         column="logger"          />
+        <result property="runId"          column="run_id"          />
+        <result property="conversationId" column="conversation_id" />
+        <result property="taskId"         column="task_id"         />
+        <result property="scene"          column="scene"           />
+        <result property="node"           column="node"            />
+        <result property="status"         column="status"          />
+        <result property="message"        column="message"         />
+        <result property="errorMsg"       column="error_msg"       />
+        <result property="requestId"      column="request_id"      />
+        <result property="durationMs"     column="duration_ms"     />
+        <result property="createBy"       column="create_by"       />
+    </resultMap>
+
+    <sql id="selectAgentLogVo">
+        select id, create_time, level, logger, run_id, conversation_id, task_id, scene,
+               node, status, message, error_msg, request_id, duration_ms, create_by
+        from agent_log
+    </sql>
+
+    <sql id="agentLogWhere">
+        <where>
+            <!-- 强制时间窗（无 <if>，见文件头取舍 1）；范围比较保护 create_time 索引 -->
+            create_time &gt;= #{window.beginTime}
+            AND create_time &lt;= #{window.endTime}
+            <if test="query.level != null and query.level != ''">
+                AND level = #{query.level}
+            </if>
+            <if test="query.status != null and query.status != ''">
+                AND status = #{query.status}
+            </if>
+            <if test="query.runId != null and query.runId != ''">
+                AND run_id = #{query.runId}
+            </if>
+            <if test="query.requestId != null and query.requestId != ''">
+                AND request_id = #{query.requestId}
+            </if>
+            <!-- 关键词只匹配正文与错误摘要：其他列（run_id/request_id）已有精确过滤，混在一起会让关键词语义不可预期 -->
+            <if test="query.keyword != null and query.keyword != ''">
+                AND (message like concat('%', #{query.keyword}, '%')
+                     OR error_msg like concat('%', #{query.keyword}, '%'))
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAgentLogList" resultMap="AgentLogResult">
+        <include refid="selectAgentLogVo"/>
+        <include refid="agentLogWhere"/>
+        <!-- 倒序：排障先看最近发生的；id 作为同一毫秒内的稳定次序（create_time 是 DATETIME(3)） -->
+        order by create_time desc, id desc
+    </select>
+
+</mapper>

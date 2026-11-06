@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentEvalReportMapper">
+
+    <!--
+      评测报告读写（排期 5-1，表 agent_eval_report，DDL 见 docs/ddl/agent_eval_flag.sql）。
+
+      ## 三条刻意的取舍
+
+      1. **只增不改**：只有 INSERT + 两个 SELECT。报告是保存护栏的依据，
+         能改的报告不能当证据（AGENTS §6.3 审计证据同一纪律）。
+
+      2. **按 (config_code, config_version, create_time desc) 取最新**
+         护栏问的是"当前版本最近一次评测结论"，所以 selectLatestForVersion **不按 status 过滤**：
+         必须能拿到 blocked/failed 的最新报告，页面才能解释"为什么不能保存"
+         （只查 scored 会把"跑挂了"表现成"从未评测"，排查方向完全相反）。
+
+      3. **分页用参数化 LIMIT，不拼字符串**
+         limit 由 Service 限制在 1~100；全部 #{} 绑定（AGENTS §7.2）。
+
+      注：本表没有 del_flag（只增的评测证据），查询也不做软删过滤；
+      report_json 只落库、不参与任何列表展示（体积可能大）。
+    -->
+
+    <resultMap type="AgentEvalReport" id="AgentEvalReportResult">
+        <id     property="id"               column="id"                />
+        <result property="configCode"       column="config_code"       />
+        <result property="configVersion"    column="config_version"    />
+        <result property="scene"            column="scene"             />
+        <result property="mode"             column="mode"              />
+        <result property="status"           column="status"            />
+        <result property="accuracy"         column="accuracy"          />
+        <result property="total"            column="total"             />
+        <result property="passed"           column="passed"            />
+        <result property="failed"           column="failed"            />
+        <result property="blocked"          column="blocked"           />
+        <result property="baselineAccuracy" column="baseline_accuracy" />
+        <result property="baselineN"        column="baseline_n"        />
+        <result property="reportJson"       column="report_json"       />
+        <result property="runBy"            column="run_by"            />
+        <result property="createTime"       column="create_time"       />
+    </resultMap>
+
+    <sql id="selectAgentEvalReportVo">
+        select id, config_code, config_version, scene, mode, status, accuracy, total, passed, failed,
+               blocked, baseline_accuracy, baseline_n, report_json, run_by, create_time
+        from agent_eval_report
+    </sql>
+
+    <insert id="insertAgentEvalReport" parameterType="AgentEvalReport" useGeneratedKeys="true" keyProperty="id">
+        insert into agent_eval_report
+        (config_code, config_version, scene, mode, status, accuracy, total, passed, failed, blocked,
+         baseline_accuracy, baseline_n, report_json, run_by, create_time)
+        values
+        (#{configCode}, #{configVersion}, #{scene}, #{mode}, #{status}, #{accuracy}, #{total}, #{passed},
+         #{failed}, #{blocked}, #{baselineAccuracy}, #{baselineN}, #{reportJson}, #{runBy}, #{createTime})
+    </insert>
+
+    <select id="selectLatestByCode" resultMap="AgentEvalReportResult">
+        <include refid="selectAgentEvalReportVo"/>
+        where config_code = #{configCode}
+        <!-- 倒序：版本历史里最近一次评测在最上；id 兜底同毫秒次序 -->
+        order by create_time desc, id desc
+        limit #{limit}
+    </select>
+
+    <select id="selectLatestForVersion" resultMap="AgentEvalReportResult">
+        <include refid="selectAgentEvalReportVo"/>
+        where config_code = #{configCode} and config_version = #{configVersion}
+        order by create_time desc, id desc
+        limit 1
+    </select>
+
+</mapper>

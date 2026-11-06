@@ -263,11 +263,25 @@ async def calibrate_plan(
     suggestions: dict[str, BaselineSuggestion] | None = None,
     model: Any | None = None,
     settings: Settings | None = None,
+    system_prompt_override: str | None = None,
+    llm_options: dict[str, Any] | None = None,
 ) -> CalibrationOutcome:
     """对一份设备级计划做 LLM 校准（失败即降级，不抛异常）。
 
     @param suggestions 基线结果（按 channel_code 索引），用于给模型提供统计口径
     @param model 注入的 LLM 客户端（测试用假实现；None 时按配置真实构造）
+    @param settings 本轮生效配置（排期 2-7：业务参数已由载体用配置覆盖；None = 进程设置）
+    @param system_prompt_override 配置台里的 restock 提示词（None = 代码默认模板，
+        seed 就是 `SYSTEM_PROMPT`，默认参数下渲染结果与改造前**逐字相同**）
+    @param llm_options `build_chat_model` 的可选覆盖参数（温度/上限/重试/超时/模型；
+        None/空 dict = 不传 = 现状）
+
+    ## 分批（排期 2-7：`batch_size` 用配置值，缺省 20）
+
+    一台设备可能有上百个货道，一次性塞进 prompt 会拉高成本并降低输出可靠性。
+    因此按 `settings.restock_calibration_batch_size` 分批调用，各批结果按 channel_code
+    合并；**某批失败只降级该批**（其它批的校准仍然生效，补货不因一次抖动整体失败）。
+    默认 20 时货道数 ≤20 的设备与改造前**只发一次请求、prompt 内容逐字相同**。
     """
     settings = settings or get_settings()
     suggestions = suggestions or {}
@@ -282,45 +296,76 @@ async def calibrate_plan(
         outcome.issues.append("计划无明细，跳过校准")
         return outcome
 
-    payload = build_payload(plan, suggestions=suggestions)
-    known_channels = [item.channel_code for item in plan.items]
     try:
-        client = model or build_chat_model(settings)
-        response = await client.ainvoke(
-            [
-                (
-                    "system",
-                    system_prompt(
-                        factor_min=settings.restock_calibration_min_factor,
-                        factor_max=settings.restock_calibration_max_factor,
-                    ),
-                ),
-                ("human", build_user_prompt(payload)),
-            ]
-        )
-    except Exception as exc:  # LLM 异常一律降级，不抛穿图循环（AGENTS §6.3）
+        client = model or build_chat_model(settings, **(llm_options or {}))
+    except Exception as exc:  # 客户端构造失败（如密钥缺失）同样降级，不抛穿
         logger.warning(
-            "LLM 校准失败，降级为统计基线 inner_code=%s err=%s: %s",
+            "LLM 客户端构造失败，降级为统计基线 inner_code=%s err=%s",
             plan.inner_code,
             type(exc).__name__,
-            str(exc)[:200],
         )
-        outcome.issues.append(f"LLM 调用失败（{type(exc).__name__}），已降级为统计基线")
+        outcome.issues.append(f"LLM 客户端不可用（{type(exc).__name__}），已降级为统计基线")
         outcome.error = type(exc).__name__
         return outcome
 
-    content = response.content if isinstance(response.content, str) else str(response.content)
-    outcome.tokens_in, outcome.tokens_out = extract_usage(response)
-    outcome.model = extract_served_model(response)
+    batch_size = max(1, int(settings.restock_calibration_batch_size))
+    entries: list[CalibrationEntry] = []
+    notes_parts: list[str] = []
+    failed_batches = 0
+    total_batches = (len(plan.items) + batch_size - 1) // batch_size
+    for offset in range(0, len(plan.items), batch_size):
+        batch_items = plan.items[offset : offset + batch_size]
+        batch_plan = plan.model_copy(update={"items": batch_items})
+        payload = build_payload(batch_plan, suggestions=suggestions)
+        known_channels = [item.channel_code for item in batch_items]
+        try:
+            response = await client.ainvoke(
+                [
+                    (
+                        "system",
+                        system_prompt(
+                            factor_min=settings.restock_calibration_min_factor,
+                            factor_max=settings.restock_calibration_max_factor,
+                            template_override=system_prompt_override,
+                        ),
+                    ),
+                    ("human", build_user_prompt(payload)),
+                ]
+            )
+        except Exception as exc:  # LLM 异常一律降级，不抛穿图循环（AGENTS §6.3）
+            failed_batches += 1
+            batch_no = offset // batch_size + 1
+            logger.warning(
+                "LLM 校准失败，降级为统计基线 inner_code=%s batch=%s err=%s: %s",
+                plan.inner_code,
+                batch_no,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+            outcome.issues.append(
+                f"LLM 调用失败（{type(exc).__name__}），第 {batch_no} 批已降级为统计基线"
+            )
+            outcome.error = type(exc).__name__
+            continue
 
-    entries, issues, notes = parse_calibrations(
-        content, known_channels=known_channels, settings=settings
-    )
-    outcome.issues.extend(issues)
-    outcome.notes = notes
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        batch_tokens_in, batch_tokens_out = extract_usage(response)
+        outcome.tokens_in += batch_tokens_in
+        outcome.tokens_out += batch_tokens_out
+        outcome.model = extract_served_model(response) or outcome.model
+        batch_entries, batch_issues, batch_notes = parse_calibrations(
+            content, known_channels=known_channels, settings=settings
+        )
+        outcome.issues.extend(batch_issues)
+        if batch_notes:
+            notes_parts.append(batch_notes)
+        entries.extend(batch_entries)
+
+    outcome.notes = "；".join(notes_parts)[:120]
     outcome.entries = entries
     if not entries:
-        outcome.issues.append("没有可用的校准项，已保留统计基线结果")
+        if failed_batches == 0:
+            outcome.issues.append("没有可用的校准项，已保留统计基线结果")
         return outcome
 
     by_channel = {entry.channel_code: entry for entry in entries}
@@ -330,12 +375,13 @@ async def calibrate_plan(
         calibrated.append(apply_factor(item, entry) if entry else item)
     outcome.items = calibrated
     outcome.applied = True
-    # 日志只记结构化指标（模型/条数/token），不记 prompt 与响应体（AGENTS §6.1）
+    # 日志只记结构化指标（模型/条数/token/批数），不记 prompt 与响应体（AGENTS §6.1）
     logger.info(
-        "LLM 校准完成 inner_code=%s entries=%s issues=%s tokens_in=%s tokens_out=%s",
+        "LLM 校准完成 inner_code=%s entries=%s issues=%s batches=%s tokens_in=%s tokens_out=%s",
         plan.inner_code,
         len(entries),
         len(outcome.issues),
+        total_batches,
         outcome.tokens_in,
         outcome.tokens_out,
     )
@@ -343,7 +389,12 @@ async def calibrate_plan(
 
 
 async def calibrate_state_node(
-    state: dict[str, Any], *, model: Any | None = None
+    state: dict[str, Any],
+    *,
+    model: Any | None = None,
+    settings: Settings | None = None,
+    system_prompt_override: str | None = None,
+    llm_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """LangGraph 节点：校准 state 里的全部计划。
 
@@ -351,14 +402,20 @@ async def calibrate_state_node(
     写回校准后的 `plans` 与 `calibration_notes`（vm_id → 校准明细，供审计与前端展示）。
     **失败不写 failures**：校准失败不是业务失败，补货建议本身仍然可用。
     """
-    settings = get_settings()
+    settings = settings or get_settings()
     plans = [RestockPlan(**raw) for raw in state.get("plans", [])]
     notes: dict[str, Any] = dict(state.get("calibration_notes") or {})
     updated: list[dict[str, Any]] = []
     tokens_in = tokens_out = 0
 
     for plan in plans:
-        outcome = await calibrate_plan(plan, model=model, settings=settings)
+        outcome = await calibrate_plan(
+            plan,
+            model=model,
+            settings=settings,
+            system_prompt_override=system_prompt_override,
+            llm_options=llm_options,
+        )
         tokens_in += outcome.tokens_in
         tokens_out += outcome.tokens_out
         updated.append(plan.model_copy(update={"items": outcome.items}).model_dump(mode="json"))

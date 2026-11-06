@@ -41,7 +41,7 @@ import json
 import os
 import statistics
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 _AGENT_ROOT = Path(__file__).resolve().parents[2] / "dkd-agent"
@@ -212,6 +212,16 @@ async def main() -> int:
     parser.add_argument("--date", default=date.today().isoformat())
     parser.add_argument("--device", default=None, help="只看某台设备（inner_code）")
     parser.add_argument("--json", action="store_true", help="只输出 JSON（供 3-8 报表消费）")
+    parser.add_argument(
+        "--out",
+        default="",
+        help="把对比报告（含 n/口径/限制说明）写入该 .json 路径；供驾驶舱对比卡持续化消费",
+    )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="把报告写入 agent_compare_report（供 6-1 驾驶舱读取；需 DKD_CLEANUP_* 管理库账号）",
+    )
     args = parser.parse_args()
     plan_date = date.fromisoformat(args.date)
 
@@ -219,7 +229,8 @@ async def main() -> int:
     try:
         async with sessionmaker() as session:
             baseline_rows = await fetch_baseline_rows(session, plan_date, args.device)
-            async with httpx.AsyncClient() as client:
+            # trust_env=False：本机系统代理会把 127.0.0.1 请求发给代理并 502（2026-11-04 实测）
+            async with httpx.AsyncClient(trust_env=False) as client:
                 token = await java_login(client)
                 if not token:
                     print("⛔ Java 登录失败：规则版入口需要管理后台权限（只读调用）")
@@ -234,6 +245,52 @@ async def main() -> int:
     result = compare(rule_rows, baseline_rows)
     result["metrics"] = stats
     result["planDate"] = plan_date.isoformat()
+    # 持续化（排期 5-4）：报告必须自带样本量与口径，否则图表会被当成“全网结论”。
+    result["n"] = len(result["paired"])
+    result["generatedAt"] = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    result["caliberDoc"] = "docs/agent-restock-1-14-comparison-caliber.md"
+    result["limitations"] = [
+        "规则版只看容量（85% 补满），基线引擎基于销量预测；两者天生不同源，偏差≠谁对谁错",
+        "偏差率只对两边都有建议的配对货道计算；单边建议单独计数",
+        "本机数据量小（FIX-6 数据未到位）；n 为配对样本数，不得据此下业务结论",
+    ]
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"compare report written: {out_path} (n={result['n']})")
+
+    if args.persist:
+        try:
+            import pymysql
+
+            conn = pymysql.connect(
+                host=os.environ.get("DKD_CLEANUP_HOST", "127.0.0.1"),
+                port=int(os.environ.get("DKD_CLEANUP_PORT", "3306")),
+                user=os.environ.get("DKD_CLEANUP_USER", "root"),
+                password=os.environ.get("DKD_CLEANUP_PASSWORD", ""),
+                database=os.environ.get("DKD_CLEANUP_DB", "dkd"),
+                charset="utf8mb4",
+                autocommit=True,
+            )
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO agent_compare_report"
+                        " (plan_date, generated_at, n, rule_total, baseline_total,"
+                        "  mean_delta_pct, median_delta_pct, report_json, create_by)"
+                        " VALUES (%s, NOW(3), %s, %s, %s, %s, %s, %s, 'compare-script')",
+                        (
+                            plan_date, result["n"], result["ruleTotal"], result["baselineTotal"],
+                            result.get("meanDeltaPct"), result.get("medianDeltaPct"),
+                            json.dumps(result, ensure_ascii=False),
+                        ),
+                    )
+                print("compare report persisted: agent_compare_report")
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 —— 落库失败不丢报告，明确提示
+            print(f"WARN: 对比报告落库失败（{type(exc).__name__}），已保留 --out 文件")
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False))

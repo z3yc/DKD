@@ -24,15 +24,28 @@
         </el-button>
       </div>
 
-      <!-- 场景切换：scene 参数与 Python 侧契约一致（1-通用 2-补货 3-诊断 4-运营分析） -->
+      <!--
+        场景切换：scene 参数与 Python 侧契约一致（1-通用 2-补货 3-诊断 4-运营分析，自定义场景>=101）。
+        列表来自 `probeStatus` 合并后的动态 scenes（默认硬编码 2/3/4 作回落，见 script 里 mergeScenes 注释）。
+      -->
       <div class="agent-tabs">
         <span
-          v-for="item in SCENES"
+          v-for="item in scenes"
           :key="item.value"
           class="tab"
           :class="{ on: scene === item.value }"
+          :title="item.custom ? '自定义智能体（管理员在配置台下发的场景）' : ''"
           @click="switchScene(item.value)"
         >{{ item.label }}</span>
+      </div>
+
+      <!--
+        4-1 刷新恢复提示：会话从 localStorage 恢复后显示（绿色=“找回来了”，不是故障提示）。
+        用户点右上角「+」新会话会清空本场景存档，之后不再自动恢复。
+      -->
+      <div v-if="restoredNotice" class="restore-bar">
+        <span class="txt">{{ restoredNotice }}</span>
+        <el-button link type="primary" @click="restoredNotice = ''">知道了</el-button>
       </div>
 
       <!-- 降级提示：agent.enabled=false 或 Python 不可达（方案 §3.3 要求明确告知，不伪造会话能力） -->
@@ -221,14 +234,84 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { chatWithAgent, probeAgentStatus, resumeAgentStream } from '@/api/manage/agent'
 import useAgentStore from '@/store/modules/agent'
+import useUserStore from '@/store/modules/user'
 
 // marked 配置与 views/manage/report/index.vue 保持一致（v18 用 use 取代 setOptions）
 marked.use({ breaks: true, gfm: true })
 
-const SCENES = [
-  { value: 2, label: '补货 Agent' },
-  { value: 3, label: '诊断 Agent' },
-  { value: 4, label: '分析 Copilot' }
+/** 内置场景的固定中文名（与改造前逐字一致，保证“后端没下发”时行为不变） */
+const BUILTIN_SCENE_LABELS = {
+  2: '补货 Agent',
+  3: '诊断 Agent',
+  4: '分析 Copilot'
+}
+
+/**
+ * 场景列表（3-3 起为动态列表）：默认 3 项。
+ *
+ * 为什么默认仍是硬编码的 2/3/4（灰度友好）：`status.data.agents` 是 3-3 新增的下发字段，
+ * 在下列情况下都会缺失或为空——老版本 Java 没扩展 status、上游 Python 不可达、
+ * agent_config 表为空/DB 开关关闭、以及回滚到旧版本时。
+ * 这些场景下抽屉必须与改造前**完全一致**：不能因为“场景清单取不到”就少 tab 或不可用，
+ * 否则一次后端灰度/回滚就会让所有人失去对话入口。
+ */
+const scenes = ref(defaultScenes())
+
+function defaultScenes() {
+  return [2, 3, 4].map((value) => ({ value, label: BUILTIN_SCENE_LABELS[value], custom: false }))
+}
+
+/**
+ * 用后端下发的 agents 合并出可见场景列表。
+ *
+ * 契约（3-3）：`data.agents = [{code,name,scene,runtime,builtin,tools,version}]`，
+ * 包含已启用的 chat 载体配置（内置 chat 行 scene=1 + 自定义智能体 scene>=101）。
+ * 合并规则与理由：
+ *  1. agents 不是非空数组 → 直接返回默认 3 项（**回落**，见上）；
+ *  2. scene=1 的内置 chat 行不变成 tab：抽屉从来没有“通用问答”tab（改造前就是 2/3/4），
+ *     多一个通用 tab 等于偷偷新增一个能力入口；
+ *  3. 内置 2/3/4 沿用固定中文名（配置台允许改名，入口名跟着变会让运营找不到）；
+ *     后端 name 仅在内置映射缺失时兜底；
+ *  4. 自定义场景（非内置，契约是 scene>=101）追加为 tab，label 用后端 name；
+ *  5. 默认 3 项**始终保留**：即使后端某次只下发了自定义行（内置 chat 行被停用等），
+ *     也不能让既有 tab 忽然消失——抽屉可用性由 `/agent/status` 的 enabled 决定，不由 tab 决定；
+ *  6. 按 scene 升序：tab 顺序必须稳定，否则每次打开抽屉 tab 位置都可能变（点错的来源）。
+ */
+function mergeScenes(agents) {
+  const list = Array.isArray(agents) ? agents : []
+  if (list.length === 0) return defaultScenes()
+  const byScene = new Map()
+  list.forEach((agent) => {
+    if (!agent) return
+    const raw = agent.scene
+    if (raw === null || raw === undefined || raw === '') return
+    const value = Number(raw)
+    // 缺 scene / 非数字 / scene<1 的下发行无法路由到 Python 侧图，不能成为 tab
+    if (!Number.isFinite(value) || value < 1) return
+    // scene=1 是内置 chat 载体的配置行，不是抽屉里的一个 tab（理由见上）
+    if (value === 1) return
+    const builtin = agent.builtin === 1 || agent.builtin === true || [2, 3, 4].indexOf(value) >= 0
+    const label = (builtin && BUILTIN_SCENE_LABELS[value]) || agent.name || '场景 ' + value
+    byScene.set(value, { value, label, custom: !builtin, builtin })
+  })
+  ;[2, 3, 4].forEach((value) => {
+    if (!byScene.has(value)) {
+      byScene.set(value, { value, label: BUILTIN_SCENE_LABELS[value], custom: false, builtin: true })
+    }
+  })
+  return Array.from(byScene.values()).sort((a, b) => a.value - b.value)
+}
+
+/**
+ * 自定义场景的通用快捷问题。
+ *
+ * 为什么不给自定义场景写专属问题：它们的工具子集/提示词由管理员在配置台按场景下发，
+ * 前端无从知道“这个智能体到底能查什么”。写死具体问题=把做不到的事摆在快捷入口
+ * （2026-10-01 已修过一次同类问题：提示与能力脱节比答错更耗信任）。
+ */
+const CUSTOM_QUICK_QUESTIONS = [
+  { text: '这个场景你能做什么？' },
+  { text: '你能查哪些数据？' }
 ]
 
 // 快捷问题与原型 V2 抽屉一致，按场景各给一组。
@@ -266,6 +349,7 @@ const GREETINGS = {
 }
 
 const agentStore = useAgentStore()
+const userStore = useUserStore()
 const visible = computed({
   get: () => agentStore.drawerVisible,
   set: (val) => (val ? agentStore.open() : agentStore.close())
@@ -299,8 +383,199 @@ let messageSeq = 0
 // 状态探测只做一次（失败后由"重试"按钮显式触发，避免每次打开都打扰）
 let probed = false
 
-const quickQuestions = computed(() => QUICK_QUESTIONS[scene.value] || QUICK_QUESTIONS[2])
-const greeting = computed(() => GREETINGS[scene.value] || GREETINGS[2])
+// ---------------------------------------------------------------------------
+// 4-1 会话本地存档：刷新 / 重进不丢会话
+//
+// 存在 localStorage 而**不是**后端：这里只是本机体验缓存，业务事实仍在
+// agent_conversation/agent_message（S13 历史会话可查）。因此：
+//  - key 带 user + scene：不同用户、不同场景互不串（场景切换即清旧场景存档）；
+//  - 只存对话文本 / conversationId / focusCode / 已丢弃条数，**不含任何密钥或 token**；
+//  - 用户点「新会话」或清浏览器存储即可清空；
+//  - 存储不可用（隐私模式）或配额满时只降级为“不恢复”，绝不阻断对话。
+// ---------------------------------------------------------------------------
+const STORAGE_PREFIX = 'dkd.agent.chat.v1'
+/** 消息条数上限：超过从最旧开始丢，恢复时如实提示丢了多少条 */
+const MAX_STORED_MESSAGES = 200
+/** 序列化字节上限约 200KB：localStorage 是共享配额，聊天记录不能把它吃满 */
+const MAX_STORED_BYTES = 200 * 1024
+/** 单条正文落盘上限：防止一条超长回复就把配额打满（恢复时它是截断文本） */
+const MAX_STORED_CONTENT_CHARS = 40000
+
+/** 恢复提示文案（空串=不显示）；用户点「知道了」只是收起提示，存档仍在 */
+const restoredNotice = ref('')
+/** 累计被丢弃的消息条数（超条数/超字节时从最旧丢），随存档一起保存 */
+const droppedCount = ref(0)
+/** 会话被服务端判定失效时置 true：跳过本轮落盘，避免刚清掉的 key 又被 finally 写回来 */
+let suppressPersist = false
+
+function storageKey(sceneValue) {
+  const user = userStore.id || userStore.name || 'anonymous'
+  return STORAGE_PREFIX + '.' + user + '.scene.' + sceneValue
+}
+
+/** UTF-8 字节数：localStorage 按字符计配额但有实现差异，用字节估算更接近真实占用 */
+function byteLength(text) {
+  try {
+    return new TextEncoder().encode(text).length
+  } catch (error) {
+    return text.length * 3
+  }
+}
+
+function readStoredSession(sceneValue) {
+  try {
+    const raw = window.localStorage.getItem(storageKey(sceneValue))
+    if (!raw) return null
+    const payload = JSON.parse(raw)
+    if (!payload || typeof payload !== 'object') return null
+    if (!Array.isArray(payload.messages)) return null
+    return payload
+  } catch (error) {
+    // 存档损坏 / 隐私模式禁用 storage：当作没有存档，不能让恢复逻辑把抽屉搞崩
+    return null
+  }
+}
+
+function writeStoredSession(payload) {
+  try {
+    window.localStorage.setItem(storageKey(scene.value), JSON.stringify(payload))
+  } catch (error) {
+    // 配额满 / 隐私模式：只影响“下次能否恢复”，不阻断当前对话
+  }
+}
+
+function removeStoredSession(sceneValue) {
+  try {
+    window.localStorage.removeItem(storageKey(sceneValue))
+  } catch (error) {
+    // 忽略：清不掉存档也不该影响“新会话”本身
+  }
+}
+
+/** UI 消息 → 可落盘结构：去掉 streaming 等运行时状态，只保留可回放的字段 */
+function toStoredMessage(msg) {
+  const content = typeof msg.content === 'string' ? msg.content : ''
+  const clipped = content.length > MAX_STORED_CONTENT_CHARS
+    ? content.slice(0, MAX_STORED_CONTENT_CHARS) + '\n…（本地存档截断）'
+    : content
+  return {
+    id: msg.id,
+    role: msg.role,
+    content: clipped,
+    error: msg.error || '',
+    conclusion: msg.conclusion || null,
+    dataCaliber: Array.isArray(msg.dataCaliber) ? msg.dataCaliber : [],
+    grounding: msg.grounding || null
+  }
+}
+
+/**
+ * 落盘当前场景会话（在每轮对话结束后调用）。
+ *
+ * 只保存**已完成轮次**（streaming 的消息丢弃）：流式中刷新会丢本轮半截内容，
+ * 这比恢复出“半句话”再当完整记录更好——半截回答会被误读成模型原话。
+ */
+function persistSession() {
+  if (suppressPersist) return
+  if (!messages.value.length) {
+    removeStoredSession(scene.value)
+    return
+  }
+  const list = messages.value.filter((msg) => msg && !msg.streaming && msg.role).map(toStoredMessage)
+  let trimmed = 0
+  while (list.length > MAX_STORED_MESSAGES) {
+    list.shift()
+    trimmed += 1
+  }
+  let payload = {
+    conversationId: conversationId.value || null,
+    focusCode: focusCode.value || '',
+    messages: list,
+    dropped: droppedCount.value + trimmed,
+    updatedAt: Date.now()
+  }
+  let json = JSON.stringify(payload)
+  // 超字节上限：继续从最旧丢，保证存档不会因为一次长对话把 localStorage 打满
+  while (byteLength(json) > MAX_STORED_BYTES && list.length > 1) {
+    list.shift()
+    trimmed += 1
+    payload = Object.assign({}, payload, { messages: list, dropped: droppedCount.value + trimmed })
+    json = JSON.stringify(payload)
+  }
+  droppedCount.value = payload.dropped
+  writeStoredSession(payload)
+}
+
+/**
+ * 恢复本场景上次会话（仅在内存为空时调用，避免覆盖正在进行的对话）。
+ *
+ * ⚠️ 恢复后**绝不复用旧 lastEventId**：它属于已经断掉的那条流，
+ * 带上会被服务端当成续传请求（“会话不存在或无可续传”那条实测坑）。
+ */
+function restoreStoredSession(sceneValue) {
+  if (messages.value.length > 0 || conversationId.value) return false
+  const payload = readStoredSession(sceneValue)
+  if (!payload || payload.messages.length === 0) return false
+  const restored = payload.messages.map((item) => ({
+    id: Number(item.id) || 0,
+    role: item.role === 'user' ? 'user' : 'assistant',
+    content: typeof item.content === 'string' ? item.content : '',
+    streaming: false,
+    error: item.error || '',
+    conclusion: item.conclusion || null,
+    evidenceExpanded: false,
+    dataCaliber: Array.isArray(item.dataCaliber) ? item.dataCaliber : [],
+    grounding: item.grounding || null
+  }))
+  messages.value = restored
+  messageSeq = restored.reduce((max, item) => Math.max(max, item.id || 0), 0)
+  conversationId.value = payload.conversationId || undefined
+  focusCode.value = typeof payload.focusCode === 'string' ? payload.focusCode : ''
+  lastEventId.value = undefined
+  droppedCount.value = Number(payload.dropped) || 0
+  const droppedTip = droppedCount.value > 0
+    ? '（较早的 ' + droppedCount.value + ' 条消息因存储上限未恢复）'
+    : ''
+  restoredNotice.value = '已恢复上次会话' + droppedTip + '；点右上角「+」可开启新会话并清空本地存档'
+  scrollToBottom()
+  return true
+}
+
+/** 服务端明确表示“这个 thread 没了/不可续传”→ 清本地存档（4-1，会话失效路径） */
+function isSessionInvalid(error) {
+  const message = String((error && error.message) || '')
+  // 注意不要把「登录过期（无效的会话…）」算进来：那不是 thread 失效，清聊天存档会误伤
+  return /会话不存在|无可续传|会话已失效|无有效会话/.test(message)
+}
+
+/**
+ * 当前场景项（在**动态** scenes 里查；找不到返回 null，文案回落内置 2，不抛错）。
+ * 放在快捷问题/欢迎语之前：两者都依赖它判断“是否自定义场景”。
+ */
+const currentScene = computed(() => {
+  return scenes.value.filter((item) => item.value === scene.value)[0] || null
+})
+
+const quickQuestions = computed(() => {
+  // 自定义场景用通用兜底（见 CUSTOM_QUICK_QUESTIONS）；模板固定读 [0]/[1]，故兜底必须有 2 项
+  if (currentScene.value && currentScene.value.custom) return CUSTOM_QUICK_QUESTIONS
+  return QUICK_QUESTIONS[scene.value] || QUICK_QUESTIONS[2]
+})
+
+/**
+ * 欢迎语：自定义智能体只承诺“工具由管理员配置、以实际查询为准、不能改业务数据”，
+ * 不复用内置场景的专属承诺（补货依据/设备诊断/分析口径都不该套到自定义场景上）。
+ */
+const greeting = computed(() => {
+  if (currentScene.value && currentScene.value.custom) {
+    return (
+      '你好，我是自定义智能体「' + currentScene.value.label + '」。' +
+      '我的可用工具由管理员在配置台按场景下发，能力以实际查询结果为准；' +
+      '我不能修改任何业务数据（建单/调整/停用请到对应业务页面人工操作）。'
+    )
+  }
+  return GREETINGS[scene.value] || GREETINGS[2]
+})
 
 function close() {
   agentStore.close()
@@ -393,15 +668,46 @@ function resetConversation() {
   lastEventId.value = undefined
   focusCode.value = ''
   draft.value = ''
+  // 明确“新会话”= 清掉本场景的本地存档：否则下次打开抽屉会把用户刚清掉的旧会话又恢复出来
+  removeStoredSession(scene.value)
+  restoredNotice.value = ''
+  droppedCount.value = 0
+  suppressPersist = false
+}
+
+/**
+ * 应用后端下发的场景列表（3-3）。
+ *
+ * 当前 scene 不在新列表时回落到 2（补货）：否则 tab 一个都不高亮，后续请求还会带着
+ * 后端已不再接受的 scene（该自定义智能体已被停用/删除）。旧 thread 属于那个已不存在的
+ * 场景，继续复用会把两种图路由混进同一条会话，所以一并开启新会话。
+ * 只有确实存在旧会话时才提示，避免“一打开抽屉就弹一条通知”。
+ */
+function applyScenes(agents) {
+  const next = mergeScenes(agents)
+  scenes.value = next
+  if (next.some((item) => item.value === scene.value)) return
+  const previousScene = scene.value
+  const hadConversation = !!conversationId.value
+  scene.value = 2
+  // 旧场景已不可用：连同它的本地存档一起清掉（否则刷新会恢复出已删除智能体的会话）
+  removeStoredSession(previousScene)
+  resetConversation()
+  if (hadConversation) ElMessage.info('当前智能体已不可用，已回落到「补货 Agent」并开启新会话')
 }
 
 function switchScene(value) {
   if (value === scene.value) return
+  const previousScene = scene.value
+  // 场景隔离：切走即清旧场景存档，切回来/刷新不会恢复出跨场景的旧 thread
+  removeStoredSession(previousScene)
   scene.value = value
   // 为什么切场景要新开会话：scene 决定 Python 侧的路由图（Phase 1 起），
   // 跨场景复用同一 thread 会让上下文语义混乱，因此明确重置并提示。
   resetConversation()
-  ElMessage.info('已切换到「' + SCENES.filter((s) => s.value === value)[0].label + '」，已开启新会话')
+  // label 从**动态列表**取（自定义场景不在原硬编码表里，查不到就退回 scene 编号，不抛错）
+  const hit = scenes.value.filter((s) => s.value === value)[0]
+  ElMessage.info('已切换到「' + (hit ? hit.label : '场景 ' + value) + '」，已开启新会话')
 }
 
 /**
@@ -412,6 +718,10 @@ async function probeStatus(force) {
   if (probed && !force) return
   probed = true
   const status = await probeAgentStatus()
+  // 3-3：场景清单与启用状态**互不影响**。agents 缺失/为空（老后端、上游不可达、配置表为空）
+  // 一律回落硬编码 3 项；这里只更新列表，不参与 degraded 判定——场景清单取不到不该让抽屉不可用。
+  // 重试（force=true）会重新走这里，因此恢复后能刷新出新下发的自定义场景。
+  applyScenes(status && status.agents)
   if (status.unauthorized) {
     agentStore.setDegraded(true, '登录状态已过期，请重新登录后再使用 AI 助手')
   } else if (!status.enabled) {
@@ -434,6 +744,8 @@ watch(visible, async (val) => {
   if (!val) return
   const pending = agentStore.consumePending()
   if (!pending.prompt) {
+    // 4-1：刷新/重进后自动恢复上次会话（内存为空才恢复，绝不覆盖正在进行的会话）
+    restoreStoredSession(scene.value)
     probeStatus(false)
     return
   }
@@ -445,6 +757,10 @@ watch(visible, async (val) => {
   focusCode.value = ''
   lastEventId.value = undefined
   if (pending.scene) scene.value = pending.scene
+  // 入口透传的预置问题=新会话：清掉该场景旧存档，不能恢复出半路会话
+  removeStoredSession(scene.value)
+  restoredNotice.value = ''
+  droppedCount.value = 0
   draft.value = pending.prompt
   if (!degraded.value) await send(pending.prompt)
 })
@@ -505,6 +821,17 @@ async function send(text) {
       // 已自动续接完成：不当作失败（断线不丢已有内容）
     } else {
       assistantMsg.error = (e && e.message) || '对话失败'
+      // 服务端判定会话已失效（会话不存在/无可续传）：清掉本地存档并丢弃 conversationId，
+      // 下一次提问自动开启新会话。保留本页转录供用户回看，但**不再落盘**——
+      // 否则 finally 里的 persistSession 会把刚清掉的 key 又写回来。
+      if (isSessionInvalid(e)) {
+        removeStoredSession(scene.value)
+        conversationId.value = undefined
+        restoredNotice.value = ''
+        droppedCount.value = 0
+        suppressPersist = true
+        ElMessage.warning('原会话已在智能体服务侧失效（可能已过期或被清理），下一次提问将开启新会话')
+      }
       // 登录过期不属“智能体故障”，提示要区分，否则运维会去查错东西
       if (e && e.unauthorized) agentStore.setDegraded(true, '登录状态已过期，请重新登录后再使用 AI 助手')
       else if (e && e.degraded) agentStore.setDegraded(true, e.message)
@@ -514,6 +841,9 @@ async function send(text) {
     sending.value = false
     stream = null
     scrollToBottom()
+    // 4-1：一轮结束后落盘（只存已完成轮次），刷新/重进可恢复 transcript 与 conversationId
+    persistSession()
+    suppressPersist = false
   }
 }
 
@@ -616,6 +946,8 @@ onBeforeUnmount(stop)
 
 .agent-tabs {
   display: flex;
+  /* 自定义智能体数量不固定，tab 必须能换行——否则下发第 4、5 个场景后会横向溢出被裁掉 */
+  flex-wrap: wrap;
   gap: 6px;
   padding: 10px 16px;
   border-bottom: 1px solid #ebeef5;
@@ -691,6 +1023,23 @@ onBeforeUnmount(stop)
 
   strong {
     font-weight: 600;
+  }
+}
+
+/* 4-1 会话恢复提示：用“成功色”而不是警告色——会话找回是好事，不是故障 */
+.restore-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  background: #f0f9eb;
+  border-bottom: 1px solid #e1f3d8;
+  font-size: 12px;
+  color: #529b2e;
+
+  .txt {
+    flex: 1;
+    line-height: 1.6;
   }
 }
 

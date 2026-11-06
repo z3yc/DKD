@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+"http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.dkd.manage.mapper.AgentConfigMapper">
+
+    <!--
+      智能体配置主表 / 版本快照表的读写（排期 2-2，DDL 见 docs/ddl/agent_config.sql）。
+
+      ## 四条刻意的取舍
+      1. **更新是「全列覆盖 + 版本条件」**，不是动态 SET
+         temperature / max_tokens / model / disabled_reason / params_json 的 NULL 是有业务语义的
+         （NULL = 走模型默认 / 无停用原因 / 无参数）。若按常规写成 <if test="xxx != null">
+         「传 null 就跳过」，运营把温度从 1.2 清空回默认时会**静默不生效**，
+         而且历史快照里会记成「改了」——最难查的那种假成功。
+      2. **WHERE id AND version AND del_flag='0'**：乐观锁与软删同时守住；
+         影响行数 0 由 Service 转 409（契约 §4.2），此处不得退化成只按 id 更新。
+      3. **列表与详情查询过滤 del_flag='0'**（AGENTS §7.4），且不用 ${}（全部 #{} 绑定）。
+      4. **history 只提供 INSERT + 查询**：它是「当前配置是哪一次保存」的证据，
+         后台没有任何改/删入口（AGENTS §6.3 同理）。
+    -->
+
+    <resultMap type="AgentConfig" id="AgentConfigResult">
+        <id     property="id"             column="id"              />
+        <result property="code"           column="code"            />
+        <result property="name"           column="name"            />
+        <result property="description"    column="description"     />
+        <result property="runtime"        column="runtime"         />
+        <result property="scene"          column="scene"           />
+        <result property="builtin"        column="builtin"         />
+        <result property="systemPrompt"   column="system_prompt"   />
+        <result property="tools"          column="tools"           />
+        <result property="model"          column="model"           />
+        <result property="temperature"    column="temperature"     />
+        <result property="maxTokens"      column="max_tokens"      />
+        <result property="timeoutS"       column="timeout_s"       />
+        <result property="maxRetries"     column="max_retries"     />
+        <result property="paramsJson"     column="params_json"     />
+        <result property="enabled"        column="enabled"         />
+        <result property="disabledReason" column="disabled_reason" />
+        <result property="version"        column="version"         />
+        <result property="changeNote"     column="change_note"     />
+        <result property="createBy"       column="create_by"       />
+        <result property="createTime"     column="create_time"     />
+        <result property="updateBy"       column="update_by"       />
+        <result property="updateTime"     column="update_time"     />
+        <result property="delFlag"        column="del_flag"        />
+    </resultMap>
+
+    <resultMap type="AgentConfigHistory" id="AgentConfigHistoryResult">
+        <id     property="id"         column="id"          />
+        <result property="code"       column="code"        />
+        <result property="version"    column="version"     />
+        <result property="snapshot"   column="snapshot"    />
+        <result property="changeNote" column="change_note" />
+        <result property="createBy"   column="create_by"   />
+        <result property="createTime" column="create_time" />
+    </resultMap>
+
+    <sql id="selectAgentConfigVo">
+        select id, code, name, description, runtime, scene, builtin, system_prompt, tools,
+               model, temperature, max_tokens, timeout_s, max_retries, params_json, enabled,
+               disabled_reason, version, change_note, create_by, create_time, update_by,
+               update_time, del_flag
+        from agent_config
+    </sql>
+
+    <sql id="agentConfigWhere">
+        <where>
+            del_flag = '0'
+            <if test="code != null and code != ''">
+                AND code like concat('%', #{code}, '%')
+            </if>
+            <if test="name != null and name != ''">
+                AND name like concat('%', #{name}, '%')
+            </if>
+            <if test="runtime != null and runtime != ''">
+                AND runtime = #{runtime}
+            </if>
+            <if test="enabled != null">
+                AND enabled = #{enabled}
+            </if>
+            <if test="builtin != null">
+                AND builtin = #{builtin}
+            </if>
+        </where>
+    </sql>
+
+    <select id="selectAgentConfigList" parameterType="AgentConfig" resultMap="AgentConfigResult">
+        <include refid="selectAgentConfigVo"/>
+        <include refid="agentConfigWhere"/>
+        order by scene asc, id asc
+    </select>
+
+    <select id="selectAgentConfigById" parameterType="Long" resultMap="AgentConfigResult">
+        <include refid="selectAgentConfigVo"/>
+        where id = #{id} and del_flag = '0'
+    </select>
+
+    <select id="countAgentConfigByName" resultType="java.lang.Integer">
+        select count(1) from agent_config
+        where del_flag = '0' and name = #{name}
+        <if test="excludeId != null">
+            and id != #{excludeId}
+        </if>
+    </select>
+
+    <select id="countAgentConfigByCode" resultType="java.lang.Integer">
+        select count(1) from agent_config
+        where del_flag = '0' and code = #{code}
+    </select>
+
+    <select id="selectMaxScene" resultType="java.lang.Integer">
+        select max(scene) from agent_config where del_flag = '0'
+    </select>
+
+    <insert id="insertAgentConfig" parameterType="AgentConfig" useGeneratedKeys="true" keyProperty="id">
+        insert into agent_config
+        (code, name, description, runtime, scene, builtin, system_prompt, tools, model,
+         temperature, max_tokens, timeout_s, max_retries, params_json, enabled, disabled_reason,
+         version, change_note, create_by, create_time, update_by, update_time, del_flag)
+        values
+        (#{code}, #{name}, #{description}, #{runtime}, #{scene}, #{builtin}, #{systemPrompt}, #{tools},
+         #{model}, #{temperature}, #{maxTokens}, #{timeoutS}, #{maxRetries}, #{paramsJson}, #{enabled},
+         #{disabledReason}, #{version}, #{changeNote}, #{createBy}, #{createTime}, #{updateBy},
+         #{updateTime}, #{delFlag})
+    </insert>
+
+    <!--
+      乐观锁更新：只覆盖可编辑列（code/runtime/scene/builtin 是只读列，不在此处出现）。
+      注意 temperature/max_tokens 等可空列无条件赋值（见文件头取舍 1）。
+    -->
+    <update id="updateAgentConfig" parameterType="AgentConfig">
+        update agent_config
+        set name = #{name},
+            description = #{description},
+            system_prompt = #{systemPrompt},
+            tools = #{tools},
+            model = #{model},
+            temperature = #{temperature},
+            max_tokens = #{maxTokens},
+            timeout_s = #{timeoutS},
+            max_retries = #{maxRetries},
+            params_json = #{paramsJson},
+            enabled = #{enabled},
+            disabled_reason = #{disabledReason},
+            change_note = #{changeNote},
+            update_by = #{updateBy},
+            update_time = #{updateTime},
+            version = version + 1
+        where id = #{id} and version = #{version} and del_flag = '0'
+    </update>
+
+    <insert id="insertAgentConfigHistory" parameterType="AgentConfigHistory"
+            useGeneratedKeys="true" keyProperty="id">
+        insert into agent_config_history (code, version, snapshot, change_note, create_by, create_time)
+        values (#{code}, #{version}, #{snapshot}, #{changeNote}, #{createBy}, #{createTime})
+    </insert>
+
+    <select id="selectAgentConfigHistoryByCode" parameterType="String" resultMap="AgentConfigHistoryResult">
+        select id, code, version, snapshot, change_note, create_by, create_time
+        from agent_config_history
+        where code = #{code}
+        order by version desc
+    </select>
+
+    <select id="selectAgentConfigHistoryByCodeAndVersion" resultMap="AgentConfigHistoryResult">
+        select id, code, version, snapshot, change_note, create_by, create_time
+        from agent_config_history
+        where code = #{code} and version = #{version}
+        limit 1
+    </select>
+
+</mapper>

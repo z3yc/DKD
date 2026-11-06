@@ -61,6 +61,7 @@ def _row(
     current: int = 0,
     capacity: int = 10,
     task_id: int | None = None,
+    llm_calibrated: int | None = None,
 ) -> dict[str, Any]:
     return {
         "id": plan_id,
@@ -77,6 +78,7 @@ def _row(
         "adjust_reason": None,
         "adjusted_by": None,
         "adjusted_time": None,
+        "llm_calibrated": llm_calibrated,
         "items": [
             {
                 "skuId": 1,
@@ -238,6 +240,22 @@ async def test_list_plans_returns_stats_and_prototype_fields():
     assert plan["innerCode"] == INNER
     assert plan["items"][0]["reason"] == "基线依据", "原型「依据」折叠面板的数据源"
     assert "adjustReason" in plan and "taskId" in plan
+
+
+async def test_list_plans_exposes_llm_calibrated_tristate():
+    """5-6：工作台清单要带出降级标记（1→True/0→False/NULL→None），前端据此显示「未校准」。"""
+    service, _, _, _ = _service(
+        rows=[
+            _row(plan_id=5, llm_calibrated=1),
+            _row(plan_id=6, llm_calibrated=0),
+            _row(plan_id=7, llm_calibrated=None),
+        ]
+    )
+
+    data = await service.list_plans(PLAN_DATE)
+
+    flags = {plan["id"]: plan["llmCalibrated"] for plan in data["plans"]}
+    assert flags == {5: True, 6: False, 7: None}
 
 
 # --------------------------------------------------------------------------------------

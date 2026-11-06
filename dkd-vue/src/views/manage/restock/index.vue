@@ -112,6 +112,23 @@
         </template>
       </el-alert>
 
+      <!--
+        5-6：当日存在「未校准」计划时的顶部提示条（橙色）。
+        只统计 llmCalibrated===false（本轮明确退化）；null=历史/未知不计入——
+        否则历史数据会把提示条永远点亮，提示条就失去“今天 LLM 出过问题”的信号意义。
+      -->
+      <el-alert
+        v-if="uncalibratedPlans.length > 0"
+        class="uncalibrated-banner"
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="'今日 ' + uncalibratedPlans.length + ' 台设备计划未校准（LLM 不可用/超时），已按纯统计基线生成'"
+        :description="unknownCalibratedCount > 0
+          ? '另有 ' + unknownCalibratedCount + ' 台历史计划没有校准标记，未计入本提示；纯统计基线可解释、可安全采用，但未经模型校准。'
+          : '纯统计基线可解释、可安全采用，但未经模型校准；可展开「Agent 依据」人工判断。'"
+      />
+
       <div class="fchips">
         <span class="fchips__label">优先级</span>
         <el-button
@@ -224,6 +241,21 @@
         <el-table-column label="状态" width="150">
           <template #default="{ row }">
             <el-tag :type="statusTagType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
+            <!--
+              5-6 校准态：true=正常（不显示，避免每行都挂“已校准”噪声）；
+              false=本轮 LLM 退化（橙色「未校准」）；null=历史/未知（灰色「未知」，不得显示为已校准）。
+            -->
+            <div v-if="calibrationState(row) !== 'calibrated' && calibrationState(row) !== 'missing'" class="cal-line">
+              <el-tooltip
+                :content="calibrationState(row) === 'uncalibrated' ? CALIBRATION_TIPS.uncalibrated : CALIBRATION_TIPS.unknown"
+                placement="top"
+              >
+                <el-tag
+                  size="small"
+                  :type="calibrationState(row) === 'uncalibrated' ? 'warning' : 'info'"
+                >{{ calibrationState(row) === 'uncalibrated' ? '未校准' : '未知' }}</el-tag>
+              </el-tooltip>
+            </div>
             <div v-if="row.taskCode" class="dim">工单 {{ row.taskCode }}</div>
             <div v-if="row.adjustReason" class="dim" :title="row.adjustReason">原因：{{ row.adjustReason }}</div>
           </template>
@@ -360,6 +392,36 @@ const reasonDialog = reactive({
 let abortController = null
 
 const pendingPlans = computed(() => plans.value.filter((p) => isPending(p.status)))
+
+/**
+ * 5-6 校准态（L1 工具直查 + LLM 校准；LLM 不可用/超时则退化为纯统计基线）。
+ *
+ * 三种取值必须分开：
+ *  - false：本轮明确未校准（橙色徽标 + 顶部计数，说明“为什么这单没有模型判断”）；
+ *  - true：正常校准（不显示，避免每行都挂“已校准”噪声）；
+ *  - null：历史数据/本轮未记录（灰色「未知」）——**绝不能当成已校准**，
+ *    否则用户会把“不知道”读成“校准过”，采纳决策的依据就被悄悄换掉了。
+ * 字段缺失（老后端未升级）按“无标记”处理：不显示徽标、不计入提示条
+ * （既不谎称已校准，也不把“还没上这个功能”渲染成满屏未知）。
+ */
+const CALIBRATION_TIPS = {
+  uncalibrated: 'LLM 校准不可用，本计划为纯统计基线（可解释、可安全采用，但未经模型校准）',
+  unknown: '历史数据/本轮未记录：无法判断是否经过 LLM 校准'
+}
+
+function calibrationState(plan) {
+  if (!plan || !Object.prototype.hasOwnProperty.call(plan, 'llmCalibrated')) return 'missing'
+  const value = plan.llmCalibrated
+  if (value === true || value === 1) return 'calibrated'
+  if (value === false || value === 0) return 'uncalibrated'
+  return 'unknown'
+}
+
+/** 未校准设备数：只统计 false（顶栏提示条用）；历史/未知不计入，避免历史数据把提示条永远点亮 */
+const uncalibratedPlans = computed(() => plans.value.filter((plan) => calibrationState(plan) === 'uncalibrated'))
+
+/** 历史/未知的数量：只在提示条副文案里说明，不参与“今日未校准 N 台”口径 */
+const unknownCalibratedCount = computed(() => plans.value.filter((plan) => calibrationState(plan) === 'unknown').length)
 
 const filteredPlans = computed(() =>
   plans.value.filter((plan) => {
@@ -786,6 +848,16 @@ function submitReason(reason) {
 
   .pause-banner {
     margin-bottom: 12px;
+  }
+
+  /* 5-6 未校准提示条：橙色=“数据能用但缺一层模型校准”，不是错误 */
+  .uncalibrated-banner {
+    margin-bottom: 12px;
+  }
+
+  /* 状态列里的校准徽标：与状态标签分行显示，避免挤在同一行读混 */
+  .cal-line {
+    margin-top: 2px;
   }
 
   .fchips {

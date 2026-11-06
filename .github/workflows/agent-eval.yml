@@ -1,0 +1,55 @@
+name: agent-eval
+
+# 评测护栏（排期 5-1）：prompt / 配置 / 评测集改动时跑**离线**评测（不调 LLM、不产生成本）。
+# 说明：
+# - 当前评测集只有 8 条 example-only 用例（无 verified 样本）→ 脚本输出 BLOCKED（退出码 2）；
+#   CI 把“阻塞”视为**通过但警告**，不会把 0% 假绿；真实 80~100 条 verified 样本接入后才会产生准确率。
+# - 在线（--live，真实 LLM）评测由人工/定时任务执行，避免 CI 消耗 token 与密钥。
+# - 版本保存护栏在 Java 侧（agent.evalGateEnabled，默认关闭）；报告通过
+#   `--post-report` 写入 agent_eval_report 后，开启护栏即可拦截低基线保存。
+
+on:
+  pull_request:
+    paths:
+      - "dkd-agent/app/prompts/**"
+      - "dkd-agent/app/agent_defaults.py"
+      - "docs/agent-eval-set/**"
+      - "docs/scripts/run-agent-eval.py"
+      - ".github/workflows/agent-eval.yml"
+  push:
+    branches: [develop, main]
+    paths:
+      - "dkd-agent/app/prompts/**"
+      - "dkd-agent/app/agent_defaults.py"
+      - "docs/agent-eval-set/**"
+      - "docs/scripts/run-agent-eval.py"
+
+jobs:
+  offline-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 离线评测（结构校验，不调 LLM）
+        shell: bash
+        run: |
+          set +e
+          python docs/scripts/run-agent-eval.py --mode offline \
+            --out docs/agent-eval-set/reports/eval-ci.json
+          code=$?
+          echo "eval_exit=$code" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::评测集暂无 verified 用例，本次为 BLOCKED（不是失败，也不是通过）"
+            exit 0
+          fi
+          exit "$code"
+      - name: 校验评测集 schema（pytest 之外的最小检查）
+        run: python -c "import json;d=json.load(open('docs/agent-eval-set/starter-cases.json'));assert d['cases']"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-eval-report
+          path: docs/agent-eval-set/reports/
+          if-no-files-found: warn

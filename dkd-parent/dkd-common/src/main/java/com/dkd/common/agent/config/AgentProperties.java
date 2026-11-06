@@ -68,6 +68,47 @@ public class AgentProperties
      */
     private long analyzeRetryBackoffMs = 5000L;
 
+    /**
+     * 配置保存后是否向 Python 侧发「配置重载」通知（排期 2-2，契约 §4.7）。
+     *
+     * <p>为什么默认开：通知只是让新配置更快生效（TTL 30s 是兜底），
+     * 关掉不会出错但会让「保存后立即对话仍是旧配置」的窗口从毫秒级扩到 30s。
+     * 本地未起 Python 服务时可临时关掉，避免每次保存刷一条 WARN。
+     */
+    private boolean configReloadEnabled = true;
+
+    /**
+     * 配置重载通知的超时（毫秒），同时作为连接与读取超时。
+     *
+     * <p>为什么取 3s 而不是复用 {@link #readTimeout}：reload 是「尽力而为」的旁路通知，
+     * 它跑在异步线程里、失败只 WARN；超时取小可以避免 Python 卡住时长期占用线程。
+     */
+    private int configReloadTimeoutMs = 3000;
+
+    /**
+     * 模型连通性探测（排期 3-5）的 HTTP 超时（毫秒），同时作为连接与读取超时。
+     *
+     * <p>为什么单独一个配置而不是复用 {@link #readTimeout}：探测是"人工点一下"的同步操作，
+     * 需要在页面上尽快给出结论；而 {@code readTimeout} 默认 120s 是给 SSE 长连接用的，
+     * 让「测试连通」卡两分钟既没有意义，也会让运营以为页面死了。默认 30s 与 Python 侧
+     * llm_probe 的模型调用超时量级一致（探测本身要等一次真实 LLM 往返）。
+     */
+    private int llmProbeTimeoutMs = 30000;
+
+    /**
+     * 配置保存前的**评测护栏**开关（排期 5-1，env {@code AGENT_EVAL_GATE_ENABLED}）。
+     *
+     * <p>为什么默认 false（关闭）：
+     * <ul>
+     *   <li>评测流水线是**渐进上线**的：先能把报告落库、能在页面查，再要求"每次保存必须跑评测"。
+     *       默认开启会让所有还没接评测的配置保存立刻被拦死（连改个错别字都不行）；</li>
+     *   <li>关闭时行为必须与改造前**完全一致**（不新增任何拒绝路径），这是回归安全的前提。</li>
+     * </ul>
+     * 开启后：编辑保存需有当前版本的最新 scored 报告且准确率不低于基线，否则拒绝
+     * （可用 force+forceReason≥10 字强制跳过，变更说明里会留痕）。
+     */
+    private boolean evalGateEnabled = false;
+
     public boolean getEnabled()
     {
         return enabled;
@@ -146,5 +187,45 @@ public class AgentProperties
     public void setAnalyzeRetryBackoffMs(long analyzeRetryBackoffMs)
     {
         this.analyzeRetryBackoffMs = analyzeRetryBackoffMs;
+    }
+
+    public boolean getConfigReloadEnabled()
+    {
+        return configReloadEnabled;
+    }
+
+    public void setConfigReloadEnabled(boolean configReloadEnabled)
+    {
+        this.configReloadEnabled = configReloadEnabled;
+    }
+
+    public int getConfigReloadTimeoutMs()
+    {
+        return configReloadTimeoutMs;
+    }
+
+    public void setConfigReloadTimeoutMs(int configReloadTimeoutMs)
+    {
+        this.configReloadTimeoutMs = configReloadTimeoutMs;
+    }
+
+    public int getLlmProbeTimeoutMs()
+    {
+        return llmProbeTimeoutMs;
+    }
+
+    public void setLlmProbeTimeoutMs(int llmProbeTimeoutMs)
+    {
+        this.llmProbeTimeoutMs = llmProbeTimeoutMs;
+    }
+
+    public boolean getEvalGateEnabled()
+    {
+        return evalGateEnabled;
+    }
+
+    public void setEvalGateEnabled(boolean evalGateEnabled)
+    {
+        this.evalGateEnabled = evalGateEnabled;
     }
 }

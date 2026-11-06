@@ -141,11 +141,15 @@ class AgentSseRelayTest
         {
             AgentGatewayController controller = controller(server.baseUrl(), true);
 
-            JSONObject data = JSON.parseObject(JSON.toJSONString(controller.status().get("data")));
+            JSONObject data = JSON.parseObject(JSON.toJSONString(
+                    controller.status(new MockHttpServletRequest("GET", "/agent/status")).get("data")));
 
             assertThat(data.getBooleanValue("enabled")).isTrue();
             assertThat(data.getString("upstream")).isEqualTo("up");
             assertThat(healthHit.get()).isEqualTo("/health");
+            // 假上游只注册了 /health：/agent/agents 会 404 → 按 3-3 约定回落空数组（前端用硬编码 3 项），
+            // 且 status 仍 200——“场景清单拉不到”不得让入口可用性探测失败
+            assertThat(data.getJSONArray("agents")).isEmpty();
         }
     }
 

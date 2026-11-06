@@ -95,6 +95,28 @@ class Settings(BaseSettings):
     obs_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_OBS_ENABLED")
     # 启动扫描判定"僵尸运行"的阈值：running 超过这么多分钟就被改成 interrupted（F-05）
     run_stale_minutes: int = Field(default=30, validation_alias="DKD_AGENT_RUN_STALE_MINUTES")
+
+    # --- 执行日志采集 agent_log（排期 2-4）---
+    # 为什么单独一个开关：日志入库会让**每一行 INFO 都产生一次 DB 写**，
+    # 单测/演示没有库时必须能整体关掉（AGENTS §8：测试不得连数据库通道）。
+    log_db_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_LOG_DB_ENABLED")
+    # 批量写：一个 INSERT 携带多少行。太小会把 DB 打成 N 次往返（日志量大时尤其明显），
+    # 太大则单次事务变长、一条坏行连坐整批；50 是契约拍板值（排期 2-4）。
+    log_batch_size: int = Field(default=50, ge=1, validation_alias="DKD_AGENT_LOG_BATCH_SIZE")
+    # 后台 flush 周期：决定日志落库的最大延迟；同时是队列满之前的缓冲窗口。
+    log_flush_interval_ms: int = Field(
+        default=1000,
+        ge=50,
+        validation_alias="DKD_AGENT_LOG_FLUSH_INTERVAL_MS",
+    )
+    # 保留天数：**只是配置项**，清理脚本（docs/scripts/cleanup-agent-log.sql）按它执行；
+    # Python 侧不执行 DELETE（Agent 账号无 DELETE 权限，清理属排期 4-4，由 Java/运维做）。
+    log_retention_days: int = Field(
+        default=30,
+        ge=1,
+        validation_alias="DKD_AGENT_LOG_RETENTION_DAYS",
+    )
+
     token_daily_limit_per_user: int = Field(
         default=200_000, validation_alias="DKD_AGENT_TOKEN_LIMIT_PER_USER"
     )
@@ -152,6 +174,50 @@ class Settings(BaseSettings):
     # 4 并发远低于限流阈值；调大前先确认 Java 侧限流与建单校验链的承载。
     create_task_concurrency: int = Field(
         default=4, validation_alias="DKD_AGENT_CREATE_TASK_CONCURRENCY"
+    )
+
+    # --- 智能体配置化（排期 2-3，契约 §5.1）---
+    # 总开关：默认 True（配置化是本期目标），但保留“关掉即回到改造前行为”的能力——
+    # 旧环境未执行 DDL、或配置表被误改时，运维可以不等发版就把行为切回代码默认值。
+    # 关闭后 `ConfigStore` 的所有读接口直接返回 None，调用方走 agent_defaults 默认值。
+    config_from_db: bool = Field(default=True, validation_alias="DKD_AGENT_CONFIG_FROM_DB")
+    # 缓存 TTL：Java 保存后异步 reload 是主通道，TTL 只是“reload 丢了”的兜底（契约 §4.7）。
+    # 30s 是契约拍板值：既不至于让一次保存等半分钟才生效，也不会让每个请求都打配置表。
+    config_ttl_s: float = Field(default=30.0, validation_alias="DKD_AGENT_CONFIG_TTL_S")
+
+    # --- 知识库 L2（排期 3-6）---
+    # 检索阈值：命中分数低于它 → 认为“不可引用”，返回 fallbackReason=low_score 而不是硬凑答案
+    # （AGENTS §7.6：引用必须可追溯；凑出来的引用比“没有引用”危险得多）。
+    # 0.15 是哈希向量的保守初值：先保证“同主题能命中、无关内容不命中”，5-3 再按回退率调优。
+    kb_min_score: float = Field(default=0.15, validation_alias="DKD_AGENT_KB_MIN_SCORE")
+    # 默认召回数：未显式传 topK 时用；上限 20 与前端滑杆一致（避免一次把整库塞进 prompt）。
+    kb_top_k: int = Field(default=5, validation_alias="DKD_AGENT_KB_TOP_K")
+    # 切片参数：500/50 是 task-16 的拍板值。改这里等于改“检索粒度”，需同步评估命中率（5-3）。
+    kb_chunk_size: int = Field(default=500, validation_alias="DKD_AGENT_KB_CHUNK_SIZE")
+    kb_chunk_overlap: int = Field(default=50, validation_alias="DKD_AGENT_KB_CHUNK_OVERLAP")
+
+    # --- MCP 外部工具接入（排期 3-7）---
+    # 总开关：默认 True（功能可用），但保留“一键关掉外部工具”的能力——
+    # MCP 会出网访问第三方 server，安全复核/灰度期需要能立刻停掉而不发版。
+    mcp_enabled: bool = Field(default=True, validation_alias="DKD_AGENT_MCP_ENABLED")
+    # 超时硬上限（毫秒）：契约固定 ≤5000；DB 里的 server.timeout_ms 只能往小调，不能放宽。
+    # 外部 server 卡住会占住工具轮次，宁可快速失败让模型如实说“查不了”。
+    mcp_max_timeout_ms: int = Field(default=5000, validation_alias="DKD_AGENT_MCP_MAX_TIMEOUT_MS")
+    # 返回行数硬上限：契约固定 ≤200；超出的工具返回必须截断并显式标注（不得静默截断）。
+    mcp_max_row_limit: int = Field(default=200, validation_alias="DKD_AGENT_MCP_MAX_ROW_LIMIT")
+
+    # --- 会话上下文预算（排期 4-5）---
+    # 长会话不治理的后果很具体：第 50 轮时历史消息把 prompt 撑爆（模型报 context length）
+    # 或成本线性上涨，而用户真正关心的通常只是最近几轮。三条参数分别控制
+    # “总预算 / 原样保留的最近条数 / 更早工具结果摘要化的字符上限”。
+    history_token_budget: int = Field(
+        default=8000, validation_alias="DKD_AGENT_HISTORY_TOKEN_BUDGET"
+    )
+    history_keep_recent_messages: int = Field(
+        default=12, validation_alias="DKD_AGENT_HISTORY_KEEP_RECENT_MESSAGES"
+    )
+    history_tool_result_chars: int = Field(
+        default=600, validation_alias="DKD_AGENT_HISTORY_TOOL_RESULT_CHARS"
     )
 
     # --- 补货基线引擎参数（Phase 1 / 任务 1-4）---

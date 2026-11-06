@@ -330,13 +330,25 @@ def parse_decisions(raw: Any) -> list[PlanDecision]:
     return decisions
 
 
-def summarize_plan(plan: RestockPlan, *, plan_id: int | None = None) -> dict[str, Any]:
-    """给前端/日志的紧凑摘要（不含敏感信息，字段名对齐原型 V2）。"""
+def summarize_plan(
+    plan: RestockPlan,
+    *,
+    plan_id: int | None = None,
+    llm_calibrated: int | bool | None = None,
+) -> dict[str, Any]:
+    """给前端/日志的紧凑摘要（不含敏感信息，字段名对齐原型 V2）。
+
+    @param llm_calibrated 5-6 的校准标记（来自 `agent_restock_plan.llm_calibrated`）：
+        1→True、0→False、NULL/None→None。`RestockPlan` 是 0-13 冻结契约，不为此加字段，
+        因此由调用方把库里的标记值传进来（前端字段名 `llmCalibrated`，与 camelCase 对齐）。
+    """
     return {
         "id": plan_id,
         "vmId": plan.vm_id,
         "innerCode": plan.inner_code,
         "status": plan.status,
+        # None 保持 None（历史行/状态未知），不要用 bool() 把 NULL 变成 False
+        "llmCalibrated": None if llm_calibrated is None else bool(llm_calibrated),
         "skuCount": plan.sku_count,
         "totalQuantity": plan.total_quantity,
         "assigneeId": plan.assignee_id,

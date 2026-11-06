@@ -25,6 +25,7 @@ from app.audit import (
     QuotaExceededError,
     enforce_daily_quota,
     mask_sensitive,
+    quota_reset_at,
     record_decision,
     record_message,
     summarize_usage,
@@ -180,6 +181,45 @@ async def test_quota_blocks_when_global_limit_exceeded(session: AsyncSession):
     await _seed(session, user_id=2, tokens=80)
     with pytest.raises(QuotaExceededError, match="全局"):
         await enforce_daily_quota(session, user_id=3, per_user_limit=0, global_limit=100)
+
+
+def test_quota_reset_at_is_next_local_midnight():
+    """5-5：重置时间 = 本地时区次日 00:00，格式 YYYY-MM-DD HH:MM。"""
+    assert quota_reset_at(datetime(2026, 3, 5, 14, 30)) == "2026-03-06 00:00"
+    assert quota_reset_at(datetime(2026, 12, 31, 23, 59)) == "2027-01-01 00:00"
+
+
+async def test_per_user_quota_message_has_used_limit_and_reset_time(session: AsyncSession):
+    """5-5 自助提示：429 文案必须含「已用/限额」与「重置时间」，用户才知道何时能再用。"""
+    await _seed(session, user_id=9, tokens=120)
+    with pytest.raises(QuotaExceededError) as excinfo:
+        await enforce_daily_quota(session, user_id=9, per_user_limit=100, global_limit=0)
+
+    message = str(excinfo.value)
+    assert "已用 120/100" in message
+    assert "重置" in message
+    assert quota_reset_at() in message
+
+
+async def test_global_quota_message_has_used_limit_and_reset_time(session: AsyncSession):
+    await _seed(session, user_id=1, tokens=80)
+    await _seed(session, user_id=2, tokens=80)
+    with pytest.raises(QuotaExceededError) as excinfo:
+        await enforce_daily_quota(session, user_id=3, per_user_limit=0, global_limit=100)
+
+    message = str(excinfo.value)
+    assert "全局" in message and "已用 160/100" in message
+    assert "重置" in message
+    assert quota_reset_at() in message
+
+
+async def test_quota_trigger_conditions_unchanged_with_selfservice_message(session: AsyncSession):
+    """触发条件不变：未达标仍然放行；消息增强只是文案，不是行为变化。"""
+    await _seed(session, user_id=4, tokens=99)
+    await enforce_daily_quota(session, user_id=4, per_user_limit=100, global_limit=0)
+    await _seed(session, user_id=4, tokens=1)
+    with pytest.raises(QuotaExceededError):
+        await enforce_daily_quota(session, user_id=4, per_user_limit=100, global_limit=0)
 
 
 async def test_quota_passes_under_limit(session: AsyncSession):
